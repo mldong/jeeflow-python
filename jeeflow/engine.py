@@ -67,12 +67,8 @@ class EngineImpl(Engine):
         vars_ = {**inst.variables, **task.variables, **(args or {})}
         await self._add_user_info(operator, vars_)
         now = datetime.now()
-        task.taskState = TaskState.DONE
-        task.actorId = operator
-        task.finishTime = now
-        task.updateTime = now
-        task.updateUser = operator
-        task.variables = vars_
+        # 聚合根：完成任务（子实体状态转换 + 实例变量合并）
+        inst.complete_task(task, operator, vars_, now)
         await self.repo.update_task(task)
         await self._fire_event(ProcessEvent(EventType.TASK_COMPLETE, inst.id, task.id, task.taskName, operator))
 
@@ -89,7 +85,9 @@ class EngineImpl(Engine):
                 if not doing:
                     actors, lc = _get_cs_state(vars_, cur_node.id)
                     if actors and lc + 1 < len(actors):
-                        nt = self._new_task(cur_node, inst, actors[lc + 1], operator, now)
+                        # 聚合根：创建串行会签下一步任务
+                        nt = inst.create_task(self._next_id(), cur_node.id, cur_node.text.get("value", ""),
+                                              actors[lc + 1], operator, cur_node.properties.get("form", ""), now)
                         nt.variables = {f"operatorList_{cur_node.id}": actors, f"loopCounter_{cur_node.id}": lc + 1,
                                         f"nrOfInstances_{cur_node.id}": len(actors)}
                         await self.repo.save_task(nt)
@@ -102,8 +100,8 @@ class EngineImpl(Engine):
 
             for node in _follow_edges(flow, cur_node.id):
                 if node.type == TYPE_END:
-                    inst.state = InstanceState.DONE
-                    inst.updateTime = datetime.now()
+                    # 聚合根：流程完成
+                    inst.finish(datetime.now())
                     inst.variables = vars_
                     await self.repo.update_instance(inst)
                     await self._fire_event(ProcessEvent(EventType.PROCESS_FINISH, inst.id, operator=operator))
@@ -116,12 +114,14 @@ class EngineImpl(Engine):
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         task, inst = await self._load_and_check(task_id, operator)
         now = datetime.now()
-        for t in await self.repo.find_doing_tasks(inst.id):
-            t.taskState = TaskState.ABANDONED; t.updateTime = now
+        # 聚合根：废弃所有进行中任务
+        for t in inst.abandon_all_doing(now):
             await self.repo.update_task(t)
-        task.taskState = TaskState.DONE; task.actorId = operator; task.finishTime = now; task.updateTime = now
+        # 子实体：完成任务
+        task.finish(operator, task.variables, now)
         await self.repo.update_task(task)
-        inst.state = InstanceState.REJECT; inst.updateTime = now
+        # 聚合根：驳回
+        inst.reject(now)
         await self.repo.update_instance(inst)
         await self._fire_event(ProcessEvent(EventType.PROCESS_REJECT, inst.id, task_id, operator=operator))
         return inst
@@ -132,10 +132,11 @@ class EngineImpl(Engine):
                                      target_task_name: str = None) -> ProcessInstance:
         task, inst = await self._load_and_check(task_id, operator)
         now = datetime.now()
-        for t in await self.repo.find_doing_tasks(inst.id):
-            t.taskState = TaskState.ABANDONED; t.updateTime = now
+        # 聚合根：废弃所有进行中任务
+        for t in inst.abandon_all_doing(now):
             await self.repo.update_task(t)
-        task.taskState = TaskState.DONE; task.actorId = operator; task.finishTime = now; task.updateTime = now
+        # 子实体：完成任务
+        task.finish(operator, task.variables, now)
         await self.repo.update_task(task)
         if target_task_name:
             def_ = await self.repo.find_define_by_id(inst.defineId)
@@ -168,7 +169,8 @@ class EngineImpl(Engine):
                 if not await self.repo.find_doing_tasks(inst.id):
                     for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_)
             elif node.type == TYPE_END:
-                inst.state = InstanceState.DONE; inst.updateTime = datetime.now(); inst.variables = vars_
+                inst.finish(datetime.now())
+                inst.variables = vars_
                 await self.repo.update_instance(inst)
                 await self._fire_event(ProcessEvent(EventType.PROCESS_FINISH, inst.id, operator=operator))
         finally:
@@ -204,23 +206,18 @@ class EngineImpl(Engine):
         perform_type = int(node.properties.get("performType", 0))
         ct = node.properties.get("countersignType", "")
         now = datetime.now()
+        form = node.properties.get("form", "")
         if perform_type == 1 and ct:
             if ct == "PARALLEL":
-                for a in actors: await self.repo.save_task(self._new_task(node, inst, a, operator, now))
+                for a in actors: await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now))
             elif ct == "SEQUENTIAL":
-                nt = self._new_task(node, inst, actors[0], operator, now)
+                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
                 nt.variables = {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self.repo.save_task(nt)
             else:
-                for a in actors: await self.repo.save_task(self._new_task(node, inst, a, operator, now))
+                for a in actors: await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now))
         else:
-            await self.repo.save_task(self._new_task(node, inst, actors[0], operator, now))
-
-    def _new_task(self, node: FlowNode, inst: ProcessInstance, actor: str, operator: str, now) -> ProcessTask:
-        return ProcessTask(id=self._next_id(), processInstanceId=inst.id, taskName=node.id,
-                           displayName=node.text.get("value", ""), taskState=TaskState.DOING,
-                           actorIds=[actor], formKey=node.properties.get("form", ""),
-                           createTime=now, updateTime=now, createUser=operator, updateUser=operator)
+            await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now))
 
     async def _resolve_actors(self, node: FlowNode, inst: ProcessInstance) -> list[str]:
         assignee = node.properties.get("assignee", "")
@@ -241,7 +238,8 @@ class EngineImpl(Engine):
         return []
 
     def _is_allowed(self, task: ProcessTask, operator: str) -> bool:
-        return operator in task.actorIds
+        # 子实体：actorIds 权限判断
+        return task.is_allowed(operator)
 
     async def _add_user_info(self, operator: str, vars_: dict):
         if not self.user_prov: return

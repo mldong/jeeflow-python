@@ -83,6 +83,66 @@ class ProcessInstance:
     updateTime: Any = None
     updateUser: str = ""
 
+    # ── 聚合根行为（对标 Java domain/ProcessInstance）──
+
+    def complete_task(self, task: "ProcessTask", operator: str, vars_: dict, now) -> None:
+        """完成任务（子实体状态转换 + 实例变量合并）"""
+        task.finish(operator, vars_, now)
+        self.variables = vars_
+        self.updateTime = now
+        self.updateUser = operator
+
+    def abandon_task(self, task: "ProcessTask", now) -> None:
+        """废弃单个任务"""
+        task.abandon(now)
+        self.updateTime = now
+
+    def abandon_all_doing(self, now) -> list["ProcessTask"]:
+        """废弃所有进行中任务，返回被废弃列表"""
+        abandoned = []
+        for t in self.tasks:
+            if t.is_doing():
+                t.abandon(now)
+                abandoned.append(t)
+        self.updateTime = now
+        return abandoned
+
+    def finish(self, now) -> None:
+        """流程完成"""
+        self.state = InstanceState.DONE
+        self.updateTime = now
+
+    def reject(self, now) -> None:
+        """驳回流程"""
+        self.state = InstanceState.REJECT
+        self.updateTime = now
+
+    def add_variable(self, vars_: dict) -> None:
+        """追加变量"""
+        self.variables.update(vars_)
+
+    def get_doing_tasks(self) -> list["ProcessTask"]:
+        return [t for t in self.tasks if t.is_doing()]
+
+    def get_done_tasks(self) -> list["ProcessTask"]:
+        return [t for t in self.tasks if t.is_finished()]
+
+    def is_all_tasks_finished(self) -> bool:
+        return not any(t.is_doing() for t in self.tasks)
+
+    def create_task(self, task_id: int, task_name: str, display_name: str, actor: str,
+                    operator: str, form_key: str, now) -> "ProcessTask":
+        """创建任务（子实体工厂）"""
+        task = ProcessTask(id=task_id, processInstanceId=self.id,
+                           taskName=task_name, displayName=display_name,
+                           taskState=TaskState.DOING, actorIds=[actor],
+                           formKey=form_key,
+                           createTime=now, updateTime=now,
+                           createUser=operator, updateUser=operator)
+        self.tasks.append(task)
+        return task
+
+
 @dataclass
 class ProcessTask:
     id: int = 0
@@ -103,6 +163,32 @@ class ProcessTask:
     createUser: str = ""
     updateTime: Any = None
     updateUser: str = ""
+
+    # ── 子实体行为（对标 Java domain/ProcessTask）──
+
+    def finish(self, operator: str, vars_: dict, now) -> None:
+        """完成任务"""
+        self.taskState = TaskState.DONE
+        self.actorId = operator
+        self.finishTime = now
+        self.updateTime = now
+        self.updateUser = operator
+        self.variables = vars_
+
+    def abandon(self, now) -> None:
+        """废弃任务"""
+        self.taskState = TaskState.ABANDONED
+        self.updateTime = now
+
+    def is_doing(self) -> bool:
+        return self.taskState == TaskState.DOING
+
+    def is_finished(self) -> bool:
+        return self.taskState == TaskState.DONE
+
+    def is_allowed(self, operator: str) -> bool:
+        """操作人是否有权限处理"""
+        return operator in self.actorIds
 
 @dataclass
 class UserInfo:

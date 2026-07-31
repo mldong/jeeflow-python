@@ -28,6 +28,7 @@ class Engine:
     async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
     async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None, target_task_name: str = None) -> ProcessInstance: ...
+    async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
 
 class EngineImpl(Engine):
     def __init__(self, repo: ProcessRepository, user_prov: UserProvider = None,
@@ -143,6 +144,30 @@ class EngineImpl(Engine):
             flow = parse_flow_model(json.loads(def_.content))
             target = _find_node(flow, target_task_name)
             if target: await self._execute_node(flow, inst, target, operator, inst.variables)
+        return inst
+
+    # ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）───────
+
+    async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str,
+                                                   args: dict[str, Any] = None) -> ProcessInstance:
+        task, inst = await self._load_and_check(task_id, operator)
+        now = datetime.now()
+        # 聚合根：废弃所有进行中任务
+        for t in inst.abandon_all_doing(now):
+            await self.repo.update_task(t)
+        # 子实体：完成任务
+        task.finish(operator, task.variables, now)
+        await self.repo.update_task(task)
+        # 找到第一个任务节点，强制参与者为发起人，重新执行
+        def_ = await self.repo.find_define_by_id(inst.defineId)
+        flow = parse_flow_model(json.loads(def_.content))
+        start_node = _find_by_type(flow, TYPE_START)
+        if start_node:
+            for node in _follow_edges(flow, start_node.id):
+                if node.type in (TYPE_TASK, TYPE_CUSTOM):
+                    node.properties["assignee"] = inst.operator
+                    await self._execute_node(flow, inst, node, operator, inst.variables)
+                    break
         return inst
 
     # ─── Helpers ──────────────────────────────────────────────────────────────

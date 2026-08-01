@@ -6,6 +6,7 @@
 
 | 文档 | 内容 |
 |------|------|
+| [SDK 集成（快速开始）](./getting-started.md) | 安装、最小示例（内存模式 5 行跑起来） |
 | [演示站（Demo）](./index.md) | 启动演示站（:8100）、快速验证、测试、生产部署 |
 | [引擎 API](./engine-api.md) | `EngineImpl` 核心方法（异步风格） |
 | [流程定义格式](./flow-definition.md) | LogicFlow JSON 结构、节点类型、加载 |

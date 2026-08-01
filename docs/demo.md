@@ -15,7 +15,7 @@ python demo/main.py
 # → http://localhost:8100（uvicorn 热重载）
 ```
 
-> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 10 个示例流程。对接 jeeflow-ui（:5173）时右上角切到 `🐍 Python :8100`；接口规范见[文档站 REST API 指南](https://jeeflow-doc.mldong.com/guides/03-api)。
+> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 10 个示例流程。对接 jeeflow-ui（:5173）时右上角切到 `🐍 Python :8100`；接口规范见[文档站 REST API 指南](../../guides/03-api)。
 
 ## 快速验证
 
@@ -40,4 +40,4 @@ python tests/e2e_test.py    # 接口端到端测试 34 项
 uvicorn demo.main:app --host 0.0.0.0 --port 8100 --workers 4
 ```
 
-生产接入：实现 `ProcessRepository` SPI（内存/DB 随意），映射 [SPEC §2](https://jeeflow-doc.mldong.com/spec/) 的 5 张表。
+生产接入：实现 `ProcessRepository` SPI（内存/DB 随意），映射 [SPEC §2](../../spec/) 的 5 张表。

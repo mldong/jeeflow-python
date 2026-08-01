@@ -46,7 +46,7 @@
 | `form` | 表单标识 |
 | `taskType` | `0` 主办 / `1` 协办 |
 
-> **约定**：每个流程的第一个任务节点是"发起申请"节点（`assignee="applicant"`），这是 startAndExecute 契约和"退回发起人"闭环的基础。完整属性表见 [SPEC](https://jeeflow-doc.mldong.com/spec/)。
+> **约定**：每个流程的第一个任务节点是"发起申请"节点（`assignee="applicant"`），这是 startAndExecute 契约和"退回发起人"闭环的基础。完整属性表见 [SPEC](../../spec/)。
 
 ## 边
 
@@ -72,4 +72,4 @@ from jeeflow.model import parse_flow_model
 flow = parse_flow_model(json.loads(content))   # 过滤未知字段，生成引擎模型
 ```
 
-> 演示站从 `jeeflow-java` 仓库的共享流程 JSON（`test/resources/flows/`，10 个）加载。完整示例与字段说明见[通用指南 02 · 流程定义](https://jeeflow-doc.mldong.com/guides/02-flow-definition)。
+> 演示站从 `jeeflow-java` 仓库的共享流程 JSON（`test/resources/flows/`，10 个）加载。完整示例与字段说明见[通用指南 02 · 流程定义](../../guides/02-flow-definition)。

@@ -41,4 +41,4 @@ for task in await repo.find_doing_tasks(inst.id):
 - 实例：`10` 进行中 / `20` 已完成 / `45` 已拒绝
 - 任务：`10` 待办 / `20` 已完成 / `99` 已废弃
 
-> submitType 全枚举行为见[设计原理 06](https://jeeflow-doc.mldong.com/concepts/06-contracts)。
+> submitType 全枚举行为见[设计原理 06](../../concepts/06-contracts)。

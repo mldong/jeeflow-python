@@ -22,6 +22,7 @@ jeeflow/
 ├── engine.py       # 引擎核心（EngineImpl）
 ├── extensions.py   # 扩展体系（拦截器 / 事件 / HandlerRegistry）
 ├── memory.py       # 内存仓储（MemoryRepository）
+├── jdbc.py         # MySQL 参考实现（JdbcRepository，aiomysql）
 ├── __init__.py
 tests/
 ├── spec_test.py    # 10 项 SPEC 合规测试

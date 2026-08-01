@@ -25,7 +25,34 @@ class MyRepository(ProcessRepository):
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None: ...
 ```
 
-> 开箱即用：`MemoryRepository`（`jeeflow/memory.py`）供演示/测试；生产按上表映射到自己的数据库（可参考 demo 或 JDBC 版语义）。
+> 开箱即用：
+> - `MemoryRepository`（`jeeflow/memory.py`）供演示/测试；
+> - **`JdbcRepository`（`jeeflow/jdbc.py`）— MySQL 参考实现**（aiomysql 连接池）：
+
+```python
+import aiomysql
+from jeeflow.jdbc import JdbcRepository
+
+pool = await aiomysql.create_pool(
+    host="127.0.0.1", user="root", password="pwd", db="jeeflow",
+    autocommit=True,  # 参考实现要求：无事务时每条语句立即提交
+)
+repo = JdbcRepository(pool)  # 关系表主键用内置时间戳 ID 生成器
+```
+
+仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
+
+**事务（spec §7.4）**：`with_tx` 用 `contextvars.ContextVar` 把事务连接绑定到当前协程上下文，回调内所有仓储调用走同一连接；异常自动回滚：
+
+```python
+async def do_biz():
+    await repo.save_instance(inst)
+    await repo.create_cc_instance(inst.id, "zhangsan", "lisi", "wangwu")
+
+await repo.with_tx(do_biz)
+```
+
+> 约定：**业务层是事务 owner**——先 `with_tx` 再调引擎方法，引擎核心不感知事务。
 
 ## UserProvider（可选）
 

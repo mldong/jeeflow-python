@@ -1,6 +1,6 @@
 [project]
 name = "jeeflow"
-version = "0.1.0"
+version = "1.0.0"
 description = "Lightweight async workflow engine - Python implementation"
 requires-python = ">=3.10"
 
@@ -16,3 +16,6 @@ dev = ["pytest", "pytest-asyncio", "aiomysql"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["jeeflow*"]

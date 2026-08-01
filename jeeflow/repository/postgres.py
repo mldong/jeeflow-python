@@ -1,6 +1,6 @@
 """PostgreSQL 适配器（asyncpg）——连接池 + `$n` 占位符。
 
-> 待 PostgreSQL 环境验证（MySQL 版已在开发服务器实测）。
+> 已在开发服务器实测（PostgreSQL 16，Docker mldong-pg）。
 > asyncpg 事务模型为 `conn.transaction()` 对象，begin/commit/rollback 由此映射，
 > 其余接口与 mysql.py 对齐——核心 SQL 由 base.convert_placeholder 统一转换。
 > 惰性引用：不安装 asyncpg 也能导入本包（类型标注仅 TYPE_CHECKING 时可见）。

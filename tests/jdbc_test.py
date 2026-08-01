@@ -1,27 +1,37 @@
-"""JDBC（MySQL）仓储集成测试——对齐 Go jdbc_test。
+"""JDBC 仓储集成测试——MySQL / PostgreSQL 双库可跑。
+
+用法：python tests/jdbc_test.py [mysql|postgres]（默认 mysql）
 
 前置条件：
-  - 开发服务器 MySQL（192.168.1.160:3306，库 jeeflow）
-  - 5 张 wf_* 表已建
-测试数据固定 define ID=900002，开头清理，可重复执行。
+  - 开发服务器（192.168.1.160）：MySQL(3306) / PostgreSQL(5432，Docker mldong-pg)
+  - 建表 SQL 自动从 tests/schema/<db>.sql 执行（IF NOT EXISTS，幂等）
+测试数据固定 define ID（mysql=900002 / postgres=910002），开头清理，可重复执行。
 """
 import asyncio
 import json
 import os
 import sys
 
-import aiomysql
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import aiomysql
+import asyncpg
+
 from jeeflow import EngineImpl
-from jeeflow.repository import JdbcRepository, TsIDGenerator, MySqlAdapter
+from jeeflow.repository import JdbcRepository, TsIDGenerator, MySqlAdapter, PostgresAdapter, convert_placeholder
 from jeeflow.model import ProcessDefine, InstanceState, TaskState, UserInfo
 from jeeflow.spi import IDGenerator
 
-DSN = dict(host="192.168.1.160", port=3306, user="root", password="8Eli#gr#AUk",
-           db="jeeflow", charset="utf8mb4", autocommit=True, maxsize=5)
-DEFINE_ID = 900002
+DB = sys.argv[1] if len(sys.argv) > 1 else "mysql"
+
+if DB == "postgres":
+    DSN = dict(host="192.168.1.160", port=5432, user="postgres", password="8Eli#gr#AUk",
+               database="jeeflow")
+    DEFINE_ID = 910002
+else:
+    DSN = dict(host="192.168.1.160", port=3306, user="root", password="8Eli#gr#AUk",
+               db="jeeflow", charset="utf8mb4", autocommit=True, maxsize=5)
+    DEFINE_ID = 900002
 
 FLOWS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
                          "jeeflow-core", "src", "test", "resources", "flows")
@@ -44,6 +54,89 @@ def check(desc, ok, detail=""):
     return ok
 
 
+# ── 环境工厂：测试代码与数据库无关，只换 pool / adapter ──────────────────────
+
+async def make_pool():
+    if DB == "postgres":
+        return await asyncpg.create_pool(**DSN)
+    return await aiomysql.create_pool(**DSN)
+
+
+def make_adapter(pool):
+    if DB == "postgres":
+        return PostgresAdapter(pool)
+    return MySqlAdapter(pool)
+
+
+def sql_of(adapter, sql):
+    """直查 SQL 统一 `?` → 适配器占位符风格（与仓储核心同一转换）"""
+    return convert_placeholder(sql, adapter.placeholder)
+
+
+async def close_pool(pool):
+    if DB == "postgres":
+        await pool.close()
+    else:
+        pool.close()
+        await pool.wait_closed()
+
+
+async def raw_count(adapter, sql, args=()):
+    """直查数据库（绕过仓储）——统一连接接口，验证真实落库"""
+    conn = await adapter.acquire()
+    try:
+        row = await conn.fetchone(sql_of(adapter, sql), args)
+        return row[0]
+    finally:
+        await adapter.release(conn)
+
+
+async def apply_schema(adapter):
+    """执行 tests/schema/<db>.sql 建表（IF NOT EXISTS，幂等）"""
+    path = os.path.join(os.path.dirname(__file__), "schema", DB + ".sql")
+    conn = await adapter.acquire()
+    try:
+        buf = ""
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("--"):
+                continue
+            buf += line + " "
+            if line.endswith(";"):
+                await conn.execute(buf.rstrip(";"), [])
+                buf = ""
+    finally:
+        await adapter.release(conn)
+
+
+async def cleanup(adapter):
+    conn = await adapter.acquire()
+    try:
+        await conn.execute(sql_of(adapter,
+            "DELETE FROM wf_process_task_actor WHERE process_task_id IN"
+            " (SELECT id FROM wf_process_task WHERE process_instance_id IN"
+            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?))"),
+            [DEFINE_ID])
+        await conn.execute(sql_of(adapter,
+            "DELETE FROM wf_process_cc_instance WHERE process_instance_id IN"
+            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?)"),
+            [DEFINE_ID])
+        await conn.execute(sql_of(adapter,
+            "DELETE FROM wf_process_task WHERE process_instance_id IN"
+            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?)"),
+            [DEFINE_ID])
+        await conn.execute(sql_of(adapter, "DELETE FROM wf_process_instance WHERE process_define_id = ?"),
+                            [DEFINE_ID])
+        await conn.execute(sql_of(adapter, "DELETE FROM wf_process_define WHERE id = ?"), [DEFINE_ID])
+    finally:
+        await adapter.release(conn)
+
+
+def load_flow(name):
+    with open(os.path.join(FLOWS_DIR, name), encoding="utf-8") as f:
+        return f.read()
+
+
 class TestIDGen(IDGenerator):
     """时间戳 + 序号（避免与数据库已有 ID 冲突）"""
 
@@ -63,54 +156,35 @@ class TestUserProv:
                         postId="P01", postName="岗位")
 
 
-async def cleanup(pool):
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM wf_process_task_actor WHERE process_task_id IN"
-                " (SELECT id FROM wf_process_task WHERE process_instance_id IN"
-                " (SELECT id FROM wf_process_instance WHERE process_define_id = %s))", (DEFINE_ID,))
-            await cur.execute(
-                "DELETE FROM wf_process_cc_instance WHERE process_instance_id IN"
-                " (SELECT id FROM wf_process_instance WHERE process_define_id = %s)", (DEFINE_ID,))
-            await cur.execute(
-                "DELETE FROM wf_process_task WHERE process_instance_id IN"
-                " (SELECT id FROM wf_process_instance WHERE process_define_id = %s)", (DEFINE_ID,))
-            await cur.execute("DELETE FROM wf_process_instance WHERE process_define_id = %s", (DEFINE_ID,))
-            await cur.execute("DELETE FROM wf_process_define WHERE id = %s", (DEFINE_ID,))
-
-
-def load_flow(name):
-    with open(os.path.join(FLOWS_DIR, name), encoding="utf-8") as f:
-        return f.read()
-
-
 async def main():
-    pool = await aiomysql.create_pool(**DSN)
+    print(f"== JdbcRepository 集成测试（{DB} @ 192.168.1.160）==")
+    pool = await make_pool()
     try:
-        await cleanup(pool)
-        repo = JdbcRepository(MySqlAdapter(pool), TsIDGenerator())
+        adapter = make_adapter(pool)
+        await apply_schema(adapter)
+        await cleanup(adapter)
+        repo = JdbcRepository(adapter, TsIDGenerator())
         eng = EngineImpl(repo, TestUserProv(), TestIDGen())
 
-        # ── ① 插入流程定义（01-simple：start→apply(applicant)→task1(leader)→end）
+        # ── ① 插入流程定义（01-simple：start→apply(发起人)→task1(leader)→end）
         content = load_flow("01-simple.json")
         raw = json.loads(content)
-        define = ProcessDefine(id=DEFINE_ID, name="py-simple", displayName=raw["displayName"],
-                               type=raw["type"], state=1, content=content, version=1)
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                from datetime import datetime
-                now = datetime.now()
-                await cur.execute(
-                    "INSERT INTO wf_process_define (id, name, display_name, type, state, content,"
-                    " version, create_time, create_user, update_time, update_user)"
-                    " VALUES (%s,%s,%s,%s,1,%s,1,%s,%s,%s,%s)",
-                    (define.id, define.name, define.displayName, define.type, define.content,
-                     now, "py-test", now, "py-test"))
+        conn = await adapter.acquire()
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            await conn.execute(sql_of(adapter,
+                "INSERT INTO wf_process_define (id, name, display_name, type, state, content,"
+                " version, create_time, create_user, update_time, update_user)"
+                " VALUES (?,?,?,?,1,?,1,?,?,?,?)"),
+                [DEFINE_ID, "py-simple", raw["displayName"], raw["type"], content,
+                 now, "py-test", now, "py-test"])
+        finally:
+            await adapter.release(conn)
 
-        # ── ② 启动：start → apply（applicant）
+        # ── ② 启动：start → apply（发起人 zhangsan，applicant→发起人）
         inst = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
-                                                      {"amount": "1000", "BUSINESS_NO": "BIZ-PY-001"})
+                                                      {"amount": "1000", "BUSINESS_NO": f"BIZ-{DB}-001"})
         check("启动后实例进行中", inst.state == InstanceState.DOING, str(inst.state))
         check("生成业务号", bool(inst.businessNo), inst.businessNo)
         doing = await repo.find_doing_tasks(inst.id)
@@ -135,10 +209,11 @@ async def main():
         inst = await eng.execute_process_task(doing[0].id, "leader", {"comment": "ok"})
         check("流程实例完成", inst.state == InstanceState.DONE, str(inst.state))
 
-        # ── ⑤ 重新连接验证持久化
-        pool2 = await aiomysql.create_pool(**DSN)
+        # ── ⑤ 重新连接验证持久化（直查数据库）
+        pool2 = await make_pool()
         try:
-            repo2 = JdbcRepository(MySqlAdapter(pool2), TsIDGenerator())
+            adapter2 = make_adapter(pool2)
+            repo2 = JdbcRepository(adapter2, TsIDGenerator())
             inst2 = await repo2.find_instance_by_id(inst.id)
             check("重新加载实例状态完成", inst2 is not None and inst2.state == InstanceState.DONE,
                   str(inst2.state if inst2 else None))
@@ -148,17 +223,15 @@ async def main():
             check("历史任务 2 条", len(hist) == 2, str(len(hist)))
             check("任务参与者关系持久化", all(len(t.actorIds) > 0 for t in hist),
                   str([t.actorIds for t in hist]))
-            async with pool2.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT state FROM wf_process_instance WHERE id = %s", (inst.id,))
-                    row = await cur.fetchone()
-            check("直查数据库实例已完成", row and row[0] == int(InstanceState.DONE), str(row))
+            state = await raw_count(adapter2,
+                                    "SELECT state FROM wf_process_instance WHERE id = ?", [inst.id])
+            check("直查数据库实例已完成", state == int(InstanceState.DONE), str(state))
         finally:
-            pool2.close()
-            await pool2.wait_closed()
+            await close_pool(pool2)
 
         # ── ⑥ 权限负向：非参与者操作被拒（沿用 ⑤ 的流程数据）
-        inst = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan", {"BUSINESS_NO": "BIZ-PY-002"})
+        inst = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
+                                                      {"BUSINESS_NO": f"BIZ-{DB}-002"})
         doing = await repo.find_doing_tasks(inst.id)
         denied = False
         try:
@@ -172,7 +245,9 @@ async def main():
         check("被拒后任务仍进行中", t is not None and t.taskState == TaskState.DOING, str(t.taskState))
 
         # ── ⑦ 事务（spec §7.4）：提交 / 回滚 / 事务内绑定读
-        await cleanup(pool)
+        await cleanup(adapter)
+        tx_inst_id = DEFINE_ID + 1
+        tx_cc_id = DEFINE_ID + 1
 
         async def tx_commit():
             async def work():
@@ -180,22 +255,21 @@ async def main():
                 from jeeflow.model import ProcessInstance
                 now = datetime.now()
                 await repo.save_instance(ProcessInstance(
-                    id=900003, defineId=DEFINE_ID, state=InstanceState.DOING, operator="zhangsan",
-                    businessNo="TXN-PY-001", variables={"k": "v"}, createTime=now, updateTime=now,
+                    id=tx_inst_id, defineId=DEFINE_ID, state=InstanceState.DOING, operator="zhangsan",
+                    businessNo="TXN-001", variables={"k": "v"}, createTime=now, updateTime=now,
                     createUser="t", updateUser="t"))
-                await repo.create_cc_instance(900003, "zhangsan", "lisi", "wangwu")
-                got = await repo.find_instance_by_id(900003)  # 事务内绑定读
+                await repo.create_cc_instance(tx_inst_id, "zhangsan", "lisi", "wangwu")
+                got = await repo.find_instance_by_id(tx_inst_id)  # 事务内绑定读
                 return got is not None
-            ok = await repo.with_tx(work)
-            return ok
+            return await repo.with_tx(work)
+
         ok = await tx_commit()
         check("事务提交落库", ok)
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT COUNT(*) FROM wf_process_instance WHERE id = 900003")
-                n = (await cur.fetchone())[0]
-                await cur.execute("SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = 900003")
-                cc = (await cur.fetchone())[0]
+        n = await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_instance WHERE id = ?",
+                            [tx_inst_id])
+        cc = await raw_count(adapter,
+                             "SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ?",
+                             [tx_inst_id])
         check("实例 1 条 + 抄送 2 条", n == 1 and cc == 2, f"instance={n} cc={cc}")
 
         async def tx_rollback():
@@ -204,36 +278,41 @@ async def main():
                 from jeeflow.model import ProcessInstance
                 now = datetime.now()
                 await repo.save_instance(ProcessInstance(
-                    id=900004, defineId=DEFINE_ID, state=InstanceState.DOING, operator="zhangsan",
-                    createTime=now, updateTime=now, createUser="t", updateUser="t"))
-                await repo.create_cc_instance(900004, "zhangsan", "lisi")
+                    id=tx_inst_id + 1, defineId=DEFINE_ID, state=InstanceState.DOING,
+                    operator="zhangsan", createTime=now, updateTime=now, createUser="t",
+                    updateUser="t"))
+                await repo.create_cc_instance(tx_inst_id + 1, "zhangsan", "lisi")
                 raise RuntimeError("boom")
             try:
                 await repo.with_tx(work)
                 return False
             except RuntimeError:
                 return True
+
         ok = await tx_rollback()
         check("事务异常回滚", ok)
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT COUNT(*) FROM wf_process_instance WHERE id = 900004")
-                n = (await cur.fetchone())[0]
-                await cur.execute("SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = 900004")
-                cc = (await cur.fetchone())[0]
+        n = await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_instance WHERE id = ?",
+                            [tx_inst_id + 1])
+        cc = await raw_count(adapter,
+                             "SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ?",
+                             [tx_inst_id + 1])
         check("回滚后无残留数据", n == 0 and cc == 0, f"instance={n} cc={cc}")
 
         # 清理测试残留
-        await cleanup(pool)
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM wf_process_instance WHERE id = 900003")
-                await cur.execute("DELETE FROM wf_process_cc_instance WHERE process_instance_id = 900003")
+        await cleanup(adapter)
+        conn = await adapter.acquire()
+        try:
+            await conn.execute(sql_of(adapter, "DELETE FROM wf_process_instance WHERE id = ?"),
+                               [tx_inst_id])
+            await conn.execute(sql_of(adapter,
+                               "DELETE FROM wf_process_cc_instance WHERE process_instance_id = ?"),
+                               [tx_inst_id])
+        finally:
+            await adapter.release(conn)
     finally:
-        pool.close()
-        await pool.wait_closed()
+        await close_pool(pool)
 
-    print(f"\nPython JDBC 集成测试: {passed} passed, {failed} failed")
+    print(f"\nPython JDBC 集成测试（{DB}）: {passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
 
 

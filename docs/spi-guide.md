@@ -104,3 +104,14 @@ from jeeflow import EngineImpl
 engine = EngineImpl(MyRepository(), MyUserProvider(), MyIdGen(), MyExpr())
 inst = await engine.start_process_instance_by_id(define_id, operator, args)
 ```
+
+## 集成测试
+
+`tests/jdbc_test.py` **双库可跑**（同一套断言，与数据库无关）：
+
+```bash
+python tests/jdbc_test.py mysql     # 开发服务器 MySQL(3306)
+python tests/jdbc_test.py postgres  # 开发服务器 PostgreSQL(5432，Docker mldong-pg)
+```
+
+建表 SQL 自动从 `tests/schema/<db>.sql` 执行（IF NOT EXISTS，幂等）。已实测：mysql 20/20、postgres 20/20 全过。

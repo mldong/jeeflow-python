@@ -34,7 +34,7 @@ for task in await repo.find_doing_tasks(inst.id):
 
 ## 变量注入
 
-引擎每次操作自动注入用户信息到流程变量：`u_userId` / `u_realName` / `u_deptId` / `u_deptName` / `u_postId` / `u_postName`（来自 `UserProvider`），key 与 boot2 一致。
+引擎每次操作自动注入用户信息到流程变量：`u_userId` / `u_realName` / `u_deptId` / `u_deptName` / `u_postId` / `u_postName`（来自 `UserProvider`），key 与 mldong 框架一致。
 
 ## 状态码
 

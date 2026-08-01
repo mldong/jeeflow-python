@@ -19,7 +19,7 @@ engine = EngineImpl(repo, user_prov, idgen, expr_eval)
 
 ## REST 端点
 
-demo 提供了完整的 boot2 兼容端点（`/wf/processDefine/*`、`/wf/processInstance/*`、`/wf/processTask/*`、`/api/stats`），直接复制或按需裁剪：
+demo 提供了完整的 mldong 框架兼容端点（`/wf/processDefine/*`、`/wf/processInstance/*`、`/wf/processTask/*`、`/api/stats`），直接复制或按需裁剪：
 
 ```python
 @app.post("/wf/processDefine/startAndExecute")

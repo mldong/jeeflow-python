@@ -50,7 +50,8 @@ repo = JdbcRepository(MySqlAdapter(pool))  # 关系表主键用内置时间戳 I
 > **新增数据库** = 写一个适配器（约 80 行，参考 `repository/mysql.py`）：实现
 > `SqlAdapter`（占位符风格 + acquire/release）+ 连接包装（execute/fetchone/fetchall/
 > begin/commit/rollback）。SQL 核心统一用 `?` 占位符，由适配器转换
-> （MySQL `%s` / PostgreSQL `$n`）。建表 SQL 见 `tests/schema/<db>.sql`。
+> （MySQL `%s` / PostgreSQL `$n`）。建表 SQL 唯一来源：jeeflow-java 仓
+> `jeeflow-repository-jdbc/src/test/resources/schema-<db>.sql`（h2/mysql/postgres 三份方言并排）。
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
 
@@ -114,4 +115,4 @@ python tests/jdbc_test.py mysql     # 开发服务器 MySQL(3306)
 python tests/jdbc_test.py postgres  # 开发服务器 PostgreSQL(5432，Docker mldong-pg)
 ```
 
-建表 SQL 自动从 `tests/schema/<db>.sql` 执行（IF NOT EXISTS，幂等）。已实测：mysql 20/20、postgres 20/20 全过。
+建表 SQL 自动从 jeeflow-java 仓 resources/ 执行（唯一来源，IF NOT EXISTS 幂等）。已实测：mysql 20/20、postgres 20/20 全过。

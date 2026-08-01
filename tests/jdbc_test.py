@@ -4,7 +4,7 @@
 
 前置条件：
   - 开发服务器（192.168.1.160）：MySQL(3306) / PostgreSQL(5432，Docker mldong-pg)
-  - 建表 SQL 自动从 tests/schema/<db>.sql 执行（IF NOT EXISTS，幂等）
+  - 建表 SQL 自动从 jeeflow-java 仓 resources/schema-<db>.sql 执行（唯一来源，IF NOT EXISTS 幂等）
 测试数据固定 define ID（mysql=900002 / postgres=910002），开头清理，可重复执行。
 """
 import asyncio
@@ -35,6 +35,9 @@ else:
 
 FLOWS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
                          "jeeflow-core", "src", "test", "resources", "flows")
+# 建表 SQL 唯一来源：jeeflow-java 仓 resources（schema-h2/mysql/postgres.sql，各语言引用）
+SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
+                          "jeeflow-repository-jdbc", "src", "test", "resources")
 
 passed = 0
 failed = 0
@@ -92,8 +95,8 @@ async def raw_count(adapter, sql, args=()):
 
 
 async def apply_schema(adapter):
-    """执行 tests/schema/<db>.sql 建表（IF NOT EXISTS，幂等）"""
-    path = os.path.join(os.path.dirname(__file__), "schema", DB + ".sql")
+    """执行 jeeflow-java 仓 schema-<db>.sql 建表（IF NOT EXISTS，幂等）"""
+    path = os.path.join(SCHEMA_DIR, f"schema-{DB}.sql")
     conn = await adapter.acquire()
     try:
         buf = ""

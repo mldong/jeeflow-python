@@ -4,7 +4,7 @@
 
 前置条件：
   - 开发服务器（192.168.1.160）：MySQL(3306) / PostgreSQL(5432，Docker mldong-pg)
-  - 建表 SQL 自动从 jeeflow-java 仓 resources/schema-<db>.sql 执行（唯一来源，IF NOT EXISTS 幂等）
+  - 建表 SQL 自动从本仓 tests/schema/schema-<db>.sql 执行（各语言自带，IF NOT EXISTS 幂等）
 测试数据固定 define ID（mysql=900002 / postgres=910002），开头清理，可重复执行。
 """
 import asyncio
@@ -24,20 +24,24 @@ from jeeflow.spi import IDGenerator
 
 DB = sys.argv[1] if len(sys.argv) > 1 else "mysql"
 
+# 连接信息可用环境变量覆盖（使用者指向自己的库），默认开发服务器
+_DB_HOST = os.environ.get("JEFFLOW_DB_HOST", "192.168.1.160")
+_DB_PORT = int(os.environ.get("JEFFLOW_DB_PORT", "5432" if DB == "postgres" else "3306"))
+_DB_USER = os.environ.get("JEFFLOW_DB_USER", "postgres" if DB == "postgres" else "root")
+_DB_PWD = os.environ.get("JEFFLOW_DB_PWD", "8Eli#gr#AUk")
+
 if DB == "postgres":
-    DSN = dict(host="192.168.1.160", port=5432, user="postgres", password="8Eli#gr#AUk",
-               database="jeeflow")
+    DSN = dict(host=_DB_HOST, port=_DB_PORT, user=_DB_USER, password=_DB_PWD, database="jeeflow")
     DEFINE_ID = 910002
 else:
-    DSN = dict(host="192.168.1.160", port=3306, user="root", password="8Eli#gr#AUk",
+    DSN = dict(host=_DB_HOST, port=_DB_PORT, user=_DB_USER, password=_DB_PWD,
                db="jeeflow", charset="utf8mb4", autocommit=True, maxsize=5)
     DEFINE_ID = 900002
 
 FLOWS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
                          "jeeflow-core", "src", "test", "resources", "flows")
-# 建表 SQL 唯一来源：jeeflow-java 仓 resources（schema-h2/mysql/postgres.sql，各语言引用）
-SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
-                          "jeeflow-repository-jdbc", "src", "test", "resources")
+# 建表 SQL 各语言自带（维护者改 jeeflow-java 仓 resources 后用 scripts/sync-schema.sh 分发）
+SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "schema")
 
 passed = 0
 failed = 0
@@ -95,7 +99,7 @@ async def raw_count(adapter, sql, args=()):
 
 
 async def apply_schema(adapter):
-    """执行 jeeflow-java 仓 schema-<db>.sql 建表（IF NOT EXISTS，幂等）"""
+    """执行本仓 tests/schema/schema-<db>.sql 建表（IF NOT EXISTS，幂等）"""
     path = os.path.join(SCHEMA_DIR, f"schema-{DB}.sql")
     conn = await adapter.acquire()
     try:

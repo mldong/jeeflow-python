@@ -4,14 +4,14 @@ version = "0.1.0"
 description = "Lightweight async workflow engine - Python implementation"
 requires-python = ">=3.10"
 
-# JDBC 参考实现（jeeflow/jdbc.py）依赖 aiomysql；
-# 只用内存仓储（MemoryRepository）时无需安装
-dependencies = [
-    "aiomysql>=0.2.0",
-]
+# 核心零依赖。JDBC 仓储按数据库选装（pip install jeeflow[mysql] / jeeflow[postgres]）；
+# 只用内存仓储（MemoryRepository）时无需任何额外安装
+dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+mysql = ["aiomysql>=0.2.0"]
+postgres = ["asyncpg>=0.29.0"]
+dev = ["pytest", "pytest-asyncio", "aiomysql"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

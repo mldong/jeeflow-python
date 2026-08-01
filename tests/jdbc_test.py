@@ -15,7 +15,7 @@ import aiomysql
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jeeflow import EngineImpl
-from jeeflow.jdbc import JdbcRepository, TsIDGenerator
+from jeeflow.repository import JdbcRepository, TsIDGenerator, MySqlAdapter
 from jeeflow.model import ProcessDefine, InstanceState, TaskState, UserInfo
 from jeeflow.spi import IDGenerator
 
@@ -89,7 +89,7 @@ async def main():
     pool = await aiomysql.create_pool(**DSN)
     try:
         await cleanup(pool)
-        repo = JdbcRepository(pool, TsIDGenerator())
+        repo = JdbcRepository(MySqlAdapter(pool), TsIDGenerator())
         eng = EngineImpl(repo, TestUserProv(), TestIDGen())
 
         # ── ① 插入流程定义（01-simple：start→apply(applicant)→task1(leader)→end）
@@ -138,7 +138,7 @@ async def main():
         # ── ⑤ 重新连接验证持久化
         pool2 = await aiomysql.create_pool(**DSN)
         try:
-            repo2 = JdbcRepository(pool2, TsIDGenerator())
+            repo2 = JdbcRepository(MySqlAdapter(pool2), TsIDGenerator())
             inst2 = await repo2.find_instance_by_id(inst.id)
             check("重新加载实例状态完成", inst2 is not None and inst2.state == InstanceState.DONE,
                   str(inst2.state if inst2 else None))

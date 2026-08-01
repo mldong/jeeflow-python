@@ -1,43 +1,16 @@
-# Python 快速开始
+# jeeflow-python 文档
 
-> jeeflow 引擎的 **Python 实现**——对齐 Java 参考实现的行为语义。本文面向 Python 开发者：安装、启动演示站、跑测试、生产部署。
+> jeeflow 引擎的 **Python 实现**——对齐 Java 参考实现的行为语义。本文档面向 Python 开发者，内容也聚合到[文档站语言指南](https://jeeflow-doc.mldong.com/languages/python/)。
 
-## 环境要求
+## 快速开始
 
-- Python 3.10+
-- 依赖：`fastapi`、`uvicorn`（引擎核心零第三方依赖，纯异步标准库）
+| 文档 | 内容 |
+|------|------|
+| [演示站（Demo）](./index.md) | 启动演示站（:8100）、快速验证、测试、生产部署 |
+| [引擎 API](./engine-api.md) | `EngineImpl` 核心方法（异步风格） |
+| [SPI 实现指南](./spi-guide.md) | `ProcessRepository` / `UserProvider` 等 SPI |
 
-## 启动演示站（:8100）
+## 相关
 
-```bash
-pip install fastapi uvicorn
-python demo/main.py
-# → http://localhost:8100（uvicorn 热重载）
-```
-
-> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 10 个示例流程。对接 jeeflow-ui（:5173）时右上角切到 `🐍 Python :8100`；接口规范见 [文档站 REST API 指南](https://jeeflow-doc.mldong.com/guides/03-api)。
-
-## 快速验证
-
-```bash
-B=http://localhost:8100
-curl -s -X POST $B/wf/processDefine/page -H "Content-Type: application/json" -d '{}'   # → {"code":0,"msg":"成功",...}
-curl -s -X POST $B/wf/processDefine/startAndExecute -H "Content-Type: application/json" -d '{"processDefineId":9,"operator":"user1","amount":500}'
-```
-
-完整验证矩阵（同意/拒绝/退回发起人/highLight/approvalRecord）见文档站通用指南。
-
-## 运行测试
-
-```bash
-python tests/spec_test.py   # 引擎合规测试 10 项
-python tests/e2e_test.py    # 接口端到端测试 34 项
-```
-
-## 生产部署
-
-```bash
-uvicorn demo.main:app --host 0.0.0.0 --port 8100 --workers 4
-```
-
-生产接入：实现 `ProcessRepository` SPI（内存/DB 随意），映射 [SPEC §2](https://jeeflow-doc.mldong.com/spec/) 的 5 张表。
+- 引擎规范（唯一事实来源）：[SPEC](https://jeeflow-doc.mldong.com/spec/)
+- 设计原理 / 通用指南：[jeeflow-doc](https://jeeflow-doc.mldong.com/)

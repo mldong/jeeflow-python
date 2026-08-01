@@ -1,6 +1,6 @@
 # jeeflow · Python
 
-轻量级异步工作流引擎 — Python 实现，对齐 [jeeflow SPEC](../jeeflow-doc/SPEC.md)。
+轻量级异步工作流引擎 — Python 实现，对齐 [jeeflow SPEC](https://jeeflow-doc.mldong.com/spec/)。
 
 ## 快速开始
 

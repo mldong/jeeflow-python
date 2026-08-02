@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from .engine import Engine
-from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate
+from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState
 from .spi import ProcessExtRepository, ProcessRepository
 
 # submitType 枚举（对齐 boot3）
@@ -94,13 +94,26 @@ class JeeflowFacade:
         inst = await self._repo.find_instance_by_id(instance_id)
         if not inst:
             raise ValueError("流程实例不存在")
+        graph = await self._instance_json_object(inst)
+        first_task_id = self._first_task_node_id(graph)
+        tasks, active_task_list = [], []
+        for t in inst.tasks:
+            vo = self._task_vo(t)
+            ext = dict(t.variables or {})
+            doing = t.taskState == TaskState.DOING
+            ext["isFirstTaskNode"] = doing and t.taskName == first_task_id
+            vo["ext"] = ext
+            tasks.append(vo)
+            if doing:
+                active_task_list.append(vo)
         return {
             "id": inst.id, "parentId": inst.parentId, "processDefineId": inst.defineId,
             "state": inst.state, "parentNodeName": inst.parentNodeName,
             "businessNo": inst.businessNo, "operator": inst.operator,
             "variables": inst.variables, "createTime": inst.createTime, "createUser": inst.createUser,
-            "jsonObject": self._instance_json_object(inst),
-            "tasks": [self._task_vo(t) for t in inst.tasks],
+            "jsonObject": graph,
+            "tasks": tasks,
+            "activeTaskList": active_task_list,
         }
 
     async def _processInstance_startAndExecute(self, args: dict) -> dict:
@@ -726,3 +739,11 @@ class JeeflowFacade:
         """实例关联定义的 jsonObject"""
         def_ = await self._repo.find_define_by_id(inst.defineId)
         return self._parse_graph(def_.content) if def_ else None
+
+    @staticmethod
+    def _first_task_node_id(graph: Optional[dict]) -> Optional[str]:
+        """流程 JSON 中第一个任务节点 id（issues/05-4 isFirstTaskNode 用）"""
+        for n in (graph or {}).get("nodes", []):
+            if isinstance(n, dict) and n.get("type") == "snaker:task":
+                return n.get("id")
+        return None

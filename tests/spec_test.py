@@ -526,3 +526,31 @@ async def test_facade_view_endpoints():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+# ─── Test 03.5: highLight 决策分支表达式过滤（issues/06） ─────────────────────
+
+@pytest.mark.asyncio
+async def test_highlight_filters_decision_branch():
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, None)
+    df = load_flow(repo, "03-decision-expr.json")
+    # amount=500 → 走「amount <= 1000」分支（task3），task2 分支未执行
+    inst = await _start_and_execute(eng, repo, df.id, "applicant", {"amount": 500})
+    doing = await repo.find_doing_tasks(inst.id)
+    for t in doing:
+        if t.taskName == "task1":
+            await repo.add_task_actor(t.id, ["leader"])
+            await eng.execute_process_task(t.id, "leader")
+    doing = await repo.find_doing_tasks(inst.id)
+    for t in doing:
+        if t.taskName == "task3":
+            await repo.add_task_actor(t.id, ["director"])
+            await eng.execute_process_task(t.id, "director")
+
+    r = await facade.flow("processInstance/highLight", {"id": inst.id})
+    assert r["code"] == 0, r
+    hl = r["data"]
+    assert "e4" in hl["historyEdgeNames"] and "e6" in hl["historyEdgeNames"], hl
+    assert "e3" not in hl["historyEdgeNames"] and "e5" not in hl["historyEdgeNames"], hl
+    assert "task2" not in hl["historyNodeNames"], hl
+    assert "task3" in hl["historyNodeNames"], hl

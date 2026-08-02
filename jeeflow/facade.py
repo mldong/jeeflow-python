@@ -393,21 +393,29 @@ class JeeflowFacade:
         if def_:
             try:
                 flow = json.loads(def_.content)
-                self._collect_path(flow, "start", "", active, history, edges, set())
+                await self._collect_path(flow, "start", "", active, history, edges, set(),
+                                         inst.variables, his)
             except Exception:
                 pass
         return {"activeNodeNames": active, "historyNodeNames": history, "historyEdgeNames": edges}
 
-    def _collect_path(self, flow: dict, node_id: str, edge_name: str,
-                      active: list, history: list, edges: list, visited: set):
+    async def _collect_path(self, flow: dict, node_id: str, edge_name: str,
+                            active: list, history: list, edges: list, visited: set,
+                            vars_: dict, history_tasks: list):
         if node_id in visited:
             return
         visited.add(node_id)
         if edge_name and edge_name not in edges:
             edges.append(edge_name)
+        src = self._find_node(flow, node_id)
         for e in flow.get("edges", []):
             if e.get("sourceNodeId") != node_id:
                 continue
+            # 决策节点：输出边表达式求值过滤（对齐 boot3 recursionModel，issues/06）
+            if src and src.get("type") == "snaker:decision":
+                expr = (e.get("properties") or {}).get("expr")
+                if expr and not await self._eval_decision_expr(flow, src, expr, vars_, history_tasks):
+                    continue
             target = self._find_node(flow, e.get("targetNodeId"))
             if not target:
                 continue
@@ -416,7 +424,25 @@ class JeeflowFacade:
                 history.append(tid)
             if tid in active:
                 continue
-            self._collect_path(flow, tid, e.get("id"), active, history, edges, visited)
+            await self._collect_path(flow, tid, e.get("id"), active, history, edges, visited,
+                                     vars_, history_tasks)
+
+    async def _eval_decision_expr(self, flow: dict, decision: dict, expr: str,
+                                  vars_: dict, history_tasks: list) -> bool:
+        """决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量）"""
+        import asyncio
+        args = dict(vars_ or {})
+        for e in flow.get("edges", []):
+            if e.get("targetNodeId") == decision.get("id"):
+                for t in history_tasks or []:
+                    if t.taskName == e.get("sourceNodeId") and t.variables:
+                        args.update(t.variables)
+                    break
+                break
+        result = await self._engine.eval_expr(expr, args)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return bool(result)
 
     @staticmethod
     def _find_node(flow: dict, node_id):

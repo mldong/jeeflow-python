@@ -46,6 +46,12 @@ class EngineImpl(Engine):
 
     def set_extensions(self, ext: EngineExtensions): self.ext = ext
 
+    async def eval_expr(self, expr: str, vars_: dict) -> Any:
+        """表达式求值（v1.5.0，门面 highLight 决策分支过滤用）"""
+        if self.expr_eval is None:
+            raise ValueError("ExpressionEvaluator 未配置")
+        return await self.expr_eval.eval(expr, vars_)
+
     # ─── Start ────────────────────────────────────────────────────────────────
 
     async def start_process_instance_by_id(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:

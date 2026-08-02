@@ -19,6 +19,8 @@ import asyncpg
 
 from jeeflow import EngineImpl
 from jeeflow.repository import JdbcRepository, TsIDGenerator, MySqlAdapter, PostgresAdapter, convert_placeholder
+from jeeflow.repository.ext import JdbcProcessExtRepository
+from jeeflow.model import ProcessDesign, ProcessDesignHis, ProcessSurrogate
 from jeeflow.model import ProcessDefine, InstanceState, TaskState, UserInfo
 from jeeflow.spi import IDGenerator
 
@@ -352,6 +354,42 @@ async def main():
         check("update_instance 级联任务状态落库",
               all(t.taskState == TaskState.ABANDONED for t in after),
               str([int(t.taskState) for t in after]))
+
+        # ── ⑩ 扩展仓储：设计 CRUD + 委托生效（v1.1.0）──
+        from jeeflow.memory import MemoryExtRepository  # noqa: F401
+        ext_repo = JdbcProcessExtRepository(adapter, TsIDGenerator())
+        d = ProcessDesign(name="pyext-design", displayName="扩展设计", type="approval",
+                          createUser="t", updateUser="t")
+        await ext_repo.save_design(d)
+        check("save_design 生成 ID", d.id > 0, str(d.id))
+        await ext_repo.save_design_his(ProcessDesignHis(processDesignId=d.id, content='{"v":1}', createUser="t"))
+        await ext_repo.save_design_his(ProcessDesignHis(processDesignId=d.id, content='{"v":2}', createUser="t"))
+        his_list = await ext_repo.list_design_his(d.id)
+        check("设计历史倒序", len(his_list) == 2 and his_list[0].content == '{"v":2}', str(len(his_list)))
+        rows, total = await ext_repo.page_designs(filters={"name": "pyext-design"})
+        check("设计分页", total == 1 and len(rows) == 1, f"total={total}")
+        await ext_repo.remove_design(d.id)
+        check("remove_design 连带历史",
+              await ext_repo.find_design_by_id(d.id) is None and len(await ext_repo.list_design_his(d.id)) == 0)
+
+        # 委托生效查询
+        s_all = ProcessSurrogate(operator="pyext-op", surrogate="agent-all", enabled=1,
+                                 createUser="t", updateUser="t")
+        await ext_repo.save_surrogate(s_all)
+        hit = await ext_repo.get_surrogate("pyext-op", "leave")
+        check("全流程委托兜底", hit is not None and hit.surrogate == "agent-all",
+              str(hit.surrogate if hit else None))
+        check("无委托返回 None", await ext_repo.get_surrogate("nobody", "leave") is None)
+        srows, stotal = await ext_repo.page_surrogates(filters={"operator": "pyext-op"})
+        check("委托分页", stotal == 1 and len(srows) == 1, f"total={stotal}")
+        await ext_repo.remove_surrogate(s_all.id)
+        check("remove_surrogate", await ext_repo.find_surrogate_by_id(s_all.id) is None)
+
+        # ── ⑪ find_define_by_name（v1.1.0 deploy 版本管理用）──
+        latest = await repo.find_define_by_name("py-simple")
+        check("find_define_by_name 命中", latest is not None and latest.name == "py-simple",
+              str(latest.name if latest else None))
+        check("find_define_by_name 未命中", await repo.find_define_by_name("no-such-flow") is None)
 
         # 清理测试残留
         await cleanup(adapter)

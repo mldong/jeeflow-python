@@ -1,11 +1,15 @@
 """SPI 接口——对标 SPEC.md §6"""
 from abc import ABC, abstractmethod
 from typing import Any, Optional
-from .model import ProcessDefine, ProcessInstance, ProcessTask, UserInfo
+from .model import ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo
 
 class ProcessRepository(ABC):
     @abstractmethod
     async def find_define_by_id(self, id: int) -> Optional[ProcessDefine]: ...
+    @abstractmethod
+    async def find_define_by_name(self, name: str) -> Optional[ProcessDefine]:
+        """按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）"""
+        ...
     # 定义写操作（v1.0.1，集成反馈①）：保存/更新/启停/删除流程定义
     @abstractmethod
     async def save_define(self, define: ProcessDefine) -> None: ...
@@ -55,3 +59,45 @@ class IDGenerator(ABC):
 class ExpressionEvaluator(ABC):
     @abstractmethod
     async def eval(self, expr: str, vars: dict[str, Any]) -> Any: ...
+
+class ProcessExtRepository(ABC):
+    """扩展仓储 SPI（v1.1.0，可选）——流程设计 / 设计历史 / 委托代理
+
+    引擎核心不依赖本接口；门面（Facade）与委托参考实现使用。
+    """
+
+    # ── 流程设计（wf_process_design） ──
+    @abstractmethod
+    async def find_design_by_id(self, id: int) -> Optional[ProcessDesign]: ...
+    @abstractmethod
+    async def save_design(self, d: ProcessDesign) -> None: ...
+    @abstractmethod
+    async def update_design(self, d: ProcessDesign) -> None: ...
+    @abstractmethod
+    async def remove_design(self, id: int) -> None: ...
+    @abstractmethod
+    async def page_designs(self, page_num: int = 1, page_size: int = 10,
+                           filters: Optional[dict] = None) -> tuple[list[ProcessDesign], int]: ...
+
+    # ── 设计历史（wf_process_design_his） ──
+    @abstractmethod
+    async def save_design_his(self, his: ProcessDesignHis) -> None: ...
+    @abstractmethod
+    async def list_design_his(self, design_id: int) -> list[ProcessDesignHis]: ...
+
+    # ── 委托代理（wf_process_surrogate） ──
+    @abstractmethod
+    async def find_surrogate_by_id(self, id: int) -> Optional[ProcessSurrogate]: ...
+    @abstractmethod
+    async def save_surrogate(self, s: ProcessSurrogate) -> None: ...
+    @abstractmethod
+    async def update_surrogate(self, s: ProcessSurrogate) -> None: ...
+    @abstractmethod
+    async def remove_surrogate(self, id: int) -> None: ...
+    @abstractmethod
+    async def page_surrogates(self, page_num: int = 1, page_size: int = 10,
+                              filters: Optional[dict] = None) -> tuple[list[ProcessSurrogate], int]: ...
+
+    # GetSurrogate 查询指定时间生效中的委托（enabled=1 + 时间窗内；processName 精确优先，空值全流程兜底）
+    @abstractmethod
+    async def get_surrogate(self, operator: str, process_name: str, at=None) -> Optional[ProcessSurrogate]: ...

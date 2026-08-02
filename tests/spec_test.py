@@ -7,6 +7,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowInterceptor, EngineExtensions
+from jeeflow.facade import JeeflowFacade
+from jeeflow.memory import MemoryExtRepository
 from jeeflow.model import ProcessDefine, ProcessTask, TaskState, InstanceState, UserInfo
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 
@@ -347,6 +349,115 @@ async def test_system_execute_flow_auto():
     inst = await eng.execute_process_task(doing[0].id, "flow.admin")
     doing = await repo.find_doing_tasks(inst.id)
     assert doing[0].taskName == "task2", f"flow.admin 应放行执行: {doing[0].taskName}"
+
+
+@pytest.mark.asyncio
+async def test_facade_deploy_version():
+    """门面路由（v1.1.0，spec §12 #15）：deploy 版本管理 / 启停 / 删除"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    assert r["code"] == 0, r
+    define_id = r["data"]["processDefineId"]
+    d1 = await repo.find_define_by_id(define_id)
+    assert d1.version == 0, f"首次部署 version = {d1.version}, want 0"
+
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    assert r["code"] == 0, r
+    latest = await repo.find_define_by_name("simple")
+    assert latest.version == 1, f"二次部署 version = {latest.version}, want 1"
+
+    r = await facade.flow("processDefine/upAndDown", {"id": define_id, "state": 0})
+    assert r["code"] == 0, r
+    assert (await repo.find_define_by_id(define_id)).state == 0
+
+    r = await facade.flow("processDefine/remove", {"id": define_id})
+    assert r["code"] == 0, r
+    assert await repo.find_define_by_id(define_id) is None
+
+
+@pytest.mark.asyncio
+async def test_facade_instance_task_and_withdraw():
+    """门面路由：发起即提交 / 执行任务 / 撤回级联"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    define_id = r["data"]["processDefineId"]
+
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "zhangsan", "amount": "1000"})
+    assert r["code"] == 0, r
+    instance_id = r["data"]["processInstanceId"]
+
+    doing = await repo.find_doing_tasks(instance_id)
+    assert len(doing) == 1 and doing[0].taskName == "task1", [t.taskName for t in doing]
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": doing[0].id, "operator": "leader", "submitType": 1})
+    assert r["code"] == 0, r
+    inst = await repo.find_instance_by_id(instance_id)
+    assert inst.state == InstanceState.DONE, f"实例应完成: {inst.state}"
+
+    # withdraw 级联废弃 doing
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "zhangsan"})
+    instance_id2 = r["data"]["processInstanceId"]
+    r = await facade.flow("processInstance/withdraw", {"id": instance_id2, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    after = await repo.find_doing_tasks(instance_id2)
+    assert len(after) == 0, f"撤回应废弃 doing 任务: {after}"
+
+
+@pytest.mark.asyncio
+async def test_facade_design_and_surrogate():
+    """门面路由：设计保存/详情/发布 + 委托增查删"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+
+    r = await facade.flow("processDesign/save",
+                          {"name": "leave", "displayName": "请假流程", "content": content,
+                           "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    design_id = r["data"]["id"]
+
+    r = await facade.flow("processDesign/detail", {"id": design_id})
+    assert r["code"] == 0, r
+    assert r["data"]["jsonObject"] is not None
+    assert len(r["data"]["his"]) == 1
+
+    r = await facade.flow("processDesign/deploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    assert r["data"]["processDefineId"] > 0
+
+    r = await facade.flow("processSurrogate/save",
+                          {"operator": "zhangsan", "surrogate": "lisi", "processName": "leave"})
+    assert r["code"] == 0, r
+    surrogate_id = r["data"]["id"]
+    hit = await facade._ext.get_surrogate("zhangsan", "leave")
+    assert hit is not None and hit.surrogate == "lisi"
+
+    r = await facade.flow("processSurrogate/page", {"operator": "zhangsan"})
+    assert r["code"] == 0 and r["data"]["recordCount"] == 1, r
+
+    r = await facade.flow("processSurrogate/remove", {"id": surrogate_id})
+    assert r["code"] == 0, r
+
+
+@pytest.mark.asyncio
+async def test_facade_errors():
+    """门面错误路径：未知 action / 缺扩展仓储"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, None)
+    r = await facade.flow("foo/bar", {})
+    assert r["code"] == 99999999, r
+    r = await facade.flow("processDesign/page", {})
+    assert r["code"] == 99999999, r
 
 
 if __name__ == "__main__":

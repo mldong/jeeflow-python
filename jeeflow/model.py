@@ -191,6 +191,45 @@ class ProcessTask:
         return operator in self.actorIds
 
 @dataclass
+class ProcessDesign:
+    """流程设计（v1.1.0，wf_process_design）——设计器保存的设计稿元信息"""
+    id: int = 0
+    name: str = ""
+    displayName: str = ""
+    type: str = "approval"
+    icon: str = ""
+    isDeployed: int = 0
+    remark: str = ""
+    createTime: Any = None
+    createUser: str = ""
+    updateTime: Any = None
+    updateUser: str = ""
+
+@dataclass
+class ProcessDesignHis:
+    """流程设计历史（v1.1.0，wf_process_design_his）——每次保存的 content 快照"""
+    id: int = 0
+    processDesignId: int = 0
+    content: str = ""
+    createTime: Any = None
+    createUser: str = ""
+
+@dataclass
+class ProcessSurrogate:
+    """流程委托代理（v1.1.0，wf_process_surrogate）——授权人把待办委托给代理人"""
+    id: int = 0
+    processName: str = ""
+    operator: str = ""
+    surrogate: str = ""
+    startTime: Any = None
+    endTime: Any = None
+    enabled: int = 1
+    createTime: Any = None
+    createUser: str = ""
+    updateTime: Any = None
+    updateUser: str = ""
+
+@dataclass
 class UserInfo:
     userId: str = ""
     realName: str = ""

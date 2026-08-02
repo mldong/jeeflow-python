@@ -1,7 +1,9 @@
 """内存仓储——测试用"""
 from copy import deepcopy
-from .model import ProcessDefine, ProcessInstance, ProcessTask, TaskState
-from .spi import ProcessRepository
+from datetime import datetime
+from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState,
+                    ProcessDesign, ProcessDesignHis, ProcessSurrogate)
+from .spi import ProcessRepository, ProcessExtRepository
 
 class MemoryRepository(ProcessRepository):
     def __init__(self):
@@ -16,6 +18,14 @@ class MemoryRepository(ProcessRepository):
         self._defines[d.id] = d
 
     async def find_define_by_id(self, id): return deepcopy(self._defines.get(id))
+
+    async def find_define_by_name(self, name):
+        """按流程编码查最新一条定义（id 倒序取首条，v1.1.0）"""
+        best = None
+        for d in self._defines.values():
+            if d.name == name and (best is None or d.id > best.id):
+                best = d
+        return deepcopy(best) if best else None
 
     # ── 定义写操作（v1.0.1，对齐 SPI）──
 
@@ -87,3 +97,85 @@ class MemoryRepository(ProcessRepository):
     def all_instances(self): return list(self._instances.values())
     def all_tasks(self):
         return [deepcopy(t) for t in self._tasks.values()]
+
+
+class MemoryExtRepository(ProcessExtRepository):
+    """扩展仓储内存实现（v1.1.0，测试/演示用）"""
+
+    def __init__(self):
+        self._designs: dict[int, ProcessDesign] = {}
+        self._designHis: dict[int, list[ProcessDesignHis]] = {}
+        self._surrogates: dict[int, ProcessSurrogate] = {}
+        self._seq = 1
+
+    # ── 流程设计 ──
+
+    async def find_design_by_id(self, id): return deepcopy(self._designs.get(id))
+
+    async def save_design(self, d: ProcessDesign):
+        d.id = d.id or self._seq; self._seq += 1
+        now = datetime.now()
+        d.createTime = d.createTime or now
+        d.updateTime = d.updateTime or now
+        self._designs[d.id] = deepcopy(d)
+
+    async def update_design(self, d: ProcessDesign):
+        d.updateTime = datetime.now()
+        self._designs[d.id] = deepcopy(d)
+
+    async def remove_design(self, id: int):
+        self._designs.pop(id, None)
+        self._designHis.pop(id, None)
+
+    async def page_designs(self, page_num=1, page_size=10, filters=None):
+        rows = [deepcopy(d) for d in self._designs.values()]
+        return rows, len(rows)
+
+    # ── 设计历史 ──
+
+    async def save_design_his(self, his: ProcessDesignHis):
+        his.id = his.id or self._seq; self._seq += 1
+        his.createTime = his.createTime or datetime.now()
+        self._designHis.setdefault(his.processDesignId, []).insert(0, deepcopy(his))
+
+    async def list_design_his(self, design_id: int):
+        return [deepcopy(h) for h in self._designHis.get(design_id, [])]
+
+    # ── 委托代理 ──
+
+    async def find_surrogate_by_id(self, id): return deepcopy(self._surrogates.get(id))
+
+    async def save_surrogate(self, s: ProcessSurrogate):
+        s.id = s.id or self._seq; self._seq += 1
+        now = datetime.now()
+        s.createTime = s.createTime or now
+        s.updateTime = s.updateTime or now
+        s.enabled = s.enabled or 1
+        self._surrogates[s.id] = deepcopy(s)
+
+    async def update_surrogate(self, s: ProcessSurrogate):
+        s.updateTime = datetime.now()
+        self._surrogates[s.id] = deepcopy(s)
+
+    async def remove_surrogate(self, id: int):
+        self._surrogates.pop(id, None)
+
+    async def page_surrogates(self, page_num=1, page_size=10, filters=None):
+        rows = [deepcopy(s) for s in self._surrogates.values()]
+        return rows, len(rows)
+
+    async def get_surrogate(self, operator: str, process_name: str, at=None):
+        at = at or datetime.now()
+        fallback = None
+        for s in self._surrogates.values():
+            if s.operator != operator or s.enabled != 1:
+                continue
+            if s.startTime and s.startTime > at:
+                continue
+            if s.endTime and s.endTime < at:
+                continue
+            if s.processName == process_name and process_name:
+                return deepcopy(s)
+            if (not s.processName or s.processName == process_name) and fallback is None:
+                fallback = s
+        return deepcopy(fallback) if fallback else None

@@ -19,8 +19,8 @@ import time
 from datetime import datetime
 from typing import Any, Optional, Protocol, Sequence
 
-from ..model import ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState
-from ..spi import IDGenerator, ProcessRepository
+from ..model import ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, ProcessDesign, ProcessDesignHis, ProcessSurrogate
+from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository
 
 # 当前协程上下文绑定的事务连接
 _tx_conn_var: contextvars.ContextVar = contextvars.ContextVar("jeeflow_tx_conn", default=None)
@@ -127,6 +127,21 @@ class JdbcRepository(ProcessRepository):
                 await self._adapter.release(raw)
 
     # ── ProcessDefine ──────────────────────────────────────────────────────
+
+    async def find_define_by_name(self, name: str) -> Optional[ProcessDefine]:
+        """按流程编码查最新一条定义（id 倒序取首条，deploy 版本管理用）"""
+        async with self._conn() as conn:
+            row = await conn.fetchone(self._sql(
+                "SELECT id, name, display_name, type, state, content, version,"
+                " create_time, create_user, update_time, update_user"
+                " FROM wf_process_define WHERE name = ? ORDER BY version DESC LIMIT 1"), (name,))
+        if not row:
+            return None
+        return ProcessDefine(
+            id=row[0], name=row[1], displayName=row[2], type=row[3], state=row[4],
+            content=row[5].decode() if isinstance(row[5], (bytes, bytearray)) else (row[5] or ""),
+            version=row[6], createTime=row[7], createUser=row[8], updateTime=row[9], updateUser=row[10],
+        )
 
     async def find_define_by_id(self, id: int) -> Optional[ProcessDefine]:
         async with self._conn() as conn:

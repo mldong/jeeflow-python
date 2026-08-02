@@ -5,9 +5,7 @@
 ## 安装
 
 ```bash
-# ⚠️ 尚未发布到 PyPI——源码方式使用：
-git clone https://github.com/mldong/jeeflow-python
-# 你的项目里直接引用源码目录（或后续发布后 pip install jeeflow）
+pip install jeeflow
 ```
 
 引擎核心零第三方依赖（纯异步标准库），只需 Python 3.10+。

@@ -2,6 +2,9 @@
 
 轻量级异步工作流引擎 — Python 实现，对齐 [jeeflow SPEC](https://jeeflow-doc.mldong.com/spec/)。
 
+> **v1.1.0**：新增管理扩展（流程设计/历史/委托 + `ProcessExtRepository`）与统一门面
+> `JeeflowFacade.flow(action, dict)`；assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行对齐 boot2/boot3。
+
 ## 快速开始
 
 ```bash

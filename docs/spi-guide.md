@@ -115,3 +115,21 @@ python tests/jdbc_test.py postgres  # 开发服务器 PostgreSQL(5432，Docker m
 ```
 
 建表 SQL 自动从本仓 `tests/schema/` 执行（IF NOT EXISTS，幂等；维护者改 jeeflow-java 仓 resources 后跑 `jeeflow-hub/scripts/sync-schema.sh` 同步）。已实测：mysql 20/20、postgres 20/20 全过。
+
+---
+
+## 管理扩展与统一门面（v1.1.0）
+
+设计稿 / 历史 / 委托由扩展仓储 SPI 提供读写（文档站 spec §10），统一门面
+`flow(action, map)` 按 action 路由（spec §11.2），返回 `{code, msg, data}`，
+deploy 自动版本管理，execute 按 submitType 全分发，操作人由 `args.operator` 显式传入。
+
+扩展仓储实现（JDBC + 内存）与门面均在本仓库：
+- 扩展仓储：`<repository>/jdbc/ext.*`（JDBC）、memory 内存实现
+- 门面：`facade.*` / `jeeflow/facade.py` / `src/facade.ts`
+
+三张扩展表（wf_process_design / design_his / surrogate）SQL 已随 schema 分发
+（`schema-<db>.sql`，维护源 jeeflow-java resources）。
+
+> 分页说明（v1.1.0）：核心表分页 SPI（pageDefines/pageTodoTasks 等）目前 Java 提供，
+> 本语言对应分页 action 返回明确错误，计划 1.2.0 补齐；设计/委托分页全支持。

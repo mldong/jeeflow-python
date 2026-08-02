@@ -287,11 +287,24 @@ class JeeflowFacade:
             "remark": design.remark,
         }
         his_list = await ext.list_design_his(design_id)
+        json_object = None
         if his_list:
             try:
-                data["jsonObject"] = json.loads(his_list[0].content)
+                json_object = json.loads(his_list[0].content)
             except Exception:
                 pass
+        # issues/07：jsonObject 缺失基本信息时从设计表补齐（对齐 boot3 ProcessDesignServiceImpl.findById）
+        if not json_object or not isinstance(json_object, dict):
+            json_object = {}
+        if "name" not in json_object:
+            json_object["name"] = design.name
+        if "displayName" not in json_object:
+            json_object["displayName"] = design.displayName
+        if "type" not in json_object:
+            json_object["type"] = design.type
+        if "processDesignId" not in json_object:
+            json_object["processDesignId"] = design.id
+        data["jsonObject"] = json_object
         data["his"] = his_list
         return data
 

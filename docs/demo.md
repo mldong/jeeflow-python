@@ -40,4 +40,4 @@ python tests/e2e_test.py    # 接口端到端测试 34 项
 uvicorn demo.main:app --host 0.0.0.0 --port 8100 --workers 4
 ```
 
-生产接入：实现 `ProcessRepository` SPI（内存/DB 随意），映射 [SPEC §2](../../spec/) 的 5 张表。
+生产接入：实现 `ProcessRepository` SPI（内存/DB 随意），映射 [规范 01 · 数据模型](../../spec/01-data-model) 的 5 张表。

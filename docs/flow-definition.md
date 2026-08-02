@@ -46,7 +46,7 @@
 | `form` | 表单标识 |
 | `taskType` | `0` 主办 / `1` 协办 |
 
-> **约定**：每个流程的第一个任务节点是"发起申请"节点（`assignee="applicant"`），这是 startAndExecute 契约和"退回发起人"闭环的基础。完整属性表见 [SPEC](../../spec/)。
+> **约定**：每个流程的第一个任务节点是"发起申请"节点（`assignee="applicant"`），这是 startAndExecute 契约和"退回发起人"闭环的基础。完整属性表见 [规范 02 · 流程定义格式](../../spec/02-flow-definition)。
 
 ## 边
 

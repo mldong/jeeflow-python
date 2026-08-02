@@ -4,7 +4,7 @@
 
 ## ProcessRepository（必须）
 
-仓储是唯一必须实现的 SPI，映射 [SPEC §2](../../spec/) 的 5 张表（`wf_process_define/instance/task/task_actor/cc_instance`）：
+仓储是唯一必须实现的 SPI，映射 [规范 01 · 数据模型](../../spec/01-data-model) 的 5 张表（`wf_process_define/instance/task/task_actor/cc_instance`）：
 
 ```python
 class MyRepository(ProcessRepository):

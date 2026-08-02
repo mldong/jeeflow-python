@@ -239,6 +239,27 @@ class UserInfo:
     postName: Optional[str] = None
 
 
+@dataclass
+class CcInstanceRow:
+    """抄送实例行数据（ccList 分页，v1.3.0，对齐 Java InstanceRow）"""
+    id: int = 0
+    parentId: Optional[int] = None
+    defineId: int = 0
+    state: InstanceState = InstanceState.DOING
+    parentNodeName: str = ""
+    businessNo: str = ""
+    operator: str = ""
+    expireTime: Any = None
+    variables: dict = field(default_factory=dict)
+    createTime: Any = None
+    createUser: str = ""
+    updateTime: Any = None
+    updateUser: str = ""
+    defineName: str = ""
+    defineDisplayName: str = ""
+    defineVersion: int = 0
+
+
 # ─── JSON Parsing ────────────────────────────────────────────────────────────────
 
 def _pick(d: dict, *keys: str) -> dict:

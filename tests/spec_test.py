@@ -498,7 +498,7 @@ async def test_facade_view_endpoints():
     r = await facade.flow("processTask/latest", {"processInstanceId": instance_id})
     assert r["code"] == 0 and r["data"]["taskName"] == "task1", r
 
-    # 抄送：创建 + 已读；ccList 未实现
+    # 抄送：创建 + 已读 + 列表（ccList v1.3.0 补齐）
     r = await facade.flow("processInstance/createCCInstance",
                           {"processInstanceId": instance_id, "operator": "zhangsan",
                            "actorIds": ["lisi"]})
@@ -507,7 +507,7 @@ async def test_facade_view_endpoints():
                           {"processInstanceId": instance_id, "operator": "lisi"})
     assert r["code"] == 0, r
     r = await facade.flow("processInstance/ccList", {"operator": "lisi"})
-    assert r["code"] == 99999999, r
+    assert r["code"] == 0 and len(r["data"]["rows"]) == 1, r
 
     # 加签/转交
     r = await facade.flow("processTask/addCandidate",

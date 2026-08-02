@@ -1,7 +1,7 @@
 """SPI 接口——对标 SPEC.md §6"""
 from abc import ABC, abstractmethod
 from typing import Any, Optional
-from .model import ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo
+from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow)
 
 class ProcessRepository(ABC):
     @abstractmethod
@@ -47,6 +47,11 @@ class ProcessRepository(ABC):
     async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str) -> None: ...
     @abstractmethod
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None: ...
+    @abstractmethod
+    async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
+                                actor_id: Optional[str] = None) -> tuple[list[CcInstanceRow], int]:
+        """我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：按抄送人 actor_id 过滤实例列表"""
+        ...
 
 class UserProvider(ABC):
     @abstractmethod

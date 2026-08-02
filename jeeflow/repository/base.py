@@ -19,7 +19,7 @@ import time
 from datetime import datetime
 from typing import Any, Optional, Protocol, Sequence
 
-from ..model import ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, ProcessDesign, ProcessDesignHis, ProcessSurrogate
+from ..model import ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate
 from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository
 
 # 当前协程上下文绑定的事务连接
@@ -359,8 +359,17 @@ class JdbcRepository(ProcessRepository):
             return [r[0] for r in rows]
 
     async def add_task_actor(self, task_id: int, actors: list[str]) -> None:
+        if not actors:
+            return
         async with self._conn() as conn:
-            await self._insert_task_actors(conn, task_id, actors)
+            # 追加语义（对齐 boot2/boot3，issues/03）：查已有参与者，去重后仅插入新增，不清空原参与者
+            rows = await conn.fetchall(self._sql(
+                "SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id ASC"),
+                (task_id,))
+            existing = {r[0] for r in rows}
+            to_add = [a for a in actors if a not in existing]
+            if to_add:
+                await self._insert_task_actors(conn, task_id, to_add)
 
     async def remove_task_actor(self, task_id: int, actors: list[str]) -> None:
         if not actors:
@@ -390,3 +399,31 @@ class JdbcRepository(ProcessRepository):
                 "UPDATE wf_process_cc_instance SET state=1, update_time=?"
                 " WHERE process_instance_id=? AND actor_id=?"),
                 (datetime.datetime.now(), instance_id, actor_id))
+
+    async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
+                                actor_id: Optional[str] = None) -> tuple[list[CcInstanceRow], int]:
+        """我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）"""
+        where = (" FROM wf_process_instance t"
+                 " LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id"
+                 " LEFT JOIN wf_process_cc_instance cc ON t.id = cc.process_instance_id"
+                 " WHERE cc.actor_id = ?")
+        cols = ("t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,"
+                " t.operator, t.expire_time, t.variable, t.create_time, t.create_user,"
+                " t.update_time, t.update_user, pd.name, pd.display_name, pd.version")
+        async with self._conn() as conn:
+            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), (actor_id,))
+            total = int(row[0]) if row else 0
+            rows = await conn.fetchall(self._sql(
+                f"SELECT {cols}{where} ORDER BY t.id ASC LIMIT ? OFFSET ?"),
+                (actor_id, page_size, (page_num - 1) * page_size))
+        return [self._map_cc_row(r) for r in rows], total
+
+    def _map_cc_row(self, r: Sequence[Any]) -> CcInstanceRow:
+        import json
+        variables = json.loads(r[8]) if r[8] else {}
+        return CcInstanceRow(
+            id=r[0], parentId=r[1], defineId=r[2], state=InstanceState(r[3]),
+            parentNodeName=r[4], businessNo=r[5], operator=r[6], expireTime=r[7],
+            variables=variables, createTime=r[9], createUser=r[10],
+            updateTime=r[11], updateUser=r[12],
+            defineName=r[13], defineDisplayName=r[14], defineVersion=r[15] or 0)

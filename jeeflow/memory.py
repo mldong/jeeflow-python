@@ -1,7 +1,8 @@
 """内存仓储——测试用"""
 from copy import deepcopy
 from datetime import datetime
-from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState,
+from typing import Optional
+from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, CcInstanceRow,
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate)
 from .spi import ProcessRepository, ProcessExtRepository
 
@@ -11,6 +12,7 @@ class MemoryRepository(ProcessRepository):
         self._instances: dict[int, ProcessInstance] = {}
         self._tasks: dict[int, ProcessTask] = {}
         self._actors: dict[int, list[str]] = {}
+        self._cc: dict[int, list[str]] = {}
         self._seq = 1
 
     def add_define(self, d: ProcessDefine):
@@ -90,8 +92,33 @@ class MemoryRepository(ProcessRepository):
     async def remove_task_actor(self, task_id, actors):
         remove = set(actors)
         self._actors[task_id] = [a for a in self._actors.get(task_id, []) if a not in remove]
-    async def create_cc_instance(self, *args): pass
-    async def update_cc_status(self, *args): pass
+    async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str):
+        self._cc[instance_id] = list(dict.fromkeys([*self._cc.get(instance_id, []), *actor_ids]))
+    async def update_cc_status(self, instance_id: int, actor_id: str): pass
+    async def page_cc_instances(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None):
+        """我的抄送分页（v1.3.0）：按抄送人 actor_id 过滤，join 实例 + 定义"""
+        rows = []
+        for inst_id, actors in self._cc.items():
+            if actor_id and actor_id not in actors:
+                continue
+            inst = self._instances.get(inst_id)
+            if not inst:
+                continue
+            row = CcInstanceRow(
+                id=inst.id, parentId=inst.parentId, defineId=inst.defineId, state=inst.state,
+                parentNodeName=inst.parentNodeName, businessNo=inst.businessNo, operator=inst.operator,
+                expireTime=inst.expireTime, variables=deepcopy(inst.variables),
+                createTime=inst.createTime, createUser=inst.createUser,
+                updateTime=inst.updateTime, updateUser=inst.updateUser)
+            defn = self._defines.get(inst.defineId)
+            if defn:
+                row.defineName = defn.name
+                row.defineDisplayName = defn.displayName
+                row.defineVersion = defn.version
+            rows.append(row)
+        total = len(rows)
+        start = (page_num - 1) * page_size
+        return rows[start:start + page_size], total
 
     def all_defines(self): return list(self._defines.values())
     def all_instances(self): return list(self._instances.values())

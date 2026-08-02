@@ -415,7 +415,12 @@ class JeeflowFacade:
         return None
 
     async def _processInstance_ccList(self, args: dict) -> dict:
-        raise ValueError("ccList 需要核心分页 SPI（page_cc_instances），当前语言 1.3.0 补齐")
+        """我的抄送分页（v1.3.0）：operator 作为抄送人过滤"""
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
+        actor_id = str(args.get("operator", "user1"))
+        rows, total = await self._repo.page_cc_instances(page_num, page_size, actor_id)
+        return self._page_data(rows, total)
 
     async def _processTask_detail(self, args: dict) -> dict:
         task_id = self._to_int(args.get("id"))

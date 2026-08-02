@@ -385,6 +385,17 @@ async def main():
         await ext_repo.remove_surrogate(s_all.id)
         check("remove_surrogate", await ext_repo.find_surrogate_by_id(s_all.id) is None)
 
+        # ── ⑩.5 page_cc_instances（v1.3.0 ccList 分页）──
+        await repo.create_cc_instance(inst.id, "zhangsan", "lisi", "wangwu")
+        ccrows, cctotal = await repo.page_cc_instances(1, 10, "lisi")
+        cc_ids = {r.id for r in ccrows}
+        check("page_cc_instances 命中抄送人", cctotal >= 1 and inst.id in cc_ids,
+              f"total={cctotal} ids={cc_ids}")
+        check("page_cc_instances 关联定义名", ccrows and ccrows[0].defineName == "py-simple",
+              ccrows[0].defineName if ccrows else "EMPTY")
+        cc2, cc2total = await repo.page_cc_instances(1, 10, "nobody")
+        check("page_cc_instances 非抄送人空", cc2total == 0 and len(cc2) == 0, f"total={cc2total}")
+
         # ── ⑪ find_define_by_name（v1.1.0 deploy 版本管理用）──
         latest = await repo.find_define_by_name("py-simple")
         check("find_define_by_name 命中", latest is not None and latest.name == "py-simple",

@@ -629,3 +629,54 @@ async def test_m_query_params():
     r = await facade.flow("processDesign/page", {"m_LIKE_name": "leave"})
     assert r["code"] == 0, r
     assert len(r["data"]["rows"]) == 1, r
+
+
+@pytest.mark.asyncio
+async def test_design_deploy_redeploy_is_deployed():
+    """issues/08：部署/重新部署/设计稿变更的 is_deployed 状态同步"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    with open(os.path.join(FLOW_DIR, "02-multi-task.json"), encoding="utf-8") as f:
+        content2 = f.read()
+
+    # 保存（含内容快照）→ 未部署
+    r = await facade.flow("processDesign/save", {"name": "leave08", "displayName": "请假流程08",
+                                                 "content": content, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    design_id = r["data"]["id"]
+    assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 0
+
+    # 部署 → is_deployed=1
+    r = await facade.flow("processDesign/deploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    define_id = r["data"]["processDefineId"]
+    assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1
+
+    # 重新部署 → 同一 defineId + is_deployed=1
+    r = await facade.flow("processDesign/redeploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    assert r["data"]["processDefineId"] == define_id, r
+    assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1
+
+    # 设计稿内容变更（updateDefine，不同 content）→ 新快照 + is_deployed=0 + name 同步
+    r = await facade.flow("processDesign/updateDefine", {"processDesignId": design_id,
+                                                         "content": content2, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    design = await facade._ext.find_design_by_id(design_id)
+    assert design.isDeployed == 0, r
+    assert design.name == "multi-task", design.name
+    assert len(await facade._ext.list_design_his(design_id)) == 2
+
+    # 基本信息修改（update）→ is_deployed 不变
+    r = await facade.flow("processDesign/update", {"id": design_id, "displayName": "改名08",
+                                                   "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    design = await facade._ext.find_design_by_id(design_id)
+    assert design.displayName == "改名08" and design.isDeployed == 0
+
+    # 部署 → 再置 1
+    r = await facade.flow("processDesign/deploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1

@@ -334,6 +334,9 @@ class JeeflowFacade:
             if args.get("remark") is not None:
                 design.remark = str(args["remark"])
             design.updateUser = operator
+            # 内容快照变更 → 置为未部署（对齐 boot3 updateDefine 语义，issues/08）
+            if self._content(args, required=False):
+                design.isDeployed = 0
             await ext.update_design(design)
         # 内容快照（设计稿内容存历史表）
         content = self._content(args, required=False)
@@ -341,6 +344,103 @@ class JeeflowFacade:
             await ext.save_design_his(ProcessDesignHis(processDesignId=design.id,
                                                        content=content, createUser=operator))
         return {"id": design.id}
+
+    async def _processDesign_update(self, args: dict) -> dict:
+        """修改流程设计基本信息（对齐 boot3 ProcessDesignController.update，不写设计稿快照）"""
+        ext = self._ext_repo()
+        design_id = self._to_int(args.get("id"))
+        if not design_id:
+            raise ValueError("id 缺失或非法")
+        design = await ext.find_design_by_id(design_id)
+        if not design:
+            raise ValueError("流程设计不存在")
+        if args.get("name") is not None:
+            design.name = str(args["name"])
+        if args.get("displayName") is not None:
+            design.displayName = str(args["displayName"])
+        if args.get("type") is not None:
+            design.type = str(args["type"])
+        if args.get("icon") is not None:
+            design.icon = str(args["icon"])
+        if args.get("remark") is not None:
+            design.remark = str(args["remark"])
+        design.updateUser = str(args.get("operator", "system"))
+        await ext.update_design(design)
+        return None
+
+    async def _processDesign_updateDefine(self, args: dict) -> dict:
+        """更新流程设计定义（设计稿保存，issues/08）：content 快照入库 + 同步基本信息 + 置未部署"""
+        ext = self._ext_repo()
+        design_id = self._to_int(args.get("processDesignId"))
+        if not design_id:
+            raise ValueError("processDesignId 缺失或非法")
+        design = await ext.find_design_by_id(design_id)
+        if not design:
+            raise ValueError("流程设计不存在")
+        content = self._content(args, required=False)
+        if not content:
+            raise ValueError("content 缺失")
+        # 与最新一条相同则不重复入库（对齐 boot3 updateDefine）
+        his_list = await ext.list_design_his(design_id)
+        if not his_list or his_list[0].content != content:
+            await ext.save_design_his(ProcessDesignHis(processDesignId=design_id,
+                                                       content=content,
+                                                       createUser=str(args.get("operator", "system"))))
+        # 同步设计基本信息（jsonObject 里的 name/displayName/type）+ 内容变更 → 未部署
+        import json as _json
+        try:
+            flow = _json.loads(content)
+            if flow.get("name"):
+                design.name = flow["name"]
+            if flow.get("displayName"):
+                design.displayName = flow["displayName"]
+            if flow.get("type"):
+                design.type = flow["type"]
+        except Exception:
+            pass
+        design.isDeployed = 0
+        design.updateUser = str(args.get("operator", "system"))
+        await ext.update_design(design)
+        return None
+
+    async def _processDesign_redeploy(self, args: dict) -> dict:
+        """重新部署流程定义（issues/08）：替换最新定义内容 + 置已部署（对齐 boot3 redeploy）"""
+        ext = self._ext_repo()
+        design_id = self._to_int(args.get("id"))
+        if not design_id:
+            raise ValueError("id 缺失或非法")
+        design = await ext.find_design_by_id(design_id)
+        if not design:
+            raise ValueError("流程设计不存在")
+        his_list = await ext.list_design_his(design_id)
+        if not his_list:
+            raise ValueError("流程设计没有内容，无法发布")
+        content = his_list[0].content
+        import json as _json
+        try:
+            flow = _json.loads(content)
+        except Exception as e:
+            raise ValueError(f"流程定义 JSON 解析失败: {e}")
+        name = flow.get("name") or ""
+        if not name:
+            raise ValueError("流程定义缺少 name")
+        # 按 name 取最新定义：有则替换内容（version 不变），无则新建（对齐 boot3 redeploy）
+        last = await self._repo.find_define_by_name(name)
+        if last is None:
+            define_id = await self._deploy({"content": content,
+                                            "operator": args.get("operator", "system")})
+        else:
+            last.name = name
+            last.displayName = flow.get("displayName", "")
+            last.type = flow.get("type", "")
+            last.content = content
+            last.updateUser = str(args.get("operator", "system"))
+            await self._repo.update_define(last)
+            define_id = last.id
+        design.isDeployed = 1
+        design.updateUser = str(args.get("operator", "system"))
+        await ext.update_design(design)
+        return {"processDefineId": define_id}
 
     async def _processDesign_remove(self, args: dict) -> dict:
         design_id = self._to_int(args.get("id"))

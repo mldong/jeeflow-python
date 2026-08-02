@@ -72,7 +72,8 @@ class JeeflowFacade:
         if not def_:
             raise ValueError("流程定义不存在")
         return {"id": def_.id, "name": def_.name, "displayName": def_.displayName,
-                "type": def_.type, "state": def_.state, "version": def_.version}
+                "type": def_.type, "state": def_.state, "version": def_.version,
+                "jsonObject": self._parse_graph(def_.content)}
 
     async def _processDefine_startAndExecute(self, args: dict) -> dict:
         return await self._startAndExecute(args)
@@ -98,6 +99,7 @@ class JeeflowFacade:
             "state": inst.state, "parentNodeName": inst.parentNodeName,
             "businessNo": inst.businessNo, "operator": inst.operator,
             "variables": inst.variables, "createTime": inst.createTime, "createUser": inst.createUser,
+            "jsonObject": self._instance_json_object(inst),
             "tasks": [self._task_vo(t) for t in inst.tasks],
         }
 
@@ -529,6 +531,7 @@ class JeeflowFacade:
         if inst:
             def_ = await self._repo.find_define_by_id(inst.defineId)
             if def_:
+                vo["jsonObject"] = self._parse_graph(def_.content)  # issues/05
                 try:
                     flow = json.loads(def_.content)
                     for n in flow.get("nodes", []):
@@ -706,3 +709,20 @@ class JeeflowFacade:
             "variable": variable, "createTime": t.createTime, "createUser": t.createUser,
             "updateTime": t.updateTime, "updateUser": t.updateUser, "taskActorIdList": t.actorIds,
         }
+
+    @staticmethod
+    def _parse_graph(content) -> Optional[dict]:
+        """定义 content 解析为 LogicFlow JSON（issues/05 jsonObject）"""
+        import json as _json
+        if not content:
+            return None
+        try:
+            obj = _json.loads(content) if isinstance(content, str) else content
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+    async def _instance_json_object(self, inst) -> Optional[dict]:
+        """实例关联定义的 jsonObject"""
+        def_ = await self._repo.find_define_by_id(inst.defineId)
+        return self._parse_graph(def_.content) if def_ else None

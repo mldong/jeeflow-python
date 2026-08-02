@@ -554,3 +554,22 @@ async def test_highlight_filters_decision_branch():
     assert "e3" not in hl["historyEdgeNames"] and "e5" not in hl["historyEdgeNames"], hl
     assert "task2" not in hl["historyNodeNames"], hl
     assert "task3" in hl["historyNodeNames"], hl
+
+# ─── Test 05-1: 三个 detail 返回 jsonObject ───────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_detail_json_object():
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, None)
+    df = load_flow(repo, "01-simple.json")
+
+    r = await facade.flow("processDefine/detail", {"id": df.id})
+    assert r["code"] == 0 and r["data"].get("jsonObject"), r
+
+    inst = await _start_and_execute(eng, repo, df.id, "applicant")
+    r = await facade.flow("processInstance/detail", {"id": inst.id})
+    assert r["code"] == 0 and r["data"].get("jsonObject"), r
+
+    doing = await repo.find_doing_tasks(inst.id)
+    r = await facade.flow("processTask/detail", {"id": doing[0].id, "operator": "applicant"})
+    assert r["code"] == 0 and r["data"].get("jsonObject"), r

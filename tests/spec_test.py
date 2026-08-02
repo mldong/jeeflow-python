@@ -460,5 +460,69 @@ async def test_facade_errors():
     assert r["code"] == 99999999, r
 
 
+@pytest.mark.asyncio
+async def test_facade_view_endpoints():
+    """门面视图端点（v1.2.0，spec §12 #16-18）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    define_id = r["data"]["processDefineId"]
+
+    # getLastByName
+    r = await facade.flow("processDefine/getLastByName", {"processDefineName": "simple"})
+    assert r["code"] == 0 and r["data"]["name"] == "simple", r
+
+    # startAndExecute → 视图端点
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "zhangsan"})
+    instance_id = r["data"]["processInstanceId"]
+
+    r = await facade.flow("processInstance/approvalRecord", {"id": instance_id})
+    assert r["code"] == 0 and len(r["data"]) == 2, r  # apply + task1
+
+    r = await facade.flow("processInstance/highLight", {"id": instance_id})
+    assert r["code"] == 0, r
+    assert "task1" in r["data"]["activeNodeNames"], r
+    assert "apply" in r["data"]["historyNodeNames"], r
+
+    r = await facade.flow("processInstance/getAssigneeTextData", {"id": instance_id})
+    assert r["code"] == 0 and len(r["data"]) == 1, r  # task1 → leader
+
+    doing = await repo.find_doing_tasks(instance_id)
+    r = await facade.flow("processTask/detail", {"id": doing[0].id, "operator": "leader"})
+    assert r["code"] == 0 and r["data"]["executable"] is True, r
+    assert r["data"]["taskModel"] is not None, r
+
+    r = await facade.flow("processTask/latest", {"processInstanceId": instance_id})
+    assert r["code"] == 0 and r["data"]["taskName"] == "task1", r
+
+    # 抄送：创建 + 已读；ccList 未实现
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": instance_id, "operator": "zhangsan",
+                           "actorIds": ["lisi"]})
+    assert r["code"] == 0, r
+    r = await facade.flow("processInstance/updateCCStatus",
+                          {"processInstanceId": instance_id, "operator": "lisi"})
+    assert r["code"] == 0, r
+    r = await facade.flow("processInstance/ccList", {"operator": "lisi"})
+    assert r["code"] == 99999999, r
+
+    # 加签/转交
+    r = await facade.flow("processTask/addCandidate",
+                          {"processTaskId": doing[0].id, "actorIds": ["zhaoliu"]})
+    assert r["code"] == 0, r
+    actors = await repo.find_task_actors(doing[0].id)
+    assert "zhaoliu" in actors, actors
+
+    # candidatePage：未配置钩子报错；配置后可用
+    r = await facade.flow("processTask/candidatePage", {"processTaskId": doing[0].id})
+    assert r["code"] == 99999999, r
+    facade.set_user_search(lambda q: (([{"userId": "u1", "realName": "用户1"}], 1)))
+    r = await facade.flow("processTask/candidatePage", {"processTaskId": doing[0].id})
+    assert r["code"] == 0 and r["data"]["recordCount"] == 1, r
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

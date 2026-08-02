@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime
 from typing import Any, Optional
@@ -30,10 +31,17 @@ class JeeflowFacade:
     """统一门面——flow(action, args) -> dict"""
 
     def __init__(self, engine: Engine, repo: ProcessRepository,
-                 ext_repo: Optional[ProcessExtRepository] = None):
+                 ext_repo: Optional[ProcessExtRepository] = None,
+                 user_search: Optional[callable] = None):
         self._engine = engine
         self._repo = repo
         self._ext = ext_repo
+        self._user_search = user_search  # 可空：candidatePage 用户分页搜索依赖
+
+    def set_user_search(self, fn: callable) -> "JeeflowFacade":
+        """注入用户搜索钩子：fn(query: dict) -> (rows: list[dict], total: int)"""
+        self._user_search = fn
+        return self
 
     async def flow(self, action: str, args: Optional[dict] = None) -> dict:
         args = args or {}
@@ -295,6 +303,264 @@ class JeeflowFacade:
             raise ValueError("id 缺失或非法")
         await self._ext_repo().remove_surrogate(surrogate_id)
         return None
+
+    # ── 视图端点（v1.2.0） ──────────────────────────────────────────────────
+
+    async def _processDefine_getLastByName(self, args: dict) -> dict:
+        name = str(args.get("processDefineName", ""))
+        def_ = await self._repo.find_define_by_name(name)
+        if not def_:
+            raise ValueError(f"流程定义不存在: {name}")
+        return {"id": def_.id, "name": def_.name, "displayName": def_.displayName,
+                "type": def_.type, "state": def_.state, "version": def_.version}
+
+    async def _processInstance_highLight(self, args: dict) -> dict:
+        instance_id = self._to_int(args.get("id"))
+        if not instance_id:
+            raise ValueError("id 缺失或非法")
+        inst = await self._repo.find_instance_by_id(instance_id)
+        if not inst:
+            raise ValueError("流程实例不存在")
+        active, history, edges = [], [], []
+        doing = await self._repo.find_doing_tasks(instance_id)
+        for t in doing:
+            if t.taskName not in active:
+                active.append(t.taskName)
+        his = await self._repo.find_history_tasks(instance_id)
+        for t in his:
+            if t.taskName not in active and t.taskName not in history:
+                history.append(t.taskName)
+        # 路径补全：start 沿边递归（遇活跃节点停止）
+        def_ = await self._repo.find_define_by_id(inst.defineId)
+        if def_:
+            try:
+                flow = json.loads(def_.content)
+                self._collect_path(flow, "start", "", active, history, edges, set())
+            except Exception:
+                pass
+        return {"activeNodeNames": active, "historyNodeNames": history, "historyEdgeNames": edges}
+
+    def _collect_path(self, flow: dict, node_id: str, edge_name: str,
+                      active: list, history: list, edges: list, visited: set):
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        if edge_name and edge_name not in edges:
+            edges.append(edge_name)
+        for e in flow.get("edges", []):
+            if e.get("sourceNodeId") != node_id:
+                continue
+            target = self._find_node(flow, e.get("targetNodeId"))
+            if not target:
+                continue
+            tid = target.get("id")
+            if tid not in active and tid not in history:
+                history.append(tid)
+            if tid in active:
+                continue
+            self._collect_path(flow, tid, e.get("id"), active, history, edges, visited)
+
+    @staticmethod
+    def _find_node(flow: dict, node_id):
+        for n in flow.get("nodes", []):
+            if n.get("id") == node_id:
+                return n
+        return None
+
+    async def _processInstance_approvalRecord(self, args: dict) -> dict:
+        instance_id = self._to_int(args.get("id"))
+        if not instance_id:
+            raise ValueError("id 缺失或非法")
+        his = await self._repo.find_history_tasks(instance_id)
+        return [{
+            "taskName": t.taskName, "displayName": t.displayName,
+            "taskType": int(t.taskType) if t.taskType is not None else None,
+            "performType": int(t.performType) if t.performType is not None else None,
+            "taskState": int(t.taskState) if t.taskState is not None else None,
+            "operator": t.actorId, "finishTime": str(t.finishTime),
+            "variable": t.variables,
+        } for t in his]
+
+    async def _processInstance_getAssigneeTextData(self, args: dict) -> dict:
+        instance_id = self._to_int(args.get("id"))
+        if not instance_id:
+            raise ValueError("id 缺失或非法")
+        include_node_name = args.get("includeNodeName") is not False
+        rows = []
+        doing = await self._repo.find_doing_tasks(instance_id)
+        for t in doing:
+            actors = await self._repo.find_task_actors(t.id)
+            for actor in actors:
+                label = actor
+                if include_node_name:
+                    label = f"{t.displayName}:{actor}"
+                rows.append({"label": label, "value": actor})
+        return rows
+
+    async def _processInstance_createCCInstance(self, args: dict) -> dict:
+        instance_id = self._to_int(args.get("processInstanceId"))
+        operator = str(args.get("operator", "user1"))
+        actor_ids = self._to_str_list(args.get("actorIds"))
+        if not instance_id or not actor_ids:
+            raise ValueError("processInstanceId/actorIds 缺失")
+        await self._repo.create_cc_instance(instance_id, operator, *actor_ids)
+        return None
+
+    async def _processInstance_updateCCStatus(self, args: dict) -> dict:
+        instance_id = self._to_int(args.get("processInstanceId"))
+        operator = str(args.get("operator", "user1"))
+        if not instance_id:
+            raise ValueError("processInstanceId 缺失或非法")
+        await self._repo.update_cc_status(instance_id, operator)
+        return None
+
+    async def _processInstance_ccList(self, args: dict) -> dict:
+        raise ValueError("ccList 需要核心分页 SPI（page_cc_instances），当前语言 1.3.0 补齐")
+
+    async def _processTask_detail(self, args: dict) -> dict:
+        task_id = self._to_int(args.get("id"))
+        operator = str(args.get("operator", "user1"))
+        if not task_id:
+            raise ValueError("id 缺失或非法")
+        task = await self._repo.find_task_by_id(task_id)
+        if not task:
+            raise ValueError("任务不存在")
+        actors = await self._repo.find_task_actors(task_id)
+        vo = {
+            "id": task.id, "processInstanceId": task.processInstanceId,
+            "taskName": task.taskName, "displayName": task.displayName,
+            "taskType": int(task.taskType) if task.taskType is not None else None,
+            "performType": int(task.performType) if task.performType is not None else None,
+            "taskState": int(task.taskState) if task.taskState is not None else None,
+            "operator": task.actorId, "formKey": task.formKey,
+            "taskActorIdList": actors, "executable": task.is_allowed(operator),
+        }
+        # taskModel：流程定义中对应节点
+        inst = await self._repo.find_instance_by_id(task.processInstanceId)
+        if inst:
+            def_ = await self._repo.find_define_by_id(inst.defineId)
+            if def_:
+                try:
+                    flow = json.loads(def_.content)
+                    for n in flow.get("nodes", []):
+                        if n.get("id") == task.taskName:
+                            vo["taskModel"] = {"name": n.get("id"),
+                                               "displayName": (n.get("text") or {}).get("value", ""),
+                                               "type": n.get("type")}
+                            break
+                except Exception:
+                    pass
+        return vo
+
+    async def _processTask_jumpAbleTaskNameList(self, args: dict) -> dict:
+        instance_id = self._to_int(args.get("processInstanceId"))
+        if not instance_id:
+            raise ValueError("processInstanceId 缺失或非法")
+        done = await self._repo.find_done_tasks(instance_id)
+        rows, seen = [], set()
+        for t in done:
+            if int(t.performType or 0) == 1:  # COUNTERSIGN
+                continue
+            if t.taskName not in seen:
+                seen.add(t.taskName)
+                rows.append({"label": t.displayName, "value": t.taskName})
+        return rows
+
+    async def _processTask_candidatePage(self, args: dict) -> dict:
+        task_id = self._to_int(args.get("processTaskId")) or self._to_int(args.get("id"))
+        if not task_id:
+            raise ValueError("processTaskId 缺失")
+        task = await self._repo.find_task_by_id(task_id)
+        if not task:
+            raise ValueError("任务不存在")
+        inst = await self._repo.find_instance_by_id(task.processInstanceId)
+        if not inst:
+            raise ValueError("流程实例不存在")
+        # 模型候选解析：后继任务节点的 candidateUsers 配置
+        candidates = []
+        def_ = await self._repo.find_define_by_id(inst.defineId)
+        if def_:
+            try:
+                flow = json.loads(def_.content)
+                candidates = self._next_task_candidates(flow, task.taskName)
+            except Exception:
+                pass
+        if candidates:
+            rows = [{"userId": c, "realName": c} for c in candidates]
+            return self._page_data(rows, len(rows))
+        # 无模型候选 → 用户分页搜索（依赖 user_search 钩子）
+        if self._user_search is None:
+            raise ValueError("未配置 user_search（用户搜索钩子）")
+        result = self._user_search(args)
+        if inspect.isawaitable(result):
+            result = await result
+        rows, total = result
+        return self._page_data(rows, total)
+
+    def _next_task_candidates(self, flow: dict, task_name: str) -> list:
+        result = []
+        visited = set()
+
+        def collect(node: dict):
+            v = (node.get("properties") or {}).get("candidateUsers", "")
+            if v:
+                for s in str(v).split(","):
+                    s = s.strip()
+                    if s and s not in result:
+                        result.append(s)
+
+        def walk(node_id: str):
+            if node_id in visited:
+                return
+            visited.add(node_id)
+            for e in flow.get("edges", []):
+                if e.get("sourceNodeId") != node_id:
+                    continue
+                target = self._find_node(flow, e.get("targetNodeId"))
+                if not target:
+                    continue
+                if target.get("type") in ("snaker:task", "snaker:custom"):
+                    collect(target)
+                    continue
+                if target.get("type") in ("snaker:fork", "snaker:join", "snaker:decision"):
+                    walk(target.get("id"))
+
+        walk(task_name)
+        return result
+
+    async def _processTask_surrogate(self, args: dict) -> dict:
+        return await self._taskAddActor(args)
+
+    async def _processTask_addCandidate(self, args: dict) -> dict:
+        return await self._taskAddActor(args)
+
+    async def _taskAddActor(self, args: dict) -> dict:
+        task_id = self._to_int(args.get("processTaskId"))
+        actor_ids = self._to_str_list(args.get("actorIds"))
+        if not task_id or not actor_ids:
+            raise ValueError("processTaskId/actorIds 缺失")
+        await self._repo.add_task_actor(task_id, actor_ids)
+        return None
+
+    async def _processTask_latest(self, args: dict) -> dict:
+        instance_id = self._to_int(args.get("processInstanceId"))
+        if not instance_id:
+            raise ValueError("processInstanceId 缺失或非法")
+        doing = await self._repo.find_doing_tasks(instance_id)
+        if not doing:
+            return None
+        t = doing[0]
+        return {"id": t.id, "taskName": t.taskName, "displayName": t.displayName,
+                "taskState": int(t.taskState) if t.taskState is not None else None,
+                "operator": t.actorId}
+
+    @staticmethod
+    def _to_str_list(v) -> list:
+        if isinstance(v, (list, tuple)):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return []
 
     # ── 工具 ─────────────────────────────────────────────────────────────────
 

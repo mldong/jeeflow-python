@@ -407,5 +407,6 @@ class TaskRow:
     updateUser: str = ""
     processDefineName: str = ""
     processDefineDisplayName: str = ""
+    defineVersion: int = 0
     instanceVariable: str = ""
     instanceCreateTime: Any = None

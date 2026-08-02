@@ -61,7 +61,7 @@ class JeeflowFacade:
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
         rows, total = await self._repo.page_defines(page_num, page_size)
-        return self._page_data(rows, total)
+        return self._page_data([self._define_row_to_dict(r) for r in rows], total)
 
     async def _processDefine_detail(self, args: dict) -> dict:
         """流程定义详情（v1.5.0 补齐）"""
@@ -84,7 +84,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         operator = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_instances(page_num, page_size, operator)
-        return self._page_data(rows, total)
+        return self._page_data([self._instance_row_to_dict(r) for r in rows], total)
 
     async def _processInstance_detail(self, args: dict) -> dict:
         """流程实例详情（含任务列表，v1.5.0 补齐）"""
@@ -229,7 +229,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         actor_id = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_todo_tasks(page_num, page_size, actor_id)
-        return self._page_data(rows, total)
+        return self._page_data([self._task_row_to_dict(r) for r in rows], total)
 
     async def _processTask_doneList(self, args: dict) -> dict:
         """我的已办分页（operator 过滤，v1.5.0 补齐）"""
@@ -237,7 +237,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         operator = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_done_tasks(page_num, page_size, operator)
-        return self._page_data(rows, total)
+        return self._page_data([self._task_row_to_dict(r) for r in rows], total)
 
     async def _processTask_execute(self, args: dict) -> dict:
         task_id = self._to_int(args.get("processTaskId"))
@@ -519,7 +519,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         actor_id = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_cc_instances(page_num, page_size, actor_id)
-        return self._page_data(rows, total)
+        return self._page_data([self._cc_row_to_dict(r) for r in rows], total)
 
     async def _processTask_detail(self, args: dict) -> dict:
         task_id = self._to_int(args.get("id"))
@@ -747,3 +747,67 @@ class JeeflowFacade:
             if isinstance(n, dict) and n.get("type") == "snaker:task":
                 return n.get("id")
         return None
+
+    # ═══ 行输出转换（issues/05-2 字段契约 + 05-3 时间格式）═══
+
+    @staticmethod
+    def _fmt_time(t) -> Optional[str]:
+        """时间格式化 yyyy-MM-dd HH:mm:ss"""
+        if t is None:
+            return None
+        if isinstance(t, str):
+            return t.replace("T", " ")[:19]
+        return t.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _define_row_to_dict(self, r) -> dict:
+        return {"id": r.id, "name": r.name, "displayName": r.displayName, "type": r.type,
+                "state": r.state, "version": r.version,
+                "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
+                "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser}
+
+    def _instance_row_to_dict(self, r) -> dict:
+        return {"id": r.id, "parentId": r.parentId, "processDefineId": r.defineId,
+                "state": int(r.state) if r.state is not None else None,
+                "parentNodeName": r.parentNodeName, "businessNo": r.businessNo, "operator": r.operator,
+                "expireTime": self._fmt_time(r.expireTime), "variable": r.variables,
+                "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
+                "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
+                "processDefineName": r.defineName, "processDefineDisplayName": r.defineDisplayName,
+                "processDefineVersion": r.defineVersion,
+                "ext": r.variables, "displayName": r.defineDisplayName, "version": r.defineVersion}
+
+    def _cc_row_to_dict(self, r) -> dict:
+        return self._instance_row_to_dict(r) if hasattr(r, "defineName") else {
+            "id": r.id, "parentId": r.parentId, "processDefineId": r.defineId,
+            "state": int(r.state) if r.state is not None else None,
+            "parentNodeName": r.parentNodeName, "businessNo": r.businessNo, "operator": r.operator,
+            "expireTime": self._fmt_time(r.expireTime), "variable": r.variables,
+            "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
+            "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
+            "processDefineName": r.defineName, "processDefineDisplayName": r.defineDisplayName,
+            "processDefineVersion": r.defineVersion,
+            "ext": r.variables, "displayName": r.defineDisplayName, "version": r.defineVersion}
+
+    def _task_row_to_dict(self, r) -> dict:
+        instance_ext = r.instanceVariable
+        if isinstance(instance_ext, str):
+            try:
+                instance_ext = json.loads(instance_ext) if instance_ext else {}
+            except Exception:
+                instance_ext = {}
+        ext = r.variables or {}
+        if not ext:
+            ext = instance_ext
+        return {"id": r.id, "processInstanceId": r.processInstanceId, "taskName": r.taskName,
+                "displayName": r.displayName, "taskType": r.taskType, "performType": r.performType,
+                "taskState": int(r.taskState) if r.taskState is not None else None,
+                "operator": r.operator, "finishTime": self._fmt_time(r.finishTime),
+                "expireTime": self._fmt_time(r.expireTime), "formKey": r.formKey,
+                "taskParentId": r.taskParentId, "variable": r.variables,
+                "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
+                "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
+                "processDefineName": r.processDefineName,
+                "processDefineDisplayName": r.processDefineDisplayName,
+                "instanceVariable": r.instanceVariable,
+                "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
+                "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion}

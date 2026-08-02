@@ -189,6 +189,7 @@ class MemoryRepository(ProcessRepository):
             if defn:
                 row.processDefineName = defn.name
                 row.processDefineDisplayName = defn.displayName
+                row.defineVersion = defn.version
         return row
 
     @staticmethod
@@ -422,6 +423,7 @@ class MemoryExtRepository(ProcessExtRepository):
             if defn:
                 row.processDefineName = defn.name
                 row.processDefineDisplayName = defn.displayName
+                row.defineVersion = defn.version
         return row
 
     @staticmethod

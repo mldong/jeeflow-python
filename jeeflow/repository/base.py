@@ -479,7 +479,7 @@ class JdbcRepository(ProcessRepository):
         cols = ("DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type,"
                 " t.perform_type, t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key,"
                 " t.task_parent_id, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,"
-                " pd.name, pd.display_name, pi.variable, pi.create_time")
+                " pd.name, pd.display_name, pd.version, pi.variable, pi.create_time")
         async with self._conn() as conn:
             row = await conn.fetchone(self._sql("SELECT COUNT(DISTINCT t.id)" + where), (filter_val,))
             total = int(row[0]) if row else 0
@@ -508,4 +508,4 @@ class JdbcRepository(ProcessRepository):
             variables=variables, createTime=r[13], createUser=r[14],
             updateTime=r[15], updateUser=r[16],
             processDefineName=r[17], processDefineDisplayName=r[18],
-            instanceVariable=r[19] or "", instanceCreateTime=r[20])
+            defineVersion=r[19] or 0, instanceVariable=r[20] or "", instanceCreateTime=r[21])

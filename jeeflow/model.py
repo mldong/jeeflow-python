@@ -43,14 +43,55 @@ TYPE_CUSTOM   = "snaker:custom"
 # ─── Domain Types ──────────────────────────────────────────────────────────────
 
 class InstanceState(IntEnum):
-    DOING  = 10
-    DONE   = 20
-    REJECT = 45
+    DOING     = 10
+    DONE      = 20
+    WITHDRAW  = 30
+    INTERRUPT = 40
+    REJECT    = 45
+    PENDING   = 50
+    ABANDON   = 99
 
 class TaskState(IntEnum):
     DOING     = 10
     DONE      = 20
+    WITHDRAW  = 30
+    INTERRUPT = 40
+    PENDING   = 50
     ABANDONED = 99
+
+# ─── 字典枚举（v1.4.0，对齐 Java enums，值与 boot3 字典一致） ────────────────
+
+class DefineState(IntEnum):
+    """流程定义状态（wf_process_define_state）"""
+    DISABLE = 0
+    ENABLE  = 1
+
+class SubmitType(IntEnum):
+    """流程提交类型（wf_process_submit_type）"""
+    APPLY                = 0
+    AGREE                = 1
+    REJECT               = 2
+    ROLLBACK             = 3
+    JUMP                 = 4
+    RE_APPLY             = 5
+    ROLLBACK_TO_OPERATOR = 6
+    COUNTERSIGN_DISAGREE = 20
+
+class TaskType(IntEnum):
+    """任务类型（wf_process_task_type）"""
+    MAJOR     = 0
+    SECONDARY = 1
+    RECORD    = 2
+
+class PerformType(IntEnum):
+    """任务参与方式（wf_process_task_perform_type）"""
+    NORMAL     = 0
+    COUNTERSIGN = 1
+
+class CountersignType(IntEnum):
+    """会签类型（wf_countersign_type）"""
+    PARALLEL   = 0
+    SEQUENTIAL = 1
 
 @dataclass
 class ProcessDefine:

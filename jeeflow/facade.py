@@ -56,8 +56,50 @@ class JeeflowFacade:
 
     # ── 流程定义 / 实例 ─────────────────────────────────────────────────────
 
+    async def _processDefine_page(self, args: dict) -> dict:
+        """流程定义分页（v1.5.0 补齐）"""
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
+        rows, total = await self._repo.page_defines(page_num, page_size)
+        return self._page_data(rows, total)
+
+    async def _processDefine_detail(self, args: dict) -> dict:
+        """流程定义详情（v1.5.0 补齐）"""
+        define_id = self._to_int(args.get("id"))
+        if not define_id:
+            raise ValueError("id 缺失或非法")
+        def_ = await self._repo.find_define_by_id(define_id)
+        if not def_:
+            raise ValueError("流程定义不存在")
+        return {"id": def_.id, "name": def_.name, "displayName": def_.displayName,
+                "type": def_.type, "state": def_.state, "version": def_.version}
+
     async def _processDefine_startAndExecute(self, args: dict) -> dict:
         return await self._startAndExecute(args)
+
+    async def _processInstance_page(self, args: dict) -> dict:
+        """我发起的流程实例分页（operator 过滤，v1.5.0 补齐）"""
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
+        operator = str(args.get("operator", "user1"))
+        rows, total = await self._repo.page_instances(page_num, page_size, operator)
+        return self._page_data(rows, total)
+
+    async def _processInstance_detail(self, args: dict) -> dict:
+        """流程实例详情（含任务列表，v1.5.0 补齐）"""
+        instance_id = self._to_int(args.get("id"))
+        if not instance_id:
+            raise ValueError("id 缺失或非法")
+        inst = await self._repo.find_instance_by_id(instance_id)
+        if not inst:
+            raise ValueError("流程实例不存在")
+        return {
+            "id": inst.id, "parentId": inst.parentId, "processDefineId": inst.defineId,
+            "state": inst.state, "parentNodeName": inst.parentNodeName,
+            "businessNo": inst.businessNo, "operator": inst.operator,
+            "variables": inst.variables, "createTime": inst.createTime, "createUser": inst.createUser,
+            "tasks": [self._task_vo(t) for t in inst.tasks],
+        }
 
     async def _processInstance_startAndExecute(self, args: dict) -> dict:
         return await self._startAndExecute(args)
@@ -165,6 +207,22 @@ class JeeflowFacade:
         return None
 
     # ── 流程任务 ─────────────────────────────────────────────────────────────
+
+    async def _processTask_todoList(self, args: dict) -> dict:
+        """我的待办分页（operator 作为待办人过滤，v1.5.0 补齐）"""
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
+        actor_id = str(args.get("operator", "user1"))
+        rows, total = await self._repo.page_todo_tasks(page_num, page_size, actor_id)
+        return self._page_data(rows, total)
+
+    async def _processTask_doneList(self, args: dict) -> dict:
+        """我的已办分页（operator 过滤，v1.5.0 补齐）"""
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
+        operator = str(args.get("operator", "user1"))
+        rows, total = await self._repo.page_done_tasks(page_num, page_size, operator)
+        return self._page_data(rows, total)
 
     async def _processTask_execute(self, args: dict) -> dict:
         task_id = self._to_int(args.get("processTaskId"))
@@ -605,3 +663,20 @@ class JeeflowFacade:
     @staticmethod
     def _error(msg: str) -> dict:
         return {"code": 99999999, "msg": msg}
+
+    @staticmethod
+    def _task_vo(t) -> dict:
+        """任务 VO（instanceDetail 任务列表用，对齐 Java taskVo）"""
+        import json as _json
+        try:
+            variable = _json.dumps(t.variables, ensure_ascii=False) if t.variables else None
+        except Exception:
+            variable = None
+        return {
+            "id": t.id, "processInstanceId": t.processInstanceId, "taskName": t.taskName,
+            "displayName": t.displayName, "taskType": t.taskType, "performType": t.performType,
+            "taskState": t.taskState, "operator": t.actorId, "finishTime": t.finishTime,
+            "expireTime": t.expireTime, "formKey": t.formKey, "taskParentId": t.parentTaskId,
+            "variable": variable, "createTime": t.createTime, "createUser": t.createUser,
+            "updateTime": t.updateTime, "updateUser": t.updateUser, "taskActorIdList": t.actorIds,
+        }

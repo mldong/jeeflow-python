@@ -2,7 +2,7 @@
 from copy import deepcopy
 from datetime import datetime
 from typing import Optional
-from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, CcInstanceRow,
+from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, CcInstanceRow, DefineRow, InstanceRow, TaskRow,
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate)
 from .spi import ProcessRepository, ProcessExtRepository
 
@@ -126,6 +126,77 @@ class MemoryRepository(ProcessRepository):
         return [deepcopy(t) for t in self._tasks.values()]
 
 
+    # ── 核心表分页（v1.5.0）──
+
+    async def page_defines(self, page_num: int = 1, page_size: int = 10):
+        rows = [DefineRow(id=d.id, name=d.name, displayName=d.displayName, type=d.type,
+                          state=d.state, version=d.version, createTime=d.createTime,
+                          createUser=d.createUser, updateTime=d.updateTime, updateUser=d.updateUser)
+                for d in self._defines.values()]
+        return self._slice(rows, page_num, page_size)
+
+    async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+        rows = []
+        for inst in self._instances.values():
+            if operator and inst.operator != operator:
+                continue
+            row = InstanceRow(
+                id=inst.id, parentId=inst.parentId, defineId=inst.defineId, state=inst.state,
+                parentNodeName=inst.parentNodeName, businessNo=inst.businessNo, operator=inst.operator,
+                expireTime=inst.expireTime, variables=deepcopy(inst.variables),
+                createTime=inst.createTime, createUser=inst.createUser,
+                updateTime=inst.updateTime, updateUser=inst.updateUser)
+            defn = self._defines.get(inst.defineId)
+            if defn:
+                row.defineName = defn.name
+                row.defineDisplayName = defn.displayName
+                row.defineVersion = defn.version
+            rows.append(row)
+        return self._slice(rows, page_num, page_size)
+
+    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None):
+        rows = []
+        for t in self._tasks.values():
+            if t.taskState != TaskState.DOING:
+                continue
+            if actor_id and actor_id not in self._actors.get(t.id, []):
+                continue
+            rows.append(self._task_row(t))
+        return self._slice(rows, page_num, page_size)
+
+    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+        rows = []
+        for t in self._tasks.values():
+            if t.taskState == TaskState.DOING:
+                continue
+            if operator and t.actorId != operator:
+                continue
+            rows.append(self._task_row(t))
+        return self._slice(rows, page_num, page_size)
+
+    def _task_row(self, t: ProcessTask) -> TaskRow:
+        row = TaskRow(
+            id=t.id, processInstanceId=t.processInstanceId, taskName=t.taskName,
+            displayName=t.displayName, taskType=t.taskType, performType=t.performType,
+            taskState=t.taskState, operator=t.actorId, finishTime=t.finishTime,
+            expireTime=t.expireTime, formKey=t.formKey, taskParentId=t.parentTaskId,
+            variables=deepcopy(t.variables), createTime=t.createTime, createUser=t.createUser,
+            updateTime=t.updateTime, updateUser=t.updateUser)
+        inst = self._instances.get(t.processInstanceId)
+        if inst:
+            row.instanceCreateTime = inst.createTime
+            defn = self._defines.get(inst.defineId)
+            if defn:
+                row.processDefineName = defn.name
+                row.processDefineDisplayName = defn.displayName
+        return row
+
+    @staticmethod
+    def _slice(rows, page_num, page_size):
+        total = len(rows)
+        start = (page_num - 1) * page_size
+        return rows[start:start + page_size], total
+
 class MemoryExtRepository(ProcessExtRepository):
     """扩展仓储内存实现（v1.1.0，测试/演示用）"""
 
@@ -206,3 +277,155 @@ class MemoryExtRepository(ProcessExtRepository):
             if (not s.processName or s.processName == process_name) and fallback is None:
                 fallback = s
         return deepcopy(fallback) if fallback else None
+
+class MemoryExtRepository(ProcessExtRepository):
+    """扩展仓储内存实现（v1.1.0，测试/演示用）"""
+
+    def __init__(self):
+        self._designs: dict[int, ProcessDesign] = {}
+        self._designHis: dict[int, list[ProcessDesignHis]] = {}
+        self._surrogates: dict[int, ProcessSurrogate] = {}
+        self._seq = 1
+
+    # ── 流程设计 ──
+
+    async def find_design_by_id(self, id): return deepcopy(self._designs.get(id))
+
+    async def save_design(self, d: ProcessDesign):
+        d.id = d.id or self._seq; self._seq += 1
+        now = datetime.now()
+        d.createTime = d.createTime or now
+        d.updateTime = d.updateTime or now
+        self._designs[d.id] = deepcopy(d)
+
+    async def update_design(self, d: ProcessDesign):
+        d.updateTime = datetime.now()
+        self._designs[d.id] = deepcopy(d)
+
+    async def remove_design(self, id: int):
+        self._designs.pop(id, None)
+        self._designHis.pop(id, None)
+
+    async def page_designs(self, page_num=1, page_size=10, filters=None):
+        rows = [deepcopy(d) for d in self._designs.values()]
+        return rows, len(rows)
+
+    # ── 设计历史 ──
+
+    async def save_design_his(self, his: ProcessDesignHis):
+        his.id = his.id or self._seq; self._seq += 1
+        his.createTime = his.createTime or datetime.now()
+        self._designHis.setdefault(his.processDesignId, []).insert(0, deepcopy(his))
+
+    async def list_design_his(self, design_id: int):
+        return [deepcopy(h) for h in self._designHis.get(design_id, [])]
+
+    # ── 委托代理 ──
+
+    async def find_surrogate_by_id(self, id): return deepcopy(self._surrogates.get(id))
+
+    async def save_surrogate(self, s: ProcessSurrogate):
+        s.id = s.id or self._seq; self._seq += 1
+        now = datetime.now()
+        s.createTime = s.createTime or now
+        s.updateTime = s.updateTime or now
+        s.enabled = s.enabled or 1
+        self._surrogates[s.id] = deepcopy(s)
+
+    async def update_surrogate(self, s: ProcessSurrogate):
+        s.updateTime = datetime.now()
+        self._surrogates[s.id] = deepcopy(s)
+
+    async def remove_surrogate(self, id: int):
+        self._surrogates.pop(id, None)
+
+    async def page_surrogates(self, page_num=1, page_size=10, filters=None):
+        rows = [deepcopy(s) for s in self._surrogates.values()]
+        return rows, len(rows)
+
+    async def get_surrogate(self, operator: str, process_name: str, at=None):
+        at = at or datetime.now()
+        fallback = None
+        for s in self._surrogates.values():
+            if s.operator != operator or s.enabled != 1:
+                continue
+            if s.startTime and s.startTime > at:
+                continue
+            if s.endTime and s.endTime < at:
+                continue
+            if s.processName == process_name and process_name:
+                return deepcopy(s)
+            if (not s.processName or s.processName == process_name) and fallback is None:
+                fallback = s
+        return deepcopy(fallback) if fallback else None
+
+    # ── 核心表分页（v1.5.0）──
+
+    async def page_defines(self, page_num: int = 1, page_size: int = 10):
+        rows = [DefineRow(id=d.id, name=d.name, displayName=d.displayName, type=d.type,
+                          state=d.state, version=d.version, createTime=d.createTime,
+                          createUser=d.createUser, updateTime=d.updateTime, updateUser=d.updateUser)
+                for d in self._defines.values()]
+        return self._slice(rows, page_num, page_size)
+
+    async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+        rows = []
+        for inst in self._instances.values():
+            if operator and inst.operator != operator:
+                continue
+            row = InstanceRow(
+                id=inst.id, parentId=inst.parentId, defineId=inst.defineId, state=inst.state,
+                parentNodeName=inst.parentNodeName, businessNo=inst.businessNo, operator=inst.operator,
+                expireTime=inst.expireTime, variables=deepcopy(inst.variables),
+                createTime=inst.createTime, createUser=inst.createUser,
+                updateTime=inst.updateTime, updateUser=inst.updateUser)
+            defn = self._defines.get(inst.defineId)
+            if defn:
+                row.defineName = defn.name
+                row.defineDisplayName = defn.displayName
+                row.defineVersion = defn.version
+            rows.append(row)
+        return self._slice(rows, page_num, page_size)
+
+    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None):
+        rows = []
+        for t in self._tasks.values():
+            if t.taskState != TaskState.DOING:
+                continue
+            if actor_id and actor_id not in self._actors.get(t.id, []):
+                continue
+            rows.append(self._task_row(t))
+        return self._slice(rows, page_num, page_size)
+
+    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+        rows = []
+        for t in self._tasks.values():
+            if t.taskState == TaskState.DOING:
+                continue
+            if operator and t.actorId != operator:
+                continue
+            rows.append(self._task_row(t))
+        return self._slice(rows, page_num, page_size)
+
+    def _task_row(self, t: ProcessTask) -> TaskRow:
+        row = TaskRow(
+            id=t.id, processInstanceId=t.processInstanceId, taskName=t.taskName,
+            displayName=t.displayName, taskType=t.taskType, performType=t.performType,
+            taskState=t.taskState, operator=t.actorId, finishTime=t.finishTime,
+            expireTime=t.expireTime, formKey=t.formKey, taskParentId=t.parentTaskId,
+            variables=deepcopy(t.variables), createTime=t.createTime, createUser=t.createUser,
+            updateTime=t.updateTime, updateUser=t.updateUser)
+        inst = self._instances.get(t.processInstanceId)
+        if inst:
+            row.instanceCreateTime = inst.createTime
+            defn = self._defines.get(inst.defineId)
+            if defn:
+                row.processDefineName = defn.name
+                row.processDefineDisplayName = defn.displayName
+        return row
+
+    @staticmethod
+    def _slice(rows, page_num, page_size):
+        total = len(rows)
+        start = (page_num - 1) * page_size
+        return rows[start:start + page_size], total

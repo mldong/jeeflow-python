@@ -345,3 +345,67 @@ def _parse_edge(raw: dict) -> FlowEdge:
         properties=raw.get("properties", {}),
         text=raw.get("text"),
     )
+
+
+# ─── 核心表分页行数据（v1.5.0，对齐 Java DefineRow/InstanceRow/TaskRow） ─────
+
+@dataclass
+class DefineRow:
+    """流程定义行数据（page_defines 分页）"""
+    id: int = 0
+    name: str = ""
+    displayName: str = ""
+    type: str = ""
+    state: int = 1
+    version: int = 1
+    createTime: Any = None
+    createUser: str = ""
+    updateTime: Any = None
+    updateUser: str = ""
+
+
+@dataclass
+class InstanceRow:
+    """流程实例行数据（page_instances 分页）"""
+    id: int = 0
+    parentId: Optional[int] = None
+    defineId: int = 0
+    state: InstanceState = InstanceState.DOING
+    parentNodeName: str = ""
+    businessNo: str = ""
+    operator: str = ""
+    expireTime: Any = None
+    variables: dict = field(default_factory=dict)
+    createTime: Any = None
+    createUser: str = ""
+    updateTime: Any = None
+    updateUser: str = ""
+    defineName: str = ""
+    defineDisplayName: str = ""
+    defineVersion: int = 0
+
+
+@dataclass
+class TaskRow:
+    """任务行数据（page_todo_tasks / page_done_tasks 分页）"""
+    id: int = 0
+    processInstanceId: int = 0
+    taskName: str = ""
+    displayName: str = ""
+    taskType: int = 0
+    performType: int = 0
+    taskState: TaskState = TaskState.DOING
+    operator: str = ""
+    finishTime: Any = None
+    expireTime: Any = None
+    formKey: str = ""
+    taskParentId: Optional[int] = None
+    variables: dict = field(default_factory=dict)
+    createTime: Any = None
+    createUser: str = ""
+    updateTime: Any = None
+    updateUser: str = ""
+    processDefineName: str = ""
+    processDefineDisplayName: str = ""
+    instanceVariable: str = ""
+    instanceCreateTime: Any = None

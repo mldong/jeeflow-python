@@ -1,7 +1,7 @@
 """SPI 接口——对标 SPEC.md §6"""
 from abc import ABC, abstractmethod
 from typing import Any, Optional
-from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow)
+from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow, DefineRow, InstanceRow, TaskRow)
 
 class ProcessRepository(ABC):
     @abstractmethod
@@ -51,6 +51,28 @@ class ProcessRepository(ABC):
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
                                 actor_id: Optional[str] = None) -> tuple[list[CcInstanceRow], int]:
         """我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：按抄送人 actor_id 过滤实例列表"""
+        ...
+
+    # ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
+
+    @abstractmethod
+    async def page_defines(self, page_num: int = 1, page_size: int = 10) -> tuple[list[DefineRow], int]:
+        """流程定义分页"""
+        ...
+    @abstractmethod
+    async def page_instances(self, page_num: int = 1, page_size: int = 10,
+                             operator: Optional[str] = None) -> tuple[list[InstanceRow], int]:
+        """我发起的流程实例分页（operator 过滤）"""
+        ...
+    @abstractmethod
+    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10,
+                              actor_id: Optional[str] = None) -> tuple[list[TaskRow], int]:
+        """我的待办分页（actor_id 过滤，仅进行中任务）"""
+        ...
+    @abstractmethod
+    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10,
+                              operator: Optional[str] = None) -> tuple[list[TaskRow], int]:
+        """我的已办分页（operator 过滤，非进行中任务）"""
         ...
 
 class UserProvider(ABC):

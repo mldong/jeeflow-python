@@ -19,7 +19,7 @@ import time
 from datetime import datetime
 from typing import Any, Optional, Protocol, Sequence
 
-from ..model import ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate
+from ..model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate)
 from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository
 
 # 当前协程上下文绑定的事务连接
@@ -427,3 +427,85 @@ class JdbcRepository(ProcessRepository):
             variables=variables, createTime=r[9], createUser=r[10],
             updateTime=r[11], updateUser=r[12],
             defineName=r[13], defineDisplayName=r[14], defineVersion=r[15] or 0)
+
+    # ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
+
+    async def page_defines(self, page_num: int = 1, page_size: int = 10) -> tuple[list[DefineRow], int]:
+        async with self._conn() as conn:
+            row = await conn.fetchone(self._sql("SELECT COUNT(*) FROM wf_process_define t"))
+            total = int(row[0]) if row else 0
+            rows = await conn.fetchall(self._sql(
+                "SELECT id, name, display_name, type, state, version, create_time, create_user,"
+                " update_time, update_user FROM wf_process_define t ORDER BY t.id DESC LIMIT ? OFFSET ?"),
+                (page_size, (page_num - 1) * page_size))
+        return [DefineRow(id=r[0], name=r[1], displayName=r[2], type=r[3], state=r[4],
+                          version=r[5], createTime=r[6], createUser=r[7],
+                          updateTime=r[8], updateUser=r[9]) for r in rows], total
+
+    async def page_instances(self, page_num: int = 1, page_size: int = 10,
+                             operator: Optional[str] = None) -> tuple[list[InstanceRow], int]:
+        where = (" FROM wf_process_instance t"
+                 " LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id"
+                 " WHERE t.operator = ?")
+        cols = ("t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,"
+                " t.operator, t.expire_time, t.variable, t.create_time, t.create_user,"
+                " t.update_time, t.update_user, pd.name, pd.display_name, pd.version")
+        async with self._conn() as conn:
+            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), (operator,))
+            total = int(row[0]) if row else 0
+            rows = await conn.fetchall(self._sql(
+                f"SELECT {cols}{where} ORDER BY t.id DESC LIMIT ? OFFSET ?"),
+                (operator, page_size, (page_num - 1) * page_size))
+        return [self._map_instance_row(r) for r in rows], total
+
+    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10,
+                              actor_id: Optional[str] = None) -> tuple[list[TaskRow], int]:
+        return await self._page_tasks(page_num, page_size, False, actor_id)
+
+    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10,
+                              operator: Optional[str] = None) -> tuple[list[TaskRow], int]:
+        return await self._page_tasks(page_num, page_size, True, operator)
+
+    async def _page_tasks(self, page_num: int, page_size: int, done: bool,
+                          filter_val: str) -> tuple[list[TaskRow], int]:
+        where = (" FROM wf_process_task t"
+                 " LEFT JOIN wf_process_instance pi ON t.process_instance_id = pi.id"
+                 " LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id"
+                 " LEFT JOIN wf_process_task_actor pta ON t.id = pta.process_task_id")
+        if done:
+            where += " WHERE t.task_state <> 10 AND t.operator = ?"
+        else:
+            where += " WHERE t.task_state = 10 AND pta.actor_id = ?"
+        cols = ("DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type,"
+                " t.perform_type, t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key,"
+                " t.task_parent_id, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,"
+                " pd.name, pd.display_name, pi.variable, pi.create_time")
+        async with self._conn() as conn:
+            row = await conn.fetchone(self._sql("SELECT COUNT(DISTINCT t.id)" + where), (filter_val,))
+            total = int(row[0]) if row else 0
+            rows = await conn.fetchall(self._sql(
+                f"SELECT {cols}{where} ORDER BY t.id DESC LIMIT ? OFFSET ?"),
+                (filter_val, page_size, (page_num - 1) * page_size))
+        return [self._map_task_row(r) for r in rows], total
+
+    def _map_instance_row(self, r: Sequence[Any]) -> InstanceRow:
+        import json
+        variables = json.loads(r[8]) if r[8] else {}
+        return InstanceRow(
+            id=r[0], parentId=r[1], defineId=r[2], state=InstanceState(r[3]),
+            parentNodeName=r[4], businessNo=r[5], operator=r[6], expireTime=r[7],
+            variables=variables, createTime=r[9], createUser=r[10],
+            updateTime=r[11], updateUser=r[12],
+            defineName=r[13], defineDisplayName=r[14], defineVersion=r[15] or 0)
+
+    def _map_task_row(self, r: Sequence[Any]) -> TaskRow:
+        import json
+        variables = json.loads(r[12]) if r[12] else {}
+        return TaskRow(
+            id=r[0], processInstanceId=r[1], taskName=r[2], displayName=r[3],
+            taskType=r[4], performType=r[5], taskState=TaskState(r[6]), operator=r[7],
+            finishTime=r[8], expireTime=r[9], formKey=r[10], taskParentId=r[11],
+            variables=variables, createTime=r[13], createUser=r[14],
+            updateTime=r[15], updateUser=r[16],
+            processDefineName=r[17], processDefineDisplayName=r[18],
+            instanceVariable=r[19] or "", instanceCreateTime=r[20])

@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from typing import Optional
 from datetime import datetime
 
-from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent
+from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, JeeflowFacade
 from jeeflow.model import InstanceState, TaskState, ProcessDefine, ProcessInstance, ProcessTask, UserInfo, parse_flow_model
 from jeeflow.spi import IDGenerator, ExpressionEvaluator
 
@@ -57,6 +57,7 @@ repo = MemoryRepository()
 idgen = SnowflakeIDGen()
 user_prov = SimpleUserProvider()
 engine = EngineImpl(repo, user_prov, idgen, SimpleExprEvaluator())
+facade = JeeflowFacade(engine, repo, None)  # demo 未接入扩展仓储
 
 # 预加载流程定义
 for fname in sorted(os.listdir(FLOWS_DIR)):
@@ -139,211 +140,11 @@ ROLLBACK_TO_OPERATOR, COUNTERSIGN_DISAGREE = 6, 20
 
 # ─── 流程定义 ────────────────────────────────────────────────────────────────────
 
-@app.post("/wf/processDefine/page")
-async def define_page(request: Request):
-    body = await request.json() if request.method == "POST" else {}
-    rows = []
-    for d in repo.all_defines():
-        rows.append({"id": d.id, "name": d.name, "displayName": d.displayName,
-                     "type": d.type, "state": d.state, "version": d.version,
-                     "createTime": _fmt_time(d.createTime), "updateTime": _fmt_time(d.updateTime)})
-    return _ok(_page(rows))
-
-@app.post("/wf/processDefine/detail")
-async def define_detail(request: Request):
-    body = await request.json()
-    id = int(body.get("id", 0))
-    d = await repo.find_define_by_id(id)
-    if not d: return _err("流程定义不存在")
-    graph = json.loads(d.content) if d.content else None
-    return _ok({"id": d.id, "name": d.name, "displayName": d.displayName, "type": d.type,
-                "state": d.state, "version": d.version, "jsonObject": graph})
-
-@app.post("/wf/processDefine/startAndExecute")
-async def define_start_and_execute(request: Request):
-    """启动流程实例（boot2 主入口）"""
-    return await _start_and_execute_body(request)
-
-# ─── 流程实例 ────────────────────────────────────────────────────────────────────
-
-@app.post("/wf/processInstance/startAndExecute")
-async def instance_start_and_execute(request: Request):
-    return await _start_and_execute_body(request)
-
-async def _start_and_execute_body(request: Request):
-    body = await request.json()
-    define_id = int(body.get("processDefineId", 0))
-    operator = str(body.get("operator", "user1"))
-    args = dict(body)
-    args.pop("processDefineId", None)
-    inst = await engine.start_process_instance_by_id(define_id, operator, args)
-    # boot2 startAndExecute：自动完成申请节点
-    doing = await repo.find_doing_tasks(inst.id)
-    for task in doing:
-        await repo.add_task_actor(task.id, [operator])
-        await engine.execute_process_task(task.id, operator, {**args, "submitType": APPLY})
-    return _ok()
-
-@app.post("/wf/processInstance/page")
-async def instance_page(request: Request):
-    body = await request.json()
-    user_id = str(body.get("operator", body.get("userId", "user1")))
-    rows = []
-    for i in repo.all_instances():
-        if i.createUser != user_id: continue
-        d = await repo.find_define_by_id(i.defineId)
-        rows.append(_inst_vo(i, d))
-    rows.sort(key=lambda x: x["id"], reverse=True)
-    return _ok(_page(rows))
-
-@app.post("/wf/processInstance/detail")
-async def instance_detail(request: Request):
-    body = await request.json()
-    id = int(body.get("id", 0))
-    inst = await repo.find_instance_by_id(id)
-    if not inst: return _err("实例不存在")
-    d = await repo.find_define_by_id(inst.defineId)
-    return _ok(_inst_vo(inst, d))
-
-@app.post("/wf/processInstance/highLight")
-async def instance_highlight(request: Request):
-    """高亮数据（独立端点）"""
-    body = await request.json()
-    id = int(body.get("id", 0))
-    inst = await repo.find_instance_by_id(id)
-    if not inst: return _err("实例不存在")
-    d = await repo.find_define_by_id(inst.defineId)
-    finished = set(); active = set()
-    for t in inst.tasks:
-        if t.taskState == TaskState.DONE: finished.add(t.taskName)
-        if t.taskState == TaskState.DOING: active.add(t.taskName)
-    finished_edges = []
-    graph = _load_graph(inst.defineId)
-    if graph:
-        for e in graph.get("edges", []):
-            if e.get("sourceNodeId") in finished and e.get("targetNodeId") in finished:
-                finished_edges.append(e.get("id"))
-    return _ok({"historyNodeNames": list(finished), "historyEdgeNames": finished_edges,
-                "activeNodeNames": list(active)})
-
-@app.post("/wf/processInstance/approvalRecord")
-async def instance_approval_record(request: Request):
-    """审批记录（独立端点）"""
-    body = await request.json()
-    id = int(body.get("id", 0))
-    inst = await repo.find_instance_by_id(id)
-    if not inst: return _err("实例不存在")
-    d = await repo.find_define_by_id(inst.defineId)
-    records = [_task_vo(t, inst, d) for t in sorted(inst.tasks, key=lambda x: x.id)]
-    return _ok(records)
-
-# ─── 流程任务 ────────────────────────────────────────────────────────────────────
-
-@app.post("/wf/processTask/todoList")
-async def todo_list(request: Request):
-    body = await request.json()
-    user_id = str(body.get("userId", body.get("operator", "user1")))
-    rows = []
-    for t in repo.all_tasks():
-        actors = repo._actors.get(t.id, [])
-        if t.taskState != TaskState.DOING or user_id not in actors:
-            continue
-        inst = await repo.find_instance_by_id(t.processInstanceId)
-        d = await repo.find_define_by_id(inst.defineId) if inst else None
-        rows.append(_task_vo(t, inst, d))
-    rows.sort(key=lambda x: x["id"], reverse=True)
-    return _ok(_page(rows))
-
-@app.post("/wf/processTask/doneList")
-async def done_list(request: Request):
-    body = await request.json()
-    user_id = str(body.get("userId", body.get("operator", "user1")))
-    rows = []
-    for t in repo.all_tasks():
-        actors = repo._actors.get(t.id, [])
-        if t.taskState != TaskState.DONE or (user_id not in actors and t.actorId != user_id):
-            continue
-        inst = await repo.find_instance_by_id(t.processInstanceId)
-        d = await repo.find_define_by_id(inst.defineId) if inst else None
-        rows.append(_task_vo(t, inst, d))
-    rows.sort(key=lambda x: x["id"], reverse=True)
-    return _ok(_page(rows))
-
-@app.post("/wf/processTask/execute")
-async def execute_task(request: Request):
-    """处理待办（boot2 submitType 全枚举）"""
-    body = await request.json()
-    task_id = int(body.get("processTaskId", 0))
-    operator = str(body.get("operator", "user1"))
-    submit_type = int(body.get("submitType", AGREE))
-    args = dict(body)
-    args.pop("processTaskId", None)
-    try:
-        if submit_type == REJECT:                       # 2 拒绝 → 跳结束（实例→45）
-            await engine.execute_and_jump_to_end(task_id, operator, args)
-        elif submit_type == ROLLBACK:                   # 3 退回上一步（回溯上一任务节点）
-            await _rollback_to_prev(task_id, operator, args)
-        elif submit_type == JUMP:                       # 4 跳指定节点
-            await engine.execute_and_jump_task(task_id, operator, args, args.get("taskName"))
-        elif submit_type == ROLLBACK_TO_OPERATOR:       # 6 退回发起人（第一个任务节点）
-            await engine.execute_and_jump_to_first_task_node(task_id, operator, args)
-        elif submit_type == COUNTERSIGN_DISAGREE:       # 20 会签不同意
-            args["countersignDisagreeFlag"] = 1
-            await engine.execute_process_task(task_id, operator, args)
-        else:                                           # 0/1/5 及默认 → 执行
-            await engine.execute_process_task(task_id, operator, args)
-        return _ok()
-    except Exception as e:
-        return _err(str(e))
-
-async def _rollback_to_prev(task_id: int, operator: str, args: dict):
-    """退回上一步：找到当前任务节点的上一个任务节点并跳转"""
-    task = await repo.find_task_by_id(task_id)
-    inst = await repo.find_instance_by_id(task.processInstanceId)
-    graph = _load_graph(inst.defineId)
-    if not graph: return await engine.execute_and_jump_to_end(task_id, operator, args)
-    # 找当前节点
-    prev = None
-    for e in graph.get("edges", []):
-        if e.get("targetNodeId") == task.taskName:
-            prev = e.get("sourceNodeId")
-            break
-    # 沿 prev 回溯到任务节点
-    target = prev
-    seen = set()
-    while target:
-        if target in seen: break
-        seen.add(target)
-        node = next((n for n in graph["nodes"] if n["id"] == target), None)
-        if not node: break
-        if node["type"] in ("snaker:task", "snaker:custom"):
-            break
-        # 非任务节点继续向上找
-        found = None
-        for e in graph.get("edges", []):
-            if e.get("targetNodeId") == target:
-                found = e.get("sourceNodeId"); break
-        target = found
-    if target:
-        await engine.execute_and_jump_task(task_id, operator, args, target)
-    else:
-        await engine.execute_and_jump_to_end(task_id, operator, args)
-
-@app.post("/wf/processTask/jumpAbleTaskNameList")
-async def jump_able_task_name_list(request: Request):
-    """可跳转的任务节点名称"""
-    body = await request.json()
-    instance_id = int(body.get("processInstanceId", 0))
-    done = await repo.find_done_tasks(instance_id)
-    seen = set()
-    rows = []
-    for t in done:
-        if t.taskName not in seen:
-            seen.add(t.taskName)
-            rows.append({"label": t.displayName, "value": t.taskName})
-    return _ok(rows)
-
-# ─── 仪表盘统计（UI 用，非 boot2 端点）───────────────────────────────────────────
+@app.post("/wf/{action:path}")
+async def wf_flow(action: str, request: Request):
+    """单入口门面转发（v1.5.0）：/wf/{action}，action 多段（如 processDefine/page）"""
+    body = await request.json() if await request.body() else {}
+    return await facade.flow(action, body)
 
 @app.get("/api/stats")
 async def api_stats(userId: str = "user1"):

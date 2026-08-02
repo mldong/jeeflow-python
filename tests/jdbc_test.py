@@ -305,6 +305,54 @@ async def main():
                              [tx_inst_id + 1])
         check("回滚后无残留数据", n == 0 and cc == 0, f"instance={n} cc={cc}")
 
+        # ── ⑧ 定义写操作 SPI（v1.0.1，集成反馈①）──
+        d = ProcessDefine(name="py-crud", displayName="CRUD 流程", type="test",
+                          state=1, version=1, content="{}", updateUser="tester")
+        await repo.save_define(d)
+        check("save_define 生成 ID", d.id > 0, str(d.id))
+        loaded = await repo.find_define_by_id(d.id)
+        check("保存后可查询", loaded is not None and loaded.name == "py-crud",
+              str(loaded.name if loaded else None))
+        loaded.displayName = "CRUD 流程 v2"
+        loaded.content = '{"v":2}'
+        await repo.update_define(loaded)
+        updated = await repo.find_define_by_id(d.id)
+        check("update_define 生效", updated.displayName == "CRUD 流程 v2", str(updated.displayName))
+        await repo.update_define_state(d.id, 0)
+        st = await repo.find_define_by_id(d.id)
+        check("update_define_state 生效", st.state == 0, str(st.state))
+        await repo.remove_define(d.id)
+        check("remove_define 删除", await repo.find_define_by_id(d.id) is None)
+
+        # ── ⑨ update_instance 级联持久化任务状态（v1.0.1，集成反馈②）──
+        # 恢复 01-simple 定义（⑦ 事务测试前已清理）
+        content = load_flow("01-simple.json")
+        raw = json.loads(content)
+        conn = await adapter.acquire()
+        try:
+            now = datetime.now()
+            await conn.execute(sql_of(adapter,
+                "INSERT INTO wf_process_define (id, name, display_name, type, state, content,"
+                " version, create_time, create_user, update_time, update_user)"
+                " VALUES (?,?,?,?,1,?,1,?,?,?,?)"),
+                [DEFINE_ID, "py-simple", raw["displayName"], raw["type"], content,
+                 now, "py-test", now, "py-test"])
+        finally:
+            await adapter.release(conn)
+        inst = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
+                                                      {"BUSINESS_NO": f"BIZ-{DB}-003"})
+        reloaded = await repo.find_instance_by_id(inst.id)
+        tasks = await repo.find_history_tasks(inst.id)
+        check("实例加载任务", reloaded is not None and len(tasks) > 0, str(len(tasks)))
+        for t in tasks:
+            t.taskState = TaskState.ABANDONED
+        reloaded.tasks = tasks
+        await repo.update_instance(reloaded)
+        after = await repo.find_history_tasks(inst.id)
+        check("update_instance 级联任务状态落库",
+              all(t.taskState == TaskState.ABANDONED for t in after),
+              str([int(t.taskState) for t in after]))
+
         # 清理测试残留
         await cleanup(adapter)
         conn = await adapter.acquire()

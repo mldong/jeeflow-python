@@ -71,6 +71,9 @@ class EngineImpl(Engine):
         # 聚合根：完成任务（子实体状态转换 + 实例变量合并）
         inst.complete_task(task, operator, vars_, now)
         await self.repo.update_task(task)
+        # v1.0.1：update_instance 级联持久化依赖聚合内任务副本为最新状态，
+        # complete_task 改的是外部任务对象，需同步回聚合根
+        _sync_task_to_aggregate(inst, task)
         await self._fire_event(ProcessEvent(EventType.TASK_COMPLETE, inst.id, task.id, task.taskName, operator))
 
         def_ = await self.repo.find_define_by_id(inst.defineId)
@@ -121,6 +124,8 @@ class EngineImpl(Engine):
         # 子实体：完成任务
         task.finish(operator, task.variables, now)
         await self.repo.update_task(task)
+        # v1.0.1：同步回聚合根，避免 update_instance 级联把任务写回旧状态
+        _sync_task_to_aggregate(inst, task)
         # 聚合根：驳回
         inst.reject(now)
         await self.repo.update_instance(inst)
@@ -310,6 +315,14 @@ def _find_by_type(flow: FlowModel, typ: str) -> Optional[FlowNode]:
 
 def _follow_edges(flow: FlowModel, source_id: str) -> list[FlowNode]:
     return [_find_node(flow, e.targetNodeId) for e in flow.edges if e.sourceNodeId == source_id and _find_node(flow, e.targetNodeId)]
+
+def _sync_task_to_aggregate(inst: ProcessInstance, task: ProcessTask):
+    """把外部任务对象的最新状态同步回聚合根任务副本
+    （v1.0.1：update_instance 级联持久化依赖聚合内任务副本为最新状态）"""
+    for i, t in enumerate(inst.tasks):
+        if t.id == task.id:
+            inst.tasks[i] = task
+            return
 
 def _get_cs_state(vars_: dict, node_id: str):
     actors = vars_.get(f"operatorList_{node_id}")

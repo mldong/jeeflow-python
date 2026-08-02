@@ -16,6 +16,20 @@ class MemoryRepository(ProcessRepository):
         self._defines[d.id] = d
 
     async def find_define_by_id(self, id): return deepcopy(self._defines.get(id))
+
+    # ── 定义写操作（v1.0.1，对齐 SPI）──
+
+    async def save_define(self, d: ProcessDefine):
+        d.id = d.id or self._seq; self._seq += 1
+        self._defines[d.id] = d
+    async def update_define(self, d: ProcessDefine):
+        self._defines[d.id] = d
+    async def update_define_state(self, define_id: int, state: int):
+        if define_id in self._defines:
+            self._defines[define_id].state = state
+    async def remove_define(self, define_id: int):
+        self._defines.pop(define_id, None)
+
     async def find_instance_by_id(self, id):
         inst = self._instances.get(id)
         if not inst: return None
@@ -28,6 +42,11 @@ class MemoryRepository(ProcessRepository):
         self._instances[inst.id] = deepcopy(inst)
     async def update_instance(self, inst: ProcessInstance):
         self._instances[inst.id] = deepcopy(inst)
+        # v1.0.1：级联保存聚合根内任务状态变更
+        for t in inst.tasks:
+            if t.id:
+                self._tasks[t.id] = deepcopy(t)
+                if t.actorIds: self._actors[t.id] = list(t.actorIds)
     async def find_task_by_id(self, task_id):
         t = self._tasks.get(task_id)
         if not t: return None

@@ -16,6 +16,7 @@ import contextvars
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any, Optional, Protocol, Sequence
 
 from ..model import ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState
@@ -141,6 +142,48 @@ class JdbcRepository(ProcessRepository):
             version=row[6], createTime=row[7], createUser=row[8], updateTime=row[9], updateUser=row[10],
         )
 
+    # 定义写操作（v1.0.1，集成反馈①）。SQL 与 jeeflow-java JdbcProcessRepository 对齐；
+    # State/Version 零值按 Java null 语义默认 1。
+
+    async def save_define(self, define: ProcessDefine) -> None:
+        if not define.id:
+            define.id = self._id_gen.next_id()
+        now = datetime.now()
+        if not define.createTime:
+            define.createTime = now
+        if not define.updateTime:
+            define.updateTime = now
+        if not define.createUser:
+            define.createUser = define.updateUser
+        async with self._conn() as conn:
+            await conn.execute(self._sql(
+                "INSERT INTO wf_process_define (id, name, display_name, type, state, content,"
+                " version, create_time, create_user, update_time, update_user)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"),
+                (define.id, define.name, define.displayName, define.type,
+                 int(define.state or 1), define.content, int(define.version or 1),
+                 define.createTime, define.createUser, define.updateTime, define.updateUser))
+
+    async def update_define(self, define: ProcessDefine) -> None:
+        async with self._conn() as conn:
+            await conn.execute(self._sql(
+                "UPDATE wf_process_define SET name=?, display_name=?, type=?, state=?,"
+                " content=?, version=?, update_time=?, update_user=? WHERE id=?"),
+                (define.name, define.displayName, define.type, int(define.state or 1),
+                 define.content, int(define.version or 1), datetime.now(), define.updateUser,
+                 define.id))
+
+    async def update_define_state(self, define_id: int, state: int) -> None:
+        async with self._conn() as conn:
+            await conn.execute(self._sql(
+                "UPDATE wf_process_define SET state=?, update_time=? WHERE id=?"),
+                (int(state), datetime.now(), define_id))
+
+    async def remove_define(self, define_id: int) -> None:
+        async with self._conn() as conn:
+            await conn.execute(self._sql("DELETE FROM wf_process_define WHERE id=?"),
+                               (define_id,))
+
     # ── ProcessInstance ────────────────────────────────────────────────────
 
     _INSTANCE_COLS = ("id, parent_id, process_define_id, state, parent_node_name,"
@@ -183,6 +226,10 @@ class JdbcRepository(ProcessRepository):
                 (int(inst.state), inst.parentNodeName, inst.businessNo, inst.operator,
                  inst.expireTime, json.dumps(inst.variables, ensure_ascii=False),
                  inst.updateTime, inst.updateUser, inst.id))
+            # v1.0.1：级联持久化聚合根内任务状态变更（同连接，spec §7.4）
+            for task in inst.tasks:
+                if task.id:
+                    await self._update_task_with_conn(conn, task)
 
     # ── ProcessTask ────────────────────────────────────────────────────────
 
@@ -219,12 +266,16 @@ class JdbcRepository(ProcessRepository):
 
     async def update_task(self, task: ProcessTask) -> None:
         async with self._conn() as conn:
-            await conn.execute(self._sql(
-                "UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?,"
-                " expire_time=?, variable=?, update_time=?, update_user=? WHERE id=?"),
-                (int(task.taskState), task.actorId, task.finishTime, task.expireTime,
-                 json.dumps(task.variables, ensure_ascii=False), task.updateTime, task.updateUser,
-                 task.id))
+            await self._update_task_with_conn(conn, task)
+
+    async def _update_task_with_conn(self, conn: SqlConnection, task: ProcessTask) -> None:
+        """用指定连接更新任务（实例级联时与实例更新同连接）"""
+        await conn.execute(self._sql(
+            "UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?,"
+            " expire_time=?, variable=?, update_time=?, update_user=? WHERE id=?"),
+            (int(task.taskState), task.actorId, task.finishTime, task.expireTime,
+             json.dumps(task.variables, ensure_ascii=False), task.updateTime, task.updateUser,
+             task.id))
 
     async def _find_tasks_by_state(self, instance_id: int, state: Optional[TaskState],
                                    task_names: Optional[list[str]]) -> list[ProcessTask]:

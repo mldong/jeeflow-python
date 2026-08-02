@@ -20,6 +20,11 @@ KEY_DEPT_ID       = "u_deptId"
 KEY_DEPT_NAME     = "u_deptName"
 KEY_POST_ID       = "u_postId"
 KEY_POST_NAME     = "u_postName"
+# v1.0.1：下一节点处理人（对齐 boot3 tf_nextNodeOperator）
+KEY_NEXT_NODE_OPERATOR = "tf_nextNodeOperator"
+# v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
+KEY_AUTO_ID   = "flow.auto"
+KEY_ADMIN_ID  = "flow.admin"
 
 class Engine:
     """引擎接口"""
@@ -231,7 +236,7 @@ class EngineImpl(Engine):
             if target: return await self._execute_node(flow, inst, target, operator, vars_)
 
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict):
-        actors = await self._resolve_actors(node, inst)
+        actors = await self._resolve_actors(node, inst, vars_)
         if not actors: return
         perform_type = int(node.properties.get("performType", 0))
         ct = node.properties.get("countersignType", "")
@@ -247,15 +252,39 @@ class EngineImpl(Engine):
             else:
                 for a in actors: await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now))
         else:
-            await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now))
+            # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
+            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
+            if len(actors) > 1:
+                nt.actorIds = actors
+            await self.repo.save_task(nt)
 
-    async def _resolve_actors(self, node: FlowNode, inst: ProcessInstance) -> list[str]:
+    async def _resolve_actors(self, node: FlowNode, inst: ProcessInstance, vars_: dict) -> list[str]:
+        # 1. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
+        next_op = vars_.get(KEY_NEXT_NODE_OPERATOR)
+        if next_op:
+            if isinstance(next_op, str):
+                return [a.strip() for a in next_op.split(",") if a.strip()]
+            if isinstance(next_op, (list, tuple)):
+                return [str(a) for a in next_op]
+            return [str(next_op)]
         assignee = node.properties.get("assignee", "")
         if assignee:
-            actors = [a.strip() for a in assignee.split(",") if a.strip()]
-            # boot2 约定："applicant" → 解析为流程发起人
-            if "applicant" in actors:
-                actors = [inst.operator if a == "applicant" else a for a in actors]
+            actors = []
+            for a in assignee.split(","):
+                token = a.strip()
+                if not token: continue
+                # mldong 契约特殊值：applicant → 流程发起人
+                if "applicant" in token:
+                    token = token.replace("applicant", inst.operator)
+                # token 即变量 key：命中用值（集合展开）、未命中字面量（对齐 boot3 args.get(token, token)）
+                if token in vars_:
+                    val = vars_[token]
+                    if isinstance(val, (list, tuple)):
+                        actors.extend(str(x) for x in val)
+                    else:
+                        actors.append(str(val))
+                else:
+                    actors.append(token)
             return actors
         handler_name = node.properties.get("assignmentHandler", "")
         if handler_name and self.ext and self.ext.registry:
@@ -268,11 +297,17 @@ class EngineImpl(Engine):
         return []
 
     def _is_allowed(self, task: ProcessTask, operator: str) -> bool:
+        # v1.0.1：系统代执行（flow.auto）/超级管理员（flow.admin）放行（对齐 boot3 isAllowed）
+        if operator and (operator.lower() == KEY_AUTO_ID or operator.lower() == KEY_ADMIN_ID):
+            return True
         # 子实体：actorIds 权限判断
         return task.is_allowed(operator)
 
     async def _add_user_info(self, operator: str, vars_: dict):
         if not self.user_prov: return
+        # v1.0.1：系统代执行（flow.auto）/超级管理员（flow.admin）非真实用户，跳过注入（对齐 boot3）
+        if operator and (operator.lower() == KEY_AUTO_ID or operator.lower() == KEY_ADMIN_ID):
+            return
         u = await self.user_prov.get_user(operator)
         if not u: return
         vars_[KEY_USER_ID] = u.userId

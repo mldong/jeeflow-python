@@ -286,5 +286,68 @@ async def test_10_interceptor_and_events():
     assert "PROCESS_FINISH" in events
 
 
+@pytest.mark.asyncio
+async def test_assignee_variable_resolution():
+    """assignee 变量解析（v1.0.1，集成反馈③）：token 即变量 key，命中用值、未命中字面量；tf_nextNodeOperator 优先"""
+    eng, repo = setup()
+    d = load_flow(repo, "11-assignee-vars.json")
+
+    # ① deptLeader 变量命中 → 参与者 = 变量值
+    inst = await eng.start_process_instance_by_id(d.id, "applicant", {"deptLeader": "L001"})
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["applicant"])
+    await eng.execute_process_task(doing[0].id, "applicant")
+    doing = await repo.find_doing_tasks(inst.id)
+    assert doing[0].taskName == "task1", doing[0].taskName
+    assert doing[0].actorIds == ["L001"], f"变量命中应解析为变量值: {doing[0].actorIds}"
+
+    # ② 静态字面量 userA,userB（变量未命中）
+    await eng.execute_process_task(doing[0].id, "L001")
+    doing = await repo.find_doing_tasks(inst.id)
+    assert doing[0].taskName == "task2", doing[0].taskName
+    assert doing[0].actorIds == ["userA", "userB"], f"静态字面量参与者: {doing[0].actorIds}"
+
+    # ③ 变量未传入 → token 字面量回退（对齐 boot3 args.get(token, token)）
+    d = load_flow(repo, "11-assignee-vars.json")
+    inst = await eng.start_process_instance_by_id(d.id, "applicant")
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["applicant"])
+    await eng.execute_process_task(doing[0].id, "applicant")
+    doing = await repo.find_doing_tasks(inst.id)
+    assert doing[0].actorIds == ["deptLeader"], f"未命中应回退字面量: {doing[0].actorIds}"
+
+    # ④ tf_nextNodeOperator 优先于 assignee
+    d = load_flow(repo, "11-assignee-vars.json")
+    inst = await eng.start_process_instance_by_id(d.id, "applicant")
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["applicant"])
+    await eng.execute_process_task(doing[0].id, "applicant", {"tf_nextNodeOperator": "BOSS1,BOSS2"})
+    doing = await repo.find_doing_tasks(inst.id)
+    assert doing[0].actorIds == ["BOSS1", "BOSS2"], f"tf_nextNodeOperator 应优先: {doing[0].actorIds}"
+
+
+@pytest.mark.asyncio
+async def test_system_execute_flow_auto():
+    """系统代执行 flow.auto / flow.admin（v1.0.1，集成反馈④）：放行 + 跳过用户注入"""
+    eng, repo = setup()
+    d = load_flow(repo, "11-assignee-vars.json")
+    inst = await eng.start_process_instance_by_id(d.id, "applicant", {"deptLeader": "L001"})
+    doing = await repo.find_doing_tasks(inst.id)
+
+    # ① flow.auto 非参与者身份放行（startAndExecute 契约）
+    inst = await eng.execute_process_task(doing[0].id, "flow.auto")
+    doing = await repo.find_doing_tasks(inst.id)
+    assert doing[0].taskName == "task1", f"flow.auto 应放行执行: {doing[0].taskName}"
+
+    # ② 跳过 UserProvider 注入：u_userId 不会被替换成 flow.auto
+    reloaded = await repo.find_instance_by_id(inst.id)
+    assert reloaded.variables.get("u_userId") == "applicant", f"flow.auto 应跳过用户注入: {reloaded.variables.get('u_userId')}"
+
+    # ③ flow.admin 放行
+    inst = await eng.execute_process_task(doing[0].id, "flow.admin")
+    doing = await repo.find_doing_tasks(inst.id)
+    assert doing[0].taskName == "task2", f"flow.admin 应放行执行: {doing[0].taskName}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

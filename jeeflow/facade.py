@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from .engine import Engine
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState
-from .spi import ProcessExtRepository, ProcessRepository
+from .spi import ProcessExtRepository, ProcessRepository, QueryCondition
 
 # submitType 枚举（对齐 boot3）
 SUBMIT_APPLY = 0
@@ -60,7 +60,7 @@ class JeeflowFacade:
         """流程定义分页（v1.5.0 补齐）"""
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
-        rows, total = await self._repo.page_defines(page_num, page_size)
+        rows, total = await self._repo.page_defines(page_num, page_size, self._parse_m_query(args))
         return self._page_data([self._define_row_to_dict(r) for r in rows], total)
 
     async def _processDefine_detail(self, args: dict) -> dict:
@@ -83,7 +83,7 @@ class JeeflowFacade:
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
         operator = str(args.get("operator", "user1"))
-        rows, total = await self._repo.page_instances(page_num, page_size, operator)
+        rows, total = await self._repo.page_instances(page_num, page_size, operator, self._parse_m_query(args))
         return self._page_data([self._instance_row_to_dict(r) for r in rows], total)
 
     async def _processInstance_detail(self, args: dict) -> dict:
@@ -228,7 +228,7 @@ class JeeflowFacade:
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
         actor_id = str(args.get("operator", "user1"))
-        rows, total = await self._repo.page_todo_tasks(page_num, page_size, actor_id)
+        rows, total = await self._repo.page_todo_tasks(page_num, page_size, actor_id, self._parse_m_query(args))
         return self._page_data([self._task_row_to_dict(r) for r in rows], total)
 
     async def _processTask_doneList(self, args: dict) -> dict:
@@ -236,7 +236,7 @@ class JeeflowFacade:
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
         operator = str(args.get("operator", "user1"))
-        rows, total = await self._repo.page_done_tasks(page_num, page_size, operator)
+        rows, total = await self._repo.page_done_tasks(page_num, page_size, operator, self._parse_m_query(args))
         return self._page_data([self._task_row_to_dict(r) for r in rows], total)
 
     async def _processTask_execute(self, args: dict) -> dict:
@@ -269,7 +269,8 @@ class JeeflowFacade:
     async def _processDesign_page(self, args: dict) -> dict:
         ext = self._ext_repo()
         rows, total = await ext.page_designs(self._to_int(args.get("pageNum")) or 1,
-                                             self._to_int(args.get("pageSize")) or 10)
+                                             self._to_int(args.get("pageSize")) or 10,
+                                             conditions=self._parse_m_query(args))
         return self._page_data(rows, total)
 
     async def _processDesign_detail(self, args: dict) -> dict:
@@ -342,7 +343,8 @@ class JeeflowFacade:
         rows, total = await ext.page_surrogates(self._to_int(args.get("pageNum")) or 1,
                                                 self._to_int(args.get("pageSize")) or 10,
                                                 filters={"operator": str(args["operator"])}
-                                                if args.get("operator") else None)
+                                                if args.get("operator") else None,
+                                                conditions=self._parse_m_query(args))
         return self._page_data(rows, total)
 
     async def _processSurrogate_save(self, args: dict) -> dict:
@@ -518,7 +520,7 @@ class JeeflowFacade:
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
         actor_id = str(args.get("operator", "user1"))
-        rows, total = await self._repo.page_cc_instances(page_num, page_size, actor_id)
+        rows, total = await self._repo.page_cc_instances(page_num, page_size, actor_id, self._parse_m_query(args))
         return self._page_data([self._cc_row_to_dict(r) for r in rows], total)
 
     async def _processTask_detail(self, args: dict) -> dict:
@@ -693,6 +695,34 @@ class JeeflowFacade:
             return int(v)
         except (TypeError, ValueError):
             return None
+
+    def _parse_m_query(self, args: dict) -> list:
+        """m_ 前缀查询参数解析（issues/05-5，对齐 Java JeeflowQueryParser）：
+        m_EQ_taskName → t.task_name EQ；m_pd_LIKE_displayName → pd.display_name LIKE"""
+        out = []
+        for key, value in args.items():
+            if not key.startswith("m_") or value is None or value == "":
+                continue
+            parts = key[2:].split("_")
+            if len(parts) < 2:
+                continue
+            if len(parts) == 2:
+                # 无别名 → 默认主表别名 t（对齐 Java，白名单列均带表别名）
+                operator, column = parts[0], "t." + self._to_underscore(parts[1])
+            else:
+                operator, column = parts[1], parts[0] + "." + self._to_underscore(parts[2])
+            out.append(QueryCondition(column=column, operator=operator.upper(), value=value))
+        return out
+
+    @staticmethod
+    def _to_underscore(camel: str) -> str:
+        out = []
+        for c in camel:
+            if c.isupper():
+                out.append("_" + c.lower())
+            else:
+                out.append(c)
+        return "".join(out)
 
     @staticmethod
     def _page_data(rows, total: int) -> dict:

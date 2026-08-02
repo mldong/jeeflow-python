@@ -19,6 +19,8 @@ import time
 from datetime import datetime
 from typing import Any, Optional, Protocol, Sequence
 
+from ..spi import QueryCondition
+
 from ..model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate)
 from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository
 
@@ -82,8 +84,74 @@ def repeat_ph(n: int) -> str:
     return ",".join(["?"] * n)
 
 
+# ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
+
+_TASK_WHITELIST = {
+    "t.id", "t.task_name", "t.display_name", "t.task_type", "t.perform_type", "t.task_state",
+    "t.operator", "t.form_key", "t.create_time", "t.finish_time", "t.expire_time",
+    "t.process_instance_id", "t.task_parent_id", "t.variable",
+    "pi.id", "pi.business_no", "pi.operator", "pi.create_time", "pi.state",
+    "pd.name", "pd.display_name", "pd.type",
+    "pta.actor_id", "pta.process_task_id",
+}
+
+_INSTANCE_WHITELIST = {
+    "t.id", "t.parent_id", "t.process_define_id", "t.state", "t.business_no",
+    "t.operator", "t.create_time", "t.expire_time", "t.variable",
+    "pd.name", "pd.display_name", "pd.type", "pd.version",
+}
+
+_CC_WHITELIST = {
+    "t.id", "t.process_define_id", "t.state", "t.business_no", "t.operator",
+    "t.create_time", "t.variable",
+    "pd.name", "pd.display_name", "pd.type", "pd.version",
+    "cc.actor_id", "cc.state",
+}
+
+_DEFINE_WHITELIST = {
+    "t.id", "t.name", "t.display_name", "t.type", "t.state", "t.version",
+    "t.create_time", "t.update_time",
+}
+
+
 class JdbcRepository(ProcessRepository):
     """ProcessRepository 的通用 JDBC 实现——注入 SqlAdapter 对接任意数据库。"""
+
+    def _build_where(self, conditions: list, whitelist: set) -> tuple[str, tuple]:
+        """m_ 条件 WHERE 构建（issues/05-5，白名单 + 参数化，对齐 Java buildWhere）"""
+        sql = ""
+        args = []
+        for c in conditions or []:
+            if c.column not in whitelist:
+                continue  # 不在白名单，丢弃
+            val = c.value
+            if val is None or val == "":
+                continue
+            op = c.operator.upper()
+            if op == "EQ":
+                sql += f" AND {c.column} = ?"; args.append(val)
+            elif op == "NE":
+                sql += f" AND {c.column} <> ?"; args.append(val)
+            elif op == "LIKE":
+                sql += f" AND {c.column} LIKE ?"; args.append(f"%{val}%")
+            elif op == "LLIKE":
+                sql += f" AND {c.column} LIKE ?"; args.append(f"%{val}")
+            elif op == "RLIKE":
+                sql += f" AND {c.column} LIKE ?"; args.append(f"{val}%")
+            elif op == "GT":
+                sql += f" AND {c.column} > ?"; args.append(val)
+            elif op == "GE":
+                sql += f" AND {c.column} >= ?"; args.append(val)
+            elif op == "LT":
+                sql += f" AND {c.column} < ?"; args.append(val)
+            elif op == "LE":
+                sql += f" AND {c.column} <= ?"; args.append(val)
+            elif op in ("IN", "NIN"):
+                if isinstance(val, (list, tuple)) and len(val) > 0:
+                    marks = repeat_ph(len(val))
+                    sql += f" AND {c.column} {'IN' if op == 'IN' else 'NOT IN'} ({marks})"
+                    args.extend(val)
+        return sql, tuple(args)
 
     def __init__(self, adapter: SqlAdapter, id_gen: Optional[IDGenerator] = None):
         self._adapter = adapter
@@ -401,21 +469,23 @@ class JdbcRepository(ProcessRepository):
                 (datetime.datetime.now(), instance_id, actor_id))
 
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
-                                actor_id: Optional[str] = None) -> tuple[list[CcInstanceRow], int]:
+                                actor_id: Optional[str] = None,
+                                conditions: Optional[list[QueryCondition]] = None) -> tuple[list[CcInstanceRow], int]:
         """我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）"""
+        cond_sql, cond_args = self._build_where(conditions or [], _CC_WHITELIST)
         where = (" FROM wf_process_instance t"
                  " LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id"
                  " LEFT JOIN wf_process_cc_instance cc ON t.id = cc.process_instance_id"
-                 " WHERE cc.actor_id = ?")
+                 " WHERE cc.actor_id = ?" + cond_sql)
         cols = ("t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,"
                 " t.operator, t.expire_time, t.variable, t.create_time, t.create_user,"
                 " t.update_time, t.update_user, pd.name, pd.display_name, pd.version")
         async with self._conn() as conn:
-            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), (actor_id,))
+            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), (actor_id, *cond_args))
             total = int(row[0]) if row else 0
             rows = await conn.fetchall(self._sql(
                 f"SELECT {cols}{where} ORDER BY t.id ASC LIMIT ? OFFSET ?"),
-                (actor_id, page_size, (page_num - 1) * page_size))
+                (actor_id, *cond_args, page_size, (page_num - 1) * page_size))
         return [self._map_cc_row(r) for r in rows], total
 
     def _map_cc_row(self, r: Sequence[Any]) -> CcInstanceRow:
@@ -430,62 +500,72 @@ class JdbcRepository(ProcessRepository):
 
     # ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
 
-    async def page_defines(self, page_num: int = 1, page_size: int = 10) -> tuple[list[DefineRow], int]:
+    async def page_defines(self, page_num: int = 1, page_size: int = 10,
+                           conditions: Optional[list[QueryCondition]] = None) -> tuple[list[DefineRow], int]:
+        cond_sql, cond_args = self._build_where(conditions or [], _DEFINE_WHITELIST)
+        where = " FROM wf_process_define t WHERE 1=1" + cond_sql
         async with self._conn() as conn:
-            row = await conn.fetchone(self._sql("SELECT COUNT(*) FROM wf_process_define t"))
+            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), cond_args)
             total = int(row[0]) if row else 0
             rows = await conn.fetchall(self._sql(
                 "SELECT id, name, display_name, type, state, version, create_time, create_user,"
-                " update_time, update_user FROM wf_process_define t ORDER BY t.id DESC LIMIT ? OFFSET ?"),
-                (page_size, (page_num - 1) * page_size))
+                " update_time, update_user" + where + " ORDER BY t.id DESC LIMIT ? OFFSET ?"),
+                (*cond_args, page_size, (page_num - 1) * page_size))
         return [DefineRow(id=r[0], name=r[1], displayName=r[2], type=r[3], state=r[4],
                           version=r[5], createTime=r[6], createUser=r[7],
                           updateTime=r[8], updateUser=r[9]) for r in rows], total
 
     async def page_instances(self, page_num: int = 1, page_size: int = 10,
-                             operator: Optional[str] = None) -> tuple[list[InstanceRow], int]:
+                             operator: Optional[str] = None,
+                             conditions: Optional[list[QueryCondition]] = None) -> tuple[list[InstanceRow], int]:
+        cond_sql, cond_args = self._build_where(conditions or [], _INSTANCE_WHITELIST)
         where = (" FROM wf_process_instance t"
                  " LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id"
-                 " WHERE t.operator = ?")
+                 " WHERE t.operator = ?" + cond_sql)
         cols = ("t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,"
                 " t.operator, t.expire_time, t.variable, t.create_time, t.create_user,"
                 " t.update_time, t.update_user, pd.name, pd.display_name, pd.version")
         async with self._conn() as conn:
-            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), (operator,))
+            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), (operator, *cond_args))
             total = int(row[0]) if row else 0
             rows = await conn.fetchall(self._sql(
                 f"SELECT {cols}{where} ORDER BY t.id DESC LIMIT ? OFFSET ?"),
-                (operator, page_size, (page_num - 1) * page_size))
+                (operator, *cond_args, page_size, (page_num - 1) * page_size))
         return [self._map_instance_row(r) for r in rows], total
 
     async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10,
-                              actor_id: Optional[str] = None) -> tuple[list[TaskRow], int]:
-        return await self._page_tasks(page_num, page_size, False, actor_id)
+                              actor_id: Optional[str] = None,
+                              conditions: Optional[list[QueryCondition]] = None) -> tuple[list[TaskRow], int]:
+        return await self._page_tasks(page_num, page_size, False, actor_id, conditions)
 
     async def page_done_tasks(self, page_num: int = 1, page_size: int = 10,
-                              operator: Optional[str] = None) -> tuple[list[TaskRow], int]:
-        return await self._page_tasks(page_num, page_size, True, operator)
+                              operator: Optional[str] = None,
+                              conditions: Optional[list[QueryCondition]] = None) -> tuple[list[TaskRow], int]:
+        return await self._page_tasks(page_num, page_size, True, operator, conditions)
 
     async def _page_tasks(self, page_num: int, page_size: int, done: bool,
-                          filter_val: str) -> tuple[list[TaskRow], int]:
+                          filter_val: str,
+                          conditions: Optional[list[QueryCondition]] = None) -> tuple[list[TaskRow], int]:
+        cond_sql, cond_args = self._build_where(conditions or [], _TASK_WHITELIST)
         where = (" FROM wf_process_task t"
                  " LEFT JOIN wf_process_instance pi ON t.process_instance_id = pi.id"
                  " LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id"
                  " LEFT JOIN wf_process_task_actor pta ON t.id = pta.process_task_id")
         if done:
-            where += " WHERE t.task_state <> 10 AND t.operator = ?"
+            where += " WHERE t.task_state <> 10 AND t.operator = ?" + cond_sql
         else:
-            where += " WHERE t.task_state = 10 AND pta.actor_id = ?"
+            where += " WHERE t.task_state = 10 AND pta.actor_id = ?" + cond_sql
         cols = ("DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type,"
                 " t.perform_type, t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key,"
                 " t.task_parent_id, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,"
                 " pd.name, pd.display_name, pd.version, pi.variable, pi.create_time")
         async with self._conn() as conn:
-            row = await conn.fetchone(self._sql("SELECT COUNT(DISTINCT t.id)" + where), (filter_val,))
+            row = await conn.fetchone(self._sql("SELECT COUNT(DISTINCT t.id)" + where),
+                                      (filter_val, *cond_args))
             total = int(row[0]) if row else 0
             rows = await conn.fetchall(self._sql(
                 f"SELECT {cols}{where} ORDER BY t.id DESC LIMIT ? OFFSET ?"),
-                (filter_val, page_size, (page_num - 1) * page_size))
+                (filter_val, *cond_args, page_size, (page_num - 1) * page_size))
         return [self._map_task_row(r) for r in rows], total
 
     def _map_instance_row(self, r: Sequence[Any]) -> InstanceRow:

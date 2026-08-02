@@ -573,3 +573,59 @@ async def test_detail_json_object():
     doing = await repo.find_doing_tasks(inst.id)
     r = await facade.flow("processTask/detail", {"id": doing[0].id, "operator": "applicant"})
     assert r["code"] == 0 and r["data"].get("jsonObject"), r
+
+
+@pytest.mark.asyncio
+async def test_m_query_params():
+    """issues/05-5：m_ 前缀查询参数（m_LIKE_name / m_pd_LIKE_displayName / m_t_LIKE_displayName）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        c1 = f.read()
+    with open(os.path.join(FLOW_DIR, "02-multi-task.json"), encoding="utf-8") as f:
+        c2 = f.read()
+    await facade.flow("processDefine/deploy", {"content": c1})
+    await facade.flow("processDefine/deploy", {"content": c2})
+
+    # 无别名 → 默认主表别名 t（t.name / t.display_name）
+    r = await facade.flow("processDefine/page", {"m_LIKE_name": "simple"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 1 and r["data"]["rows"][0]["name"] == "simple", r
+
+    r = await facade.flow("processDefine/page", {"m_LIKE_displayName": "简单"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 1, r
+
+    r = await facade.flow("processDefine/page", {"m_LIKE_displayName": "流程"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 2, r
+
+    # 实例列表：m_pd_LIKE_displayName（别名 pd → pd.display_name）
+    d1 = await repo.find_define_by_name("simple")
+    await facade.flow("processInstance/startAndExecute",
+                      {"processDefineId": d1.id, "operator": "zhangsan"})
+    r = await facade.flow("processInstance/page",
+                          {"operator": "zhangsan", "m_pd_LIKE_displayName": "简单"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 1, r
+    r = await facade.flow("processInstance/page",
+                          {"operator": "zhangsan", "m_pd_LIKE_displayName": "zzz"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 0, r
+
+    # 任务列表：m_t_LIKE_displayName（别名 t → t.display_name）
+    r = await facade.flow("processTask/todoList",
+                          {"operator": "leader", "m_t_LIKE_displayName": "审批"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 1, r
+    r = await facade.flow("processTask/todoList",
+                          {"operator": "leader", "m_t_LIKE_displayName": "zzz"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 0, r
+
+    # 设计列表：无别名 m_LIKE_name（process-design 页）
+    await facade.flow("processDesign/save",
+                      {"name": "leave", "displayName": "请假流程", "content": c1, "operator": "zhangsan"})
+    r = await facade.flow("processDesign/page", {"m_LIKE_name": "leave"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 1, r

@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, Optional, Sequence
 
 from ..model import ProcessDesign, ProcessDesignHis, ProcessSurrogate
-from ..spi import IDGenerator, ProcessExtRepository
+from ..spi import IDGenerator, ProcessExtRepository, QueryCondition
 from .base import SqlAdapter, TsIDGenerator, convert_placeholder, _tx_conn_var
 
 
@@ -81,7 +81,8 @@ class JdbcProcessExtRepository(ProcessExtRepository):
             await conn.execute(self._sql("DELETE FROM wf_process_design_his WHERE process_design_id=?"), (id,))
 
     async def page_designs(self, page_num: int = 1, page_size: int = 10,
-                           filters: Optional[dict] = None) -> tuple[list[ProcessDesign], int]:
+                           filters: Optional[dict] = None,
+                           conditions: Optional[list[QueryCondition]] = None) -> tuple[list[ProcessDesign], int]:
         sql = f"SELECT {self._DESIGN_COLS} FROM wf_process_design t WHERE 1=1"
         count_sql = "SELECT COUNT(*) FROM wf_process_design t WHERE 1=1"
         args: list[Any] = []
@@ -92,6 +93,12 @@ class JdbcProcessExtRepository(ProcessExtRepository):
                 count_sql += f" AND t.{col} = ?"
                 args.append(val)
                 args2.append(val)
+        # m_ 条件（issues/05-5）：LIKE/EQ 等走白名单
+        cond_sql, cond_args = self._build_ext_where(conditions or [], _DESIGN_WHITELIST)
+        sql += cond_sql
+        count_sql += cond_sql
+        args.extend(cond_args)
+        args2.extend(cond_args)
         async with self._conn() as conn:
             row = await conn.fetchone(self._sql(count_sql), args2)
             total = int(row[0]) if row else 0
@@ -99,6 +106,32 @@ class JdbcProcessExtRepository(ProcessExtRepository):
             args.extend([page_size, (page_num - 1) * page_size])
             rows = await conn.fetchall(self._sql(sql), args)
         return [self._map_design(r) for r in rows], total
+
+    def _build_ext_where(self, conditions: list, whitelist: set) -> tuple[str, tuple]:
+        """m_ 条件 WHERE 构建（issues/05-5，白名单 + 参数化）"""
+        sql = ""
+        args = []
+        for c in conditions or []:
+            if c.column not in whitelist:
+                continue
+            val = c.value
+            if val is None or val == "":
+                continue
+            op = c.operator.upper()
+            if op == "EQ":
+                sql += f" AND {c.column} = ?"; args.append(val)
+            elif op == "LIKE":
+                sql += f" AND {c.column} LIKE ?"; args.append(f"%{val}%")
+            elif op == "LLIKE":
+                sql += f" AND {c.column} LIKE ?"; args.append(f"%{val}")
+            elif op == "RLIKE":
+                sql += f" AND {c.column} LIKE ?"; args.append(f"{val}%")
+            elif op == "IN":
+                if isinstance(val, (list, tuple)) and len(val) > 0:
+                    marks = ",".join(["?"] * len(val))
+                    sql += f" AND {c.column} IN ({marks})"
+                    args.extend(val)
+        return sql, tuple(args)
 
     # ── 设计历史 ─────────────────────────────────────────────────────────────
 
@@ -169,7 +202,8 @@ class JdbcProcessExtRepository(ProcessExtRepository):
             await conn.execute(self._sql("DELETE FROM wf_process_surrogate WHERE id=?"), (id,))
 
     async def page_surrogates(self, page_num: int = 1, page_size: int = 10,
-                              filters: Optional[dict] = None) -> tuple[list[ProcessSurrogate], int]:
+                              filters: Optional[dict] = None,
+                              conditions: Optional[list[QueryCondition]] = None) -> tuple[list[ProcessSurrogate], int]:
         sql = f"SELECT {self._SURROGATE_COLS} FROM wf_process_surrogate t WHERE 1=1"
         count_sql = "SELECT COUNT(*) FROM wf_process_surrogate t WHERE 1=1"
         args: list[Any] = []
@@ -225,3 +259,16 @@ class JdbcProcessExtRepository(ProcessExtRepository):
         return ProcessSurrogate(id=r[0], processName=r[1], operator=r[2], surrogate=r[3],
                                 startTime=r[4], endTime=r[5], enabled=r[6], createTime=r[7],
                                 createUser=r[8], updateTime=r[9], updateUser=r[10])
+
+
+# ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
+
+_DESIGN_WHITELIST = {
+    "t.id", "t.name", "t.display_name", "t.type", "t.is_deployed", "t.remark",
+    "t.create_time", "t.update_time",
+}
+
+_SURROGATE_WHITELIST = {
+    "t.id", "t.process_name", "t.operator", "t.surrogate", "t.enabled",
+    "t.start_time", "t.end_time", "t.create_time", "t.update_time",
+}

@@ -95,7 +95,8 @@ class MemoryRepository(ProcessRepository):
     async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str):
         self._cc[instance_id] = list(dict.fromkeys([*self._cc.get(instance_id, []), *actor_ids]))
     async def update_cc_status(self, instance_id: int, actor_id: str): pass
-    async def page_cc_instances(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None):
+    async def page_cc_instances(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None,
+                                conditions=None):
         """我的抄送分页（v1.3.0）：按抄送人 actor_id 过滤，join 实例 + 定义"""
         rows = []
         for inst_id, actors in self._cc.items():
@@ -115,7 +116,10 @@ class MemoryRepository(ProcessRepository):
                 row.defineName = defn.name
                 row.defineDisplayName = defn.displayName
                 row.defineVersion = defn.version
-            rows.append(row)
+            fields = _pick_fields(row, _INSTANCE_FIELDS)
+            fields["cc.actor_id"] = actors
+            if _match_conditions(conditions, fields):
+                rows.append(row)
         total = len(rows)
         start = (page_num - 1) * page_size
         return rows[start:start + page_size], total
@@ -128,14 +132,18 @@ class MemoryRepository(ProcessRepository):
 
     # ── 核心表分页（v1.5.0）──
 
-    async def page_defines(self, page_num: int = 1, page_size: int = 10):
-        rows = [DefineRow(id=d.id, name=d.name, displayName=d.displayName, type=d.type,
-                          state=d.state, version=d.version, createTime=d.createTime,
-                          createUser=d.createUser, updateTime=d.updateTime, updateUser=d.updateUser)
-                for d in self._defines.values()]
+    async def page_defines(self, page_num: int = 1, page_size: int = 10, conditions=None):
+        rows = []
+        for d in self._defines.values():
+            row = DefineRow(id=d.id, name=d.name, displayName=d.displayName, type=d.type,
+                            state=d.state, version=d.version, createTime=d.createTime,
+                            createUser=d.createUser, updateTime=d.updateTime, updateUser=d.updateUser)
+            if _match_conditions(conditions, _pick_fields(row, _DEFINE_FIELDS)):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
-    async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+    async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
+                             conditions=None):
         rows = []
         for inst in self._instances.values():
             if operator and inst.operator != operator:
@@ -151,27 +159,36 @@ class MemoryRepository(ProcessRepository):
                 row.defineName = defn.name
                 row.defineDisplayName = defn.displayName
                 row.defineVersion = defn.version
-            rows.append(row)
+            if _match_conditions(conditions, _pick_fields(row, _INSTANCE_FIELDS)):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
-    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None):
+    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None,
+                              conditions=None):
         rows = []
         for t in self._tasks.values():
             if t.taskState != TaskState.DOING:
                 continue
             if actor_id and actor_id not in self._actors.get(t.id, []):
                 continue
-            rows.append(self._task_row(t))
+            row = self._task_row(t)
+            fields = _pick_fields(row, _TASK_FIELDS)
+            fields["pta.actor_id"] = self._actors.get(t.id, [])
+            if _match_conditions(conditions, fields):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
-    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
+                              conditions=None):
         rows = []
         for t in self._tasks.values():
             if t.taskState == TaskState.DOING:
                 continue
             if operator and t.actorId != operator:
                 continue
-            rows.append(self._task_row(t))
+            row = self._task_row(t)
+            if _match_conditions(conditions, _pick_fields(row, _TASK_FIELDS)):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
     def _task_row(self, t: ProcessTask) -> TaskRow:
@@ -198,6 +215,100 @@ class MemoryRepository(ProcessRepository):
         start = (page_num - 1) * page_size
         return rows[start:start + page_size], total
 
+# ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
+
+# 行字段映射（列名 → 行属性，白名单列均可匹配）
+_TASK_FIELDS = {
+    "t.id": "id", "t.task_name": "taskName", "t.display_name": "displayName",
+    "t.task_type": "taskType", "t.perform_type": "performType", "t.task_state": "taskState",
+    "t.operator": "operator", "t.form_key": "formKey", "t.create_time": "createTime",
+    "t.finish_time": "finishTime", "t.expire_time": "expireTime",
+    "t.process_instance_id": "processInstanceId", "t.task_parent_id": "taskParentId",
+    "pd.name": "processDefineName", "pd.display_name": "processDefineDisplayName",
+    "pd.version": "defineVersion",
+}
+
+_INSTANCE_FIELDS = {
+    "t.id": "id", "t.parent_id": "parentId", "t.process_define_id": "defineId",
+    "t.state": "state", "t.parent_node_name": "parentNodeName", "t.business_no": "businessNo",
+    "t.operator": "operator", "t.expire_time": "expireTime", "t.create_time": "createTime",
+    "pd.name": "defineName", "pd.display_name": "defineDisplayName", "pd.version": "defineVersion",
+}
+
+_DEFINE_FIELDS = {
+    "t.id": "id", "t.name": "name", "t.display_name": "displayName", "t.type": "type",
+    "t.state": "state", "t.version": "version", "t.create_time": "createTime",
+    "t.update_time": "updateTime",
+}
+
+_DESIGN_FIELDS = {
+    "t.id": "id", "t.name": "name", "t.display_name": "displayName", "t.type": "type",
+    "t.is_deployed": "isDeployed", "t.remark": "remark",
+    "t.create_time": "createTime", "t.update_time": "updateTime",
+}
+
+_SURROGATE_FIELDS = {
+    "t.id": "id", "t.process_name": "processName", "t.operator": "operator",
+    "t.surrogate": "surrogate", "t.enabled": "enabled",
+    "t.start_time": "startTime", "t.end_time": "endTime",
+    "t.create_time": "createTime", "t.update_time": "updateTime",
+}
+
+
+def _pick_fields(row, field_map: dict) -> dict:
+    return {col: getattr(row, key, None) for col, key in field_map.items()}
+
+
+def _eq_value(v, expect) -> bool:
+    if isinstance(v, (list, tuple, set)):
+        return expect in v
+    return str(v) == str(expect)
+
+
+def _match_conditions(conditions, fields: dict) -> bool:
+    """条件全匹配（操作符对齐 JDBC buildWhere；列不在字段中则跳过）"""
+    for c in conditions or []:
+        v = fields.get(c.column)
+        expect = c.value
+        if v is None or expect is None:
+            continue
+        op = c.operator.upper()
+        if op == "EQ":
+            if not _eq_value(v, expect):
+                return False
+        elif op == "NE":
+            if _eq_value(v, expect):
+                return False
+        elif op == "LIKE":
+            if str(expect) not in str(v):
+                return False
+        elif op == "LLIKE":
+            if not str(v).endswith(str(expect)):
+                return False
+        elif op == "RLIKE":
+            if not str(v).startswith(str(expect)):
+                return False
+        elif op == "GT":
+            if not (v > expect):
+                return False
+        elif op == "GE":
+            if not (v >= expect):
+                return False
+        elif op == "LT":
+            if not (v < expect):
+                return False
+        elif op == "LE":
+            if not (v <= expect):
+                return False
+        elif op == "IN":
+            if expect not in v:
+                return False
+        elif op == "NIN":
+            if expect in v:
+                return False
+    return True
+
+
 class MemoryExtRepository(ProcessExtRepository):
     """扩展仓储内存实现（v1.1.0，测试/演示用）"""
 
@@ -226,8 +337,9 @@ class MemoryExtRepository(ProcessExtRepository):
         self._designs.pop(id, None)
         self._designHis.pop(id, None)
 
-    async def page_designs(self, page_num=1, page_size=10, filters=None):
-        rows = [deepcopy(d) for d in self._designs.values()]
+    async def page_designs(self, page_num=1, page_size=10, filters=None, conditions=None):
+        rows = [d for d in self._designs.values()
+                if _match_conditions(conditions, _pick_fields(d, _DESIGN_FIELDS))]
         return rows, len(rows)
 
     # ── 设计历史 ──
@@ -259,8 +371,19 @@ class MemoryExtRepository(ProcessExtRepository):
     async def remove_surrogate(self, id: int):
         self._surrogates.pop(id, None)
 
-    async def page_surrogates(self, page_num=1, page_size=10, filters=None):
-        rows = [deepcopy(s) for s in self._surrogates.values()]
+    async def page_surrogates(self, page_num=1, page_size=10, filters=None, conditions=None):
+        rows = []
+        for s in self._surrogates.values():
+            ok = True
+            for col, val in (filters or {}).items():
+                if val is None or val == "":
+                    continue
+                key = "processName" if col == "process_name" else col
+                if str(getattr(s, key, "")) != str(val):
+                    ok = False
+                    break
+            if ok and _match_conditions(conditions, _pick_fields(s, _SURROGATE_FIELDS)):
+                rows.append(deepcopy(s))
         return rows, len(rows)
 
     async def get_surrogate(self, operator: str, process_name: str, at=None):
@@ -307,8 +430,9 @@ class MemoryExtRepository(ProcessExtRepository):
         self._designs.pop(id, None)
         self._designHis.pop(id, None)
 
-    async def page_designs(self, page_num=1, page_size=10, filters=None):
-        rows = [deepcopy(d) for d in self._designs.values()]
+    async def page_designs(self, page_num=1, page_size=10, filters=None, conditions=None):
+        rows = [d for d in self._designs.values()
+                if _match_conditions(conditions, _pick_fields(d, _DESIGN_FIELDS))]
         return rows, len(rows)
 
     # ── 设计历史 ──
@@ -340,8 +464,19 @@ class MemoryExtRepository(ProcessExtRepository):
     async def remove_surrogate(self, id: int):
         self._surrogates.pop(id, None)
 
-    async def page_surrogates(self, page_num=1, page_size=10, filters=None):
-        rows = [deepcopy(s) for s in self._surrogates.values()]
+    async def page_surrogates(self, page_num=1, page_size=10, filters=None, conditions=None):
+        rows = []
+        for s in self._surrogates.values():
+            ok = True
+            for col, val in (filters or {}).items():
+                if val is None or val == "":
+                    continue
+                key = "processName" if col == "process_name" else col
+                if str(getattr(s, key, "")) != str(val):
+                    ok = False
+                    break
+            if ok and _match_conditions(conditions, _pick_fields(s, _SURROGATE_FIELDS)):
+                rows.append(deepcopy(s))
         return rows, len(rows)
 
     async def get_surrogate(self, operator: str, process_name: str, at=None):
@@ -362,14 +497,18 @@ class MemoryExtRepository(ProcessExtRepository):
 
     # ── 核心表分页（v1.5.0）──
 
-    async def page_defines(self, page_num: int = 1, page_size: int = 10):
-        rows = [DefineRow(id=d.id, name=d.name, displayName=d.displayName, type=d.type,
-                          state=d.state, version=d.version, createTime=d.createTime,
-                          createUser=d.createUser, updateTime=d.updateTime, updateUser=d.updateUser)
-                for d in self._defines.values()]
+    async def page_defines(self, page_num: int = 1, page_size: int = 10, conditions=None):
+        rows = []
+        for d in self._defines.values():
+            row = DefineRow(id=d.id, name=d.name, displayName=d.displayName, type=d.type,
+                            state=d.state, version=d.version, createTime=d.createTime,
+                            createUser=d.createUser, updateTime=d.updateTime, updateUser=d.updateUser)
+            if _match_conditions(conditions, _pick_fields(row, _DEFINE_FIELDS)):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
-    async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+    async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
+                             conditions=None):
         rows = []
         for inst in self._instances.values():
             if operator and inst.operator != operator:
@@ -385,27 +524,36 @@ class MemoryExtRepository(ProcessExtRepository):
                 row.defineName = defn.name
                 row.defineDisplayName = defn.displayName
                 row.defineVersion = defn.version
-            rows.append(row)
+            if _match_conditions(conditions, _pick_fields(row, _INSTANCE_FIELDS)):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
-    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None):
+    async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None,
+                              conditions=None):
         rows = []
         for t in self._tasks.values():
             if t.taskState != TaskState.DOING:
                 continue
             if actor_id and actor_id not in self._actors.get(t.id, []):
                 continue
-            rows.append(self._task_row(t))
+            row = self._task_row(t)
+            fields = _pick_fields(row, _TASK_FIELDS)
+            fields["pta.actor_id"] = self._actors.get(t.id, [])
+            if _match_conditions(conditions, fields):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
-    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None):
+    async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
+                              conditions=None):
         rows = []
         for t in self._tasks.values():
             if t.taskState == TaskState.DOING:
                 continue
             if operator and t.actorId != operator:
                 continue
-            rows.append(self._task_row(t))
+            row = self._task_row(t)
+            if _match_conditions(conditions, _pick_fields(row, _TASK_FIELDS)):
+                rows.append(row)
         return self._slice(rows, page_num, page_size)
 
     def _task_row(self, t: ProcessTask) -> TaskRow:

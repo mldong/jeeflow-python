@@ -1,6 +1,15 @@
 """SPI 接口——对标 SPEC.md §6"""
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Optional
+
+
+@dataclass
+class QueryCondition:
+    """查询条件（issues/05-5：m_ 前缀参数解析产物，对齐 Java PageQuery.Condition）"""
+    column: str
+    operator: str
+    value: Any
 from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow, DefineRow, InstanceRow, TaskRow)
 
 class ProcessRepository(ABC):
@@ -49,29 +58,34 @@ class ProcessRepository(ABC):
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None: ...
     @abstractmethod
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
-                                actor_id: Optional[str] = None) -> tuple[list[CcInstanceRow], int]:
+                                actor_id: Optional[str] = None,
+                                conditions: Optional[list[QueryCondition]] = None) -> tuple[list[CcInstanceRow], int]:
         """我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：按抄送人 actor_id 过滤实例列表"""
         ...
 
     # ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
 
     @abstractmethod
-    async def page_defines(self, page_num: int = 1, page_size: int = 10) -> tuple[list[DefineRow], int]:
+    async def page_defines(self, page_num: int = 1, page_size: int = 10,
+                           conditions: Optional[list[QueryCondition]] = None) -> tuple[list[DefineRow], int]:
         """流程定义分页"""
         ...
     @abstractmethod
     async def page_instances(self, page_num: int = 1, page_size: int = 10,
-                             operator: Optional[str] = None) -> tuple[list[InstanceRow], int]:
+                             operator: Optional[str] = None,
+                             conditions: Optional[list[QueryCondition]] = None) -> tuple[list[InstanceRow], int]:
         """我发起的流程实例分页（operator 过滤）"""
         ...
     @abstractmethod
     async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10,
-                              actor_id: Optional[str] = None) -> tuple[list[TaskRow], int]:
+                              actor_id: Optional[str] = None,
+                              conditions: Optional[list[QueryCondition]] = None) -> tuple[list[TaskRow], int]:
         """我的待办分页（actor_id 过滤，仅进行中任务）"""
         ...
     @abstractmethod
     async def page_done_tasks(self, page_num: int = 1, page_size: int = 10,
-                              operator: Optional[str] = None) -> tuple[list[TaskRow], int]:
+                              operator: Optional[str] = None,
+                              conditions: Optional[list[QueryCondition]] = None) -> tuple[list[TaskRow], int]:
         """我的已办分页（operator 过滤，非进行中任务）"""
         ...
 
@@ -104,7 +118,8 @@ class ProcessExtRepository(ABC):
     async def remove_design(self, id: int) -> None: ...
     @abstractmethod
     async def page_designs(self, page_num: int = 1, page_size: int = 10,
-                           filters: Optional[dict] = None) -> tuple[list[ProcessDesign], int]: ...
+                           filters: Optional[dict] = None,
+                           conditions: Optional[list[QueryCondition]] = None) -> tuple[list[ProcessDesign], int]: ...
 
     # ── 设计历史（wf_process_design_his） ──
     @abstractmethod
@@ -123,7 +138,8 @@ class ProcessExtRepository(ABC):
     async def remove_surrogate(self, id: int) -> None: ...
     @abstractmethod
     async def page_surrogates(self, page_num: int = 1, page_size: int = 10,
-                              filters: Optional[dict] = None) -> tuple[list[ProcessSurrogate], int]: ...
+                              filters: Optional[dict] = None,
+                              conditions: Optional[list[QueryCondition]] = None) -> tuple[list[ProcessSurrogate], int]: ...
 
     # GetSurrogate 查询指定时间生效中的委托（enabled=1 + 时间窗内；processName 精确优先，空值全流程兜底）
     @abstractmethod

@@ -78,6 +78,35 @@ class MyUserProvider(UserProvider):
                         postId="P01", postName="工程师")
 ```
 
+## OrgUserProvider（可选，v1.6.0）
+
+组织维度取人——内置组织 handler（部门领导/分管领导/角色）的数据源。
+**业务方只实现数据接口，不写 handler**：
+
+```python
+from jeeflow.spi import OrgUserProvider
+
+class MyOrgUserProvider(OrgUserProvider):
+    async def find_dept_leaders(self, dept_id: str) -> list[str]:
+        return await self.org_svc.leader_ids(dept_id)
+    async def find_dept_main_leaders(self, dept_id: str) -> list[str]:
+        return await self.org_svc.main_leader_ids(dept_id)
+    async def find_by_role(self, role_code: str) -> list[str]:
+        return await self.org_svc.user_ids_by_role(role_code)
+```
+
+注册内置 handler（注册名与 Java 类全限定名一致，流程 JSON 四语言通用）：
+
+```python
+from jeeflow import HandlerRegistry, EngineExtensions, register_builtin_assignments
+
+registry = HandlerRegistry()
+register_builtin_assignments(registry, user_prov, org_prov)   # 组织维度依赖注入
+engine.set_extensions(EngineExtensions(registry=registry))
+```
+
+> 内置 handler 的**场景/配置/注意事项**见 [用户指南 07 · 参与者解析](../../guides/07-assignment-handlers.md)。
+
 ## IDGenerator（可选）
 
 ```python

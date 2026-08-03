@@ -59,19 +59,23 @@ user_prov = SimpleUserProvider()
 engine = EngineImpl(repo, user_prov, idgen, SimpleExprEvaluator())
 facade = JeeflowFacade(engine, repo, None)  # demo 未接入扩展仓储
 
-# 预加载流程定义
-for fname in sorted(os.listdir(FLOWS_DIR)):
-    if fname.endswith(".json"):
-        with open(os.path.join(FLOWS_DIR, fname), "r", encoding="utf-8") as f:
-            raw = json.loads(f.read())
-        d = ProcessDefine(
-            name=raw.get("name", fname),
-            displayName=raw.get("displayName", fname),
-            type=raw.get("type", ""),
-            state=1,
-            content=json.dumps(raw, ensure_ascii=False),
-        )
-        repo.add_define(d)
+def load_seed():
+    """预加载流程定义（种子）——/api/reset 重置后复用"""
+    for fname in sorted(os.listdir(FLOWS_DIR)):
+        if fname.endswith(".json"):
+            with open(os.path.join(FLOWS_DIR, fname), "r", encoding="utf-8") as f:
+                raw = json.loads(f.read())
+            d = ProcessDefine(
+                name=raw.get("name", fname),
+                displayName=raw.get("displayName", fname),
+                type=raw.get("type", ""),
+                state=1,
+                content=json.dumps(raw, ensure_ascii=False),
+            )
+            repo.add_define(d)
+
+
+load_seed()
 
 app = FastAPI(title="jeeflow demo", version="0.1.0")
 # CORS——允许 jeeflow-ui (localhost:5173) 跨域直连
@@ -145,6 +149,19 @@ async def wf_flow(action: str, request: Request):
     """单入口门面转发（v1.5.0）：/wf/{action}，action 多段（如 processDefine/page）"""
     body = await request.json() if await request.body() else {}
     return await facade.flow(action, body)
+
+@app.post("/api/reset")
+async def api_reset():
+    """一键重置演示数据（issues/11）：清空内存库（实例/任务/抄送/参与者）+ 重载种子流程定义"""
+    repo._defines.clear()
+    repo._instances.clear()
+    repo._tasks.clear()
+    repo._actors.clear()
+    repo._cc.clear()
+    repo._seq = 1
+    load_seed()
+    return _ok()
+
 
 @app.get("/api/stats")
 async def api_stats(userId: str = "user1"):

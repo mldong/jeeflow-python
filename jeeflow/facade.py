@@ -13,7 +13,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from .engine import Engine
+from .engine import Engine, KEY_NEXT_NODE_OPERATOR, KEY_PROCESS_START_NEXT_NODE_OPERATOR
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState
 from .spi import ProcessExtRepository, ProcessRepository, QueryCondition
 
@@ -146,6 +146,10 @@ class JeeflowFacade:
         for task in doing:
             await self._repo.add_task_actor(task.id, [operator])
             flow_args["submitType"] = SUBMIT_APPLY
+            # 对齐 boot3：f_nextNodeOperator（发起时预指派人）→ tf_nextNodeOperator（引擎执行参数）
+            start_next_op = flow_args.get(KEY_PROCESS_START_NEXT_NODE_OPERATOR)
+            if start_next_op:
+                flow_args[KEY_NEXT_NODE_OPERATOR] = start_next_op
             await self._engine.execute_process_task(task.id, operator, flow_args)
         return {"processInstanceId": inst.id}
 

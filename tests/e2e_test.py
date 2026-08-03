@@ -331,6 +331,37 @@ async def main():
               userIds13 == ["finA", "finB", "userA", "userB"], f"candidates={userIds13}")
     print()
 
+    # ═══ 14. startAndExecute 预指派人（f_nextNodeOperator，对齐 boot3）═══════════════
+    print("[14] startAndExecute 预指派人（f_nextNodeOperator）")
+
+    from jeeflow.engine import KEY_PROCESS_START_NEXT_NODE_OPERATOR
+
+    with open(os.path.join(FLOWS_DIR, "01-simple.json"), "r", encoding="utf-8") as f:
+        raw14 = json.loads(f.read())
+    d14 = ProcessDefine(name="simple", displayName=raw14.get("displayName", "simple"),
+                        type=raw14.get("type", ""), state=1, content=json.dumps(raw14, ensure_ascii=False))
+    repo.add_define(d14)
+
+    facade14 = JeeflowFacade(eng13, repo, None)
+    r14 = await facade14.flow("processInstance/startAndExecute",
+                              {"processDefineId": d14.id, "operator": "user1",
+                               KEY_PROCESS_START_NEXT_NODE_OPERATOR: "userA"})
+    check("预指派发起成功", r14["code"] == 0, f"r={r14}")
+    inst14 = r14["data"]["processInstanceId"]
+    doing14 = await repo.find_doing_tasks(inst14)
+    check("task1 参与者=userA（预指派人）",
+          len(doing14) == 1 and doing14[0].taskName == "task1" and doing14[0].actorIds == ["userA"],
+          f"tasks={[(t.taskName, t.actorIds) for t in doing14]}")
+
+    r14b = await facade14.flow("processInstance/startAndExecute",
+                               {"processDefineId": d14.id, "operator": "user1"})
+    inst14b = r14b["data"]["processInstanceId"]
+    doing14b = await repo.find_doing_tasks(inst14b)
+    check("未指定时 task1 参与者=leader",
+          len(doing14b) == 1 and doing14b[0].taskName == "task1" and doing14b[0].actorIds == ["leader"],
+          f"tasks={[(t.taskName, t.actorIds) for t in doing14b]}")
+    print()
+
     # ── Summary ──
     print("=" * 60)
     total = passed + failed

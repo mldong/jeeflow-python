@@ -22,6 +22,8 @@ KEY_POST_ID       = "u_postId"
 KEY_POST_NAME     = "u_postName"
 # v1.0.1：下一节点处理人（对齐 boot3 tf_nextNodeOperator）
 KEY_NEXT_NODE_OPERATOR = "tf_nextNodeOperator"
+# v1.6.0：流程启动时预指派人（对齐 boot3 f_nextNodeOperator）——startAndExecute 时转换为 tf_
+KEY_PROCESS_START_NEXT_NODE_OPERATOR = "f_nextNodeOperator"
 # v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
 KEY_AUTO_ID   = "flow.auto"
 KEY_ADMIN_ID  = "flow.admin"

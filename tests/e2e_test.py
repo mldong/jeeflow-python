@@ -2,7 +2,7 @@
 import os, sys, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from jeeflow import EngineImpl, MemoryRepository, EngineExtensions, FlowInterceptor
+from jeeflow import EngineImpl, MemoryRepository, EngineExtensions, FlowInterceptor, HandlerRegistry, register_builtin_assignments
 from jeeflow.model import ProcessDefine, TaskState, InstanceState, UserInfo
 from jeeflow.spi import IDGenerator, ExpressionEvaluator
 
@@ -238,6 +238,63 @@ async def main():
     inst = await repo.find_instance_by_id(1)
     check("实例详情可查", inst is not None and inst.state is not None,
           f"id=1 state={inst.state if inst else None}")
+    print()
+
+    # ═══ 12. 内置参与者 handler（issues/16）══════════════════════════════════════════
+    print("[12] 内置参与者 handler（issues/16）")
+
+    class TestOrgUserProv:
+        async def find_dept_leaders(self, dept_id):
+            return ["leader1", "leader2"] if dept_id == "D01" else []
+        async def find_dept_main_leaders(self, dept_id):
+            return ["boss1"] if dept_id == "D01" else []
+        async def find_by_role(self, role_code):
+            return ["roleA", "roleB"] if role_code == "task4" else []
+
+    reg16 = HandlerRegistry()
+    register_builtin_assignments(reg16, TestUserProv(), TestOrgUserProv())
+    eng16 = EngineImpl(repo, TestUserProv(), TestIDGen(), TestExpr())
+    eng16.set_extensions(EngineExtensions(registry=reg16))
+
+    # 注册 11-assignment-handler.json 流程定义
+    with open(os.path.join(FLOWS_DIR, "11-assignment-handler.json"), "r", encoding="utf-8") as f:
+        raw16 = json.loads(f.read())
+    d16 = ProcessDefine(name="assignment-handler", displayName=raw16.get("displayName", "assignment-handler"),
+                        type=raw16.get("type", ""), state=1, content=json.dumps(raw16, ensure_ascii=False))
+    repo.add_define(d16)
+
+    # ① FormFieldAssigneeHandler：节点 task1 → args.task1 = userA,userB
+    inst16 = await eng16.start_process_instance_by_id(d16.id, "user1", {"task1": "userA,userB"})
+    doing16 = await repo.find_doing_tasks(inst16.id)
+    check("① task1 参与者=字段值", len(doing16) == 1 and doing16[0].taskName == "task1"
+          and sorted(doing16[0].actorIds) == ["userA", "userB"],
+          f"actors={[t.actorIds for t in doing16]}")
+    await repo.add_task_actor(doing16[0].id, doing16[0].actorIds)
+    await eng16.execute_process_task(doing16[0].id, "userA")
+
+    # ② OperatorAssignmentHandler：task2 → 发起人 user1
+    doing16 = await repo.find_doing_tasks(inst16.id)
+    check("② task2 参与者=发起人", len(doing16) == 1 and doing16[0].taskName == "task2"
+          and doing16[0].actorIds == ["user1"], f"actors={[t.actorIds for t in doing16]}")
+    await repo.add_task_actor(doing16[0].id, doing16[0].actorIds)
+    await eng16.execute_process_task(doing16[0].id, "user1")
+
+    # ③ DeptLeaderAssignmentHandler：task3 → user1 部门 D01 领导
+    doing16 = await repo.find_doing_tasks(inst16.id)
+    check("③ task3 参与者=部门领导", len(doing16) == 1 and doing16[0].taskName == "task3"
+          and sorted(doing16[0].actorIds) == ["leader1", "leader2"],
+          f"actors={[t.actorIds for t in doing16]}")
+    await repo.add_task_actor(doing16[0].id, doing16[0].actorIds)
+    await eng16.execute_process_task(doing16[0].id, "leader1")
+
+    # ④ TaskRoleAssigneeHandler：task4 → roleCode=task4 → roleA,roleB
+    doing16 = await repo.find_doing_tasks(inst16.id)
+    check("④ task4 参与者=角色", len(doing16) == 1 and doing16[0].taskName == "task4"
+          and sorted(doing16[0].actorIds) == ["roleA", "roleB"],
+          f"actors={[t.actorIds for t in doing16]}")
+    await repo.add_task_actor(doing16[0].id, doing16[0].actorIds)
+    inst16 = await eng16.execute_process_task(doing16[0].id, "roleA")
+    check("⑤ 流程结束", inst16.state == InstanceState.DONE, f"state={inst16.state}")
     print()
 
     # ── Summary ──

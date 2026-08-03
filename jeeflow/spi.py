@@ -93,6 +93,27 @@ class UserProvider(ABC):
     @abstractmethod
     async def get_user(self, user_id: str) -> Optional[UserInfo]: ...
 
+class OrgUserProvider(ABC):
+    """组织维度用户提供者（issues/16）——部门领导 / 部门分管领导 / 角色成员。
+
+    通用业务语义，业务方只实现数据接口，不写 AssignmentHandler。
+    """
+
+    @abstractmethod
+    async def find_dept_leaders(self, dept_id: str) -> list[str]:
+        """部门领导（deptId → 领导 userId 列表）"""
+        ...
+
+    @abstractmethod
+    async def find_dept_main_leaders(self, dept_id: str) -> list[str]:
+        """部门分管领导（deptId → 分管领导 userId 列表）"""
+        ...
+
+    @abstractmethod
+    async def find_by_role(self, role_code: str) -> list[str]:
+        """按角色取人（roleCode → userId 列表）"""
+        ...
+
 class IDGenerator(ABC):
     @abstractmethod
     def next_id(self) -> int: ...

@@ -242,7 +242,7 @@ class EngineImpl(Engine):
             if target: return await self._execute_node(flow, inst, target, operator, vars_)
 
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict):
-        actors = await self._resolve_actors(node, inst, vars_)
+        actors = await self._resolve_actors(node, inst, operator, vars_)
         if not actors: return
         perform_type = int(node.properties.get("performType", 0))
         ct = node.properties.get("countersignType", "")
@@ -264,7 +264,7 @@ class EngineImpl(Engine):
                 nt.actorIds = actors
             await self.repo.save_task(nt)
 
-    async def _resolve_actors(self, node: FlowNode, inst: ProcessInstance, vars_: dict) -> list[str]:
+    async def _resolve_actors(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict) -> list[str]:
         # 1. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
         next_op = vars_.get(KEY_NEXT_NODE_OPERATOR)
         if next_op:
@@ -295,7 +295,7 @@ class EngineImpl(Engine):
         handler_name = node.properties.get("assignmentHandler", "")
         if handler_name and self.ext and self.ext.registry:
             h = self.ext.registry.resolve_assignment(handler_name)
-            if h: return await h.assign(node, inst)
+            if h: return await h.assign(node, inst, operator)
         if self.ext and self.ext.assignment_handler:
             result = self.ext.assignment_handler(handler_name, node, inst)
             if hasattr(result, '__await__'): return await result

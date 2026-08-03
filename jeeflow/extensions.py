@@ -46,7 +46,9 @@ DecisionHandler = Callable[[str, Any, Any, dict], Union[str, Awaitable[str]]]
 class IAssignmentHandler(ABC):
     """可注册的参与者处理器（Registry 用）"""
     @abstractmethod
-    async def assign(self, node, instance) -> list[str]: ...
+    async def assign(self, node, instance, operator: str) -> list[str]:
+        """返回参与者列表（operator: 当前任务操作人，issues/16 对齐 Java Execution.getOperator）"""
+        ...
 
 
 class IDecisionHandler(ABC):

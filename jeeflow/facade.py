@@ -106,15 +106,23 @@ class JeeflowFacade:
             tasks.append(vo)
             if doing:
                 active_task_list.append(vo)
-        return {
+        data = {
             "id": inst.id, "parentId": inst.parentId, "processDefineId": inst.defineId,
             "state": inst.state, "parentNodeName": inst.parentNodeName,
             "businessNo": inst.businessNo, "operator": inst.operator,
-            "variables": inst.variables, "createTime": inst.createTime, "createUser": inst.createUser,
+            "variables": inst.variables,
+            "formData": self._form_data_of(inst.variables, "f_"),  # issues/15
+            "createTime": inst.createTime, "createUser": inst.createUser,
             "jsonObject": graph,
             "tasks": tasks,
             "activeTaskList": active_task_list,
         }
+        defn = await self._repo.find_define_by_id(inst.defineId)
+        if defn:
+            data["displayName"] = defn.displayName  # issues/15
+            data["name"] = defn.name
+            data["version"] = defn.version
+        return data
 
     async def _processInstance_startAndExecute(self, args: dict) -> dict:
         return await self._startAndExecute(args)
@@ -591,8 +599,9 @@ class JeeflowFacade:
             "taskType": int(t.taskType) if t.taskType is not None else None,
             "performType": int(t.performType) if t.performType is not None else None,
             "taskState": int(t.taskState) if t.taskState is not None else None,
-            "operator": t.actorId, "finishTime": str(t.finishTime),
+            "operator": t.actorId, "finishTime": self._fmt_time(t.finishTime),
             "variable": t.variables,
+            "ext": t.variables,  # issues/15：前端读 ext.tf_approvalComment
         } for t in his]
 
     async def _processInstance_getAssigneeTextData(self, args: dict) -> dict:
@@ -864,6 +873,7 @@ class JeeflowFacade:
             "expireTime": t.expireTime, "formKey": t.formKey, "taskParentId": t.parentTaskId,
             "variable": variable, "createTime": t.createTime, "createUser": t.createUser,
             "updateTime": t.updateTime, "updateUser": t.updateUser, "taskActorIdList": t.actorIds,
+            "taskFormData": JeeflowFacade._form_data_of(t.variables, "tf_"),  # issues/15（_task_vo 无 self，走类名调用）
         }
 
     @staticmethod
@@ -892,6 +902,16 @@ class JeeflowFacade:
         return None
 
     # ═══ 行输出转换（issues/05-2 字段契约 + 05-3 时间格式）═══
+
+    @staticmethod
+    def _form_data_of(vars_: dict, prefix: str) -> dict:
+        """issues/15：取 vars 中 prefix 前缀字段，输出「带前缀 + 去前缀副本」（对齐 boot3 getFormData）"""
+        out = {}
+        for k, v in (vars_ or {}).items():
+            if k and k.startswith(prefix):
+                out[k] = v
+                out[k[len(prefix):]] = v
+        return out
 
     @staticmethod
     def _fmt_time(t) -> Optional[str]:
@@ -953,4 +973,5 @@ class JeeflowFacade:
                 "processDefineDisplayName": r.processDefineDisplayName,
                 "instanceVariable": r.instanceVariable,
                 "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
-                "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion}
+                "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion,
+                "taskFormData": self._form_data_of(ext, "tf_")}  # issues/15

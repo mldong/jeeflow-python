@@ -680,3 +680,43 @@ async def test_design_deploy_redeploy_is_deployed():
     r = await facade.flow("processDesign/deploy", {"id": design_id, "operator": "zhangsan"})
     assert r["code"] == 0, r
     assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1
+
+
+@pytest.mark.asyncio
+async def test_form_data_contract():
+    """issues/15：formData / taskFormData / 审批记录 ext 契约"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, None)
+    df = load_flow(repo, "01-simple.json")
+
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": df.id, "operator": "zhangsan",
+                           "f_reasonType": "休假", "f_amount": 500})
+    assert r["code"] == 0, r
+    inst_id = r["data"]["processInstanceId"]
+
+    r = await facade.flow("processInstance/detail", {"id": inst_id})
+    assert r["code"] == 0, r
+    data = r["data"]
+    form_data = data.get("formData") or {}
+    assert form_data.get("f_reasonType") == "休假", r
+    assert form_data.get("reasonType") == "休假", r
+    assert data.get("name") == "01-simple.json", r
+    assert data.get("displayName"), r
+    assert "version" in data, r
+
+    # 执行任务（tf_ 前缀变量）→ doneList 行 taskFormData + approvalRecord ext
+    r = await facade.flow("processTask/todoList", {"operator": "leader"})
+    task_id = r["data"]["rows"][0]["id"]
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": task_id, "operator": "leader", "tf_approvalComment": "同意"})
+    assert r["code"] == 0, r
+
+    r = await facade.flow("processTask/doneList", {"operator": "leader"})
+    tfd = r["data"]["rows"][0].get("taskFormData") or {}
+    assert tfd.get("tf_approvalComment") == "同意", r
+    assert tfd.get("approvalComment") == "同意", r
+
+    r = await facade.flow("processInstance/approvalRecord", {"id": inst_id})
+    assert r["code"] == 0, r
+    assert any(row.get("ext") is not None for row in r["data"]), r

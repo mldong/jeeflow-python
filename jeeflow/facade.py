@@ -32,15 +32,22 @@ class JeeflowFacade:
 
     def __init__(self, engine: Engine, repo: ProcessRepository,
                  ext_repo: Optional[ProcessExtRepository] = None,
-                 user_search: Optional[callable] = None):
+                 user_search: Optional[callable] = None,
+                 org_prov: Optional["OrgUserProvider"] = None):
         self._engine = engine
         self._repo = repo
         self._ext = ext_repo
         self._user_search = user_search  # 可空：candidatePage 用户分页搜索依赖
+        self._org_prov = org_prov  # 可空：candidatePage candidateGroups 角色取人（v1.6.0）
 
     def set_user_search(self, fn: callable) -> "JeeflowFacade":
         """注入用户搜索钩子：fn(query: dict) -> (rows: list[dict], total: int)"""
         self._user_search = fn
+        return self
+
+    def set_org_provider(self, org_prov: "OrgUserProvider") -> "JeeflowFacade":
+        """注入组织用户提供者（candidatePage candidateGroups 角色取人）"""
+        self._org_prov = org_prov
         return self
 
     async def flow(self, action: str, args: Optional[dict] = None) -> dict:
@@ -711,7 +718,7 @@ class JeeflowFacade:
         if def_:
             try:
                 flow = json.loads(def_.content)
-                candidates = self._next_task_candidates(flow, task.taskName)
+                candidates = await self._next_task_candidates(flow, task.taskName)
             except Exception:
                 pass
         if candidates:
@@ -726,19 +733,30 @@ class JeeflowFacade:
         rows, total = result
         return self._page_data(rows, total)
 
-    def _next_task_candidates(self, flow: dict, task_name: str) -> list:
+    async def _next_task_candidates(self, flow: dict, task_name: str) -> list:
         result = []
         visited = set()
 
-        def collect(node: dict):
+        async def collect(node: dict):
             v = (node.get("properties") or {}).get("candidateUsers", "")
             if v:
                 for s in str(v).split(","):
                     s = s.strip()
                     if s and s not in result:
                         result.append(s)
+            # candidateGroups：按角色取人（v1.6.0，对齐 boot4 GlobalCandidateHandler）
+            g = (node.get("properties") or {}).get("candidateGroups", "")
+            if g and self._org_prov is not None:
+                for rc in str(g).split(","):
+                    rc = rc.strip()
+                    if not rc:
+                        continue
+                    ids = await self._org_prov.find_by_role(rc) or []
+                    for uid in ids:
+                        if uid and uid not in result:
+                            result.append(uid)
 
-        def walk(node_id: str):
+        async def walk(node_id: str):
             if node_id in visited:
                 return
             visited.add(node_id)
@@ -749,12 +767,12 @@ class JeeflowFacade:
                 if not target:
                     continue
                 if target.get("type") in ("snaker:task", "snaker:custom"):
-                    collect(target)
+                    await collect(target)
                     continue
                 if target.get("type") in ("snaker:fork", "snaker:join", "snaker:decision"):
-                    walk(target.get("id"))
+                    await walk(target.get("id"))
 
-        walk(task_name)
+        await walk(task_name)
         return result
 
     async def _processTask_surrogate(self, args: dict) -> dict:

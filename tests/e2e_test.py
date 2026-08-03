@@ -297,6 +297,40 @@ async def main():
     check("⑤ 流程结束", inst16.state == InstanceState.DONE, f"state={inst16.state}")
     print()
 
+    # ═══ 13. candidatePage 双源候选（issues/16 GlobalCandidateHandler 语义）═════════
+    print("[13] candidatePage 双源候选（issues/16）")
+
+    from jeeflow import JeeflowFacade
+
+    class TestOrgUserProv13:
+        async def find_dept_leaders(self, dept_id): return []
+        async def find_dept_main_leaders(self, dept_id): return []
+        async def find_by_role(self, role_code):
+            return ["finA", "finB"] if role_code == "finance" else []
+
+    eng13 = EngineImpl(repo, TestUserProv(), TestIDGen(), TestExpr())
+    facade13 = JeeflowFacade(eng13, repo, None, org_prov=TestOrgUserProv13())
+
+    with open(os.path.join(FLOWS_DIR, "12-candidate-page.json"), "r", encoding="utf-8") as f:
+        raw13 = json.loads(f.read())
+    d13 = ProcessDefine(name="candidate-flow", displayName=raw13.get("displayName", "candidate-flow"),
+                        type=raw13.get("type", ""), state=1, content=json.dumps(raw13, ensure_ascii=False))
+    repo.add_define(d13)
+
+    # 直接启动（不自动完成 apply）→ apply 任务 → candidatePage 查 review 候选
+    inst13 = await eng13.start_process_instance_by_id(d13.id, "user1")
+    doing13 = await repo.find_doing_tasks(inst13.id)
+    check("apply 任务就绪", len(doing13) == 1 and doing13[0].taskName == "apply",
+          f"task={doing13[0].taskName if doing13 else None}")
+    r13 = await facade13.flow("processTask/candidatePage", {"processTaskId": doing13[0].id})
+    check("candidatePage 命中双源候选", r13["code"] == 0 and r13["data"]["recordCount"] == 4,
+          f"r={r13}")
+    if r13["code"] == 0:
+        userIds13 = sorted(x["userId"] for x in r13["data"]["rows"])
+        check("候选 = candidateUsers(userA/userB) + candidateGroups(finA/finB)",
+              userIds13 == ["finA", "finB", "userA", "userB"], f"candidates={userIds13}")
+    print()
+
     # ── Summary ──
     print("=" * 60)
     total = passed + failed

@@ -292,3 +292,31 @@ def test_strict_column_match():
     row = conn.execute("SELECT title, start_time FROM biz_leave").fetchone()
     assert row == ("strict", None), f"严格模式应过滤驼峰 key: {row}"
     conn.close()
+
+
+# ─── ⑭ 非自增主键生成（issues/21）：TEXT 主键（雪花/应用生成）配生成器后插入成功 ──
+
+def test_primary_key_generator():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE biz_snow (id TEXT PRIMARY KEY, title TEXT)")
+    writer = JdbcDynamicTableWriter(conn)
+    writer.primary_key_generator = lambda t: "snow-888"
+    writer.insert("biz_snow", {"title": "snow"})
+    row = conn.execute("SELECT id, title FROM biz_snow").fetchone()
+    assert row == ("snow-888", "snow"), f"主键应由生成器生成: {row}"
+    # data 已含主键值 → 用之，不调生成器
+    writer.insert("biz_snow", {"id": "manual-1", "title": "m"})
+    n = conn.execute("SELECT COUNT(1) FROM biz_snow WHERE id='manual-1'").fetchone()[0]
+    assert n == 1
+    conn.close()
+
+
+# ─── ⑮ 非自增主键未配生成器（issues/21）：清晰报错 ─────────────────────────────
+
+def test_missing_primary_key_generator():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE biz_snow (id TEXT PRIMARY KEY, title TEXT)")
+    writer = JdbcDynamicTableWriter(conn)  # 未配置生成器
+    with pytest.raises(ValueError, match="primary key generator"):
+        writer.insert("biz_snow", {"title": "x"})
+    conn.close()

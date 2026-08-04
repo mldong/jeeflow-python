@@ -15,7 +15,7 @@ import re
 import sqlite3
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, NamedTuple, Optional, Sequence
 
 from .extensions import FlowInterceptor
 from .model import ProcessDefine, ProcessInstance, TYPE_END, InstanceState
@@ -48,6 +48,13 @@ class DynamicTableWriter(ABC):
 
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _TIME_LAYOUT = "%Y-%m-%d %H:%M:%S"
+
+
+class _Column(NamedTuple):
+    """表列元数据（issues/21：主键/自增用于主键生成决策）"""
+    name: str          # 表列原名（UPPER）
+    primary_key: bool
+    auto_increment: bool
 
 
 class JdbcDynamicTableWriter(DynamicTableWriter):
@@ -85,28 +92,46 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         # 列匹配（issues/20）：默认宽松——驼峰↔下划线归一匹配（表单字段 companyName ↔ 表列 company_name）；
         # 需要精确控制列名的集成方显式开启严格模式（忽略大小写精确匹配）
         self.strict_column_match: bool = False
-        self._cache: dict[str, list[str]] = {}
+        # 主键生成器（issues/21）：非自增主键表（雪花/应用生成）插入时生成主键值，入参表名
+        self.primary_key_generator: Optional[Callable[[str], Any]] = None
+        self._cache: dict[str, list[_Column]] = {}
 
     # ── 表结构探测 ──
 
-    def _table_columns(self, table_name: str) -> list[str]:
+    def _table_columns(self, table_name: str) -> list[_Column]:
         cached = self._cache.get(table_name)
         if cached is not None:
             return cached
         if self._dialect == "sqlite":
-            # PRAGMA 不支持占位符——表名已过安全校验
-            cols = [row[1] for row in self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
-        else:
+            # PRAGMA table_info：cid,name,type,notnull,dflt_value,pk——INTEGER PRIMARY KEY 为 rowid 别名（自增）
+            rows = self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            cols = [_Column(r[1].upper(), r[5] == 1,
+                            r[5] == 1 and r[2].strip().upper() == "INTEGER") for r in rows]
+        elif self._dialect == "mysql":
             rows = self._conn.execute(
-                "SELECT column_name FROM information_schema.columns "
+                "SELECT column_name, extra, column_key FROM information_schema.columns "
                 "WHERE UPPER(table_name) = UPPER(?) ORDER BY ordinal_position",
                 (table_name,)).fetchall()
-            cols = [r[0] for r in rows]
+            cols = [_Column(r[0].upper(), r[2].upper() == "PRI",
+                            "auto_increment" in (r[1] or "").lower()) for r in rows]
+        else:
+            # PG/H2 标准 SQL：IS_IDENTITY（identity）+ column_default nextval（PG serial）+ 主键约束 JOIN
+            rows = self._conn.execute(
+                "SELECT c.column_name, c.is_identity, c.column_default, "
+                "CASE WHEN kcu.column_name IS NOT NULL THEN 'PRI' ELSE '' END AS column_key "
+                "FROM information_schema.columns c "
+                "LEFT JOIN information_schema.table_constraints tc "
+                "  ON tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY' "
+                "LEFT JOIN information_schema.key_column_usage kcu "
+                "  ON kcu.constraint_name = tc.constraint_name AND kcu.column_name = c.column_name "
+                "WHERE UPPER(c.table_name) = UPPER(?) ORDER BY c.ordinal_position",
+                (table_name,)).fetchall()
+            cols = [_Column(r[0].upper(), r[3].upper() == "PRI",
+                            (r[1] or "").upper() == "YES" or "nextval" in (r[2] or "")) for r in rows]
         if not cols:
             raise ValueError(f"persist: table {table_name!r} not found")
-        upper = [c.upper() for c in cols]
-        self._cache[table_name] = upper
-        return upper
+        self._cache[table_name] = cols
+        return cols
 
     # ── 公共接口 ──
 
@@ -122,11 +147,19 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         values: list[Any] = []
         # 保持插入顺序稳定（data 无序，按表列顺序取）；写入用表列原名（issues/20）
         for col in cols:
-            key = self._find_data_key(data, col)
-            if key is None:
+            key = self._find_data_key(data, col.name)
+            if key is not None:
+                names.append(col.name)
+                values.append(data[key])
                 continue
-            names.append(col)
-            values.append(data[key])
+            # 主键生成（issues/21）：非自增主键表且 data 无主键值 → 调生成器；未配置 → 清晰报错
+            if col.primary_key and not col.auto_increment:
+                if self.primary_key_generator is None:
+                    raise ValueError(
+                        f"persist: table {table_name!r} primary key {col.name!r} is not auto-increment "
+                        "and no primary key generator configured (set primary_key_generator, e.g. snowflake)")
+                names.append(col.name)
+                values.append(self.primary_key_generator(table_name))
         if not names:
             raise ValueError(f"persist: no matching columns for {table_name}")
         placeholder = "?" if self._dialect in ("sqlite", "h2") else "%s"
@@ -170,19 +203,22 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
 
     # ── 列匹配（issues/20）──
 
-    def _find_table_column(self, cols: Sequence[str], key: str) -> Optional[str]:
+    def _find_table_column(self, cols: Sequence[_Column], key: str) -> Optional[str]:
         """在表列中匹配输入 key：宽松（默认）驼峰↔下划线归一；严格忽略大小写精确。"""
-        for col in cols:
+        for m in cols:
             if self.strict_column_match:
-                if col.upper() == key.upper():
-                    return col
-            elif self._normalize(col) == self._normalize(key):
-                return col
+                if m.name.upper() == key.upper():
+                    return m.name
+            elif self._normalize(m.name) == self._normalize(key):
+                return m.name
         return None
 
     def _find_data_key(self, data: dict[str, Any], col: str) -> Optional[str]:
         for k in data:
-            if self._find_table_column([col], k) is not None:
+            if self.strict_column_match:
+                if col.upper() == k.upper():
+                    return k
+            elif self._normalize(col) == self._normalize(k):
                 return k
         return None
 

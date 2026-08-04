@@ -418,3 +418,68 @@ async def test_sync_mode_reject():
     assert finish == 45, f"驳回最终状态应为 REJECT: {finish}"
     assert create_user == "user1"
     conn.close()
+
+
+# ─── ⑰ issues/26：办理提交被拒字段（只读/隐藏）不入变量——下游无权限节点无法绕过 ──
+
+PERM3_FLOW = """{
+  "name": "perm3", "displayName": "权限绕过验证", "type": "approval",
+  "relTableName": "biz_perm3", "persistMode": "SYNC",
+  "nodes": [
+    {"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+    {"id": "apply", "type": "snaker:task", "properties": {"assignee": "applicant", "taskType": 0, "performType": 0}, "text": {"value": "发起申请"}},
+    {"id": "approve1", "type": "snaker:task", "properties": {"assignee": "leader1", "taskType": 0, "performType": 0, "field": {"PERMISSION_f_title": 1, "PERMISSION_amount": 2}}, "text": {"value": "审批一"}},
+    {"id": "approve2", "type": "snaker:task", "properties": {"assignee": "leader2", "taskType": 0, "performType": 0}, "text": {"value": "审批二"}},
+    {"id": "finish", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}
+  ],
+  "edges": [
+    {"id": "e0", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {}},
+    {"id": "e1", "sourceNodeId": "apply", "targetNodeId": "approve1", "properties": {}},
+    {"id": "e2", "sourceNodeId": "approve1", "targetNodeId": "approve2", "properties": {}},
+    {"id": "e3", "sourceNodeId": "approve2", "targetNodeId": "finish", "properties": {}}
+  ]
+}"""
+
+
+@pytest.mark.asyncio
+async def test_sync_perm_bypass():
+    repo = MemoryRepository()
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE biz_perm3 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT, amount REAL,
+        apply INTEGER, approve1 INTEGER, approve2 INTEGER, finish INTEGER,
+        process_instance_id INTEGER,
+        create_user TEXT, is_deleted INTEGER
+    )""")
+    writer = JdbcDynamicTableWriter(conn)
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    eng.set_extensions(EngineExtensions(interceptors=[
+        PersistPostInterceptor(writer=writer, loader=repo.find_define_by_id)]))
+    repo.add_define(ProcessDefine(name="perm3", displayName="perm3", type="approval",
+                                  state=1, version=1, content=PERM3_FLOW))
+
+    inst = await eng.start_process_instance_by_id(1, "user1",
+        {"f_title": "原始标题", "f_amount": 800.0, "u_deptId": "D01"})
+
+    async def complete_named(name, actor, args):
+        doing = await repo.find_doing_tasks(inst.id)
+        for d in doing:
+            if d.taskName == name:
+                await repo.add_task_actor(d.id, [actor])
+                await eng.execute_process_task(d.id, actor, args)
+                return
+        raise AssertionError(f"task {name} not found")
+
+    await complete_named("apply", "user1", {KEY_SUBMIT_TYPE: 0})
+    # approve1 只读 title，提交 TRY_HACK → 引擎入口过滤 → 不入变量 → 不落库
+    await complete_named("approve1", "leader1", {KEY_SUBMIT_TYPE: 1, "f_title": "TRY_HACK"})
+    # approve2 无权限声明——变量无 TRY_HACK，title 保持原值
+    await complete_named("approve2", "leader2", {KEY_SUBMIT_TYPE: 1, "f_amount": 999.0})
+
+    title, amount, approve1, approve2, finish = conn.execute(
+        "SELECT title, amount, approve1, approve2, finish FROM biz_perm3").fetchone()
+    assert title == "原始标题", f"只读字段被拒值不应落库（下游不可绕过）: {title}"
+    assert amount == 999.0
+    assert (approve1, approve2, finish) == (10, 10, 20)
+    conn.close()

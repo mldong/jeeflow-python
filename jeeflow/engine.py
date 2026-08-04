@@ -78,7 +78,12 @@ class EngineImpl(Engine):
 
     async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         task, inst = await self._load_and_check(task_id, operator)
-        vars_ = {**inst.variables, **task.variables, **(args or {})}
+        # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）——
+        # 被拒值无法经流程变量落到下游节点写入，上游只读声明不可被绕过
+        def_ = await self.repo.find_define_by_id(inst.defineId)
+        flow = parse_flow_model(json.loads(def_.content))
+        args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
+        vars_ = {**inst.variables, **task.variables, **args}
         await self._add_user_info(operator, vars_)
         now = datetime.now()
         # 聚合根：完成任务（子实体状态转换 + 实例变量合并）
@@ -90,7 +95,6 @@ class EngineImpl(Engine):
         await self._fire_event(ProcessEvent(EventType.TASK_COMPLETE, inst.id, task.id, task.taskName, operator))
 
         def_ = await self.repo.find_define_by_id(inst.defineId)
-        flow = parse_flow_model(json.loads(def_.content))
         inst.variables = vars_
         await self.repo.update_instance(inst)
 
@@ -384,3 +388,26 @@ def _is_truthy(v) -> bool:
     if v is None: return False
     if isinstance(v, (int, float)): return v != 0
     return True
+
+
+def _filter_field_by_perm(args: dict, node: Optional[FlowNode]) -> dict:
+    """办理提交的 f_ 字段按任务节点 field 权限过滤（issues/26）——
+    任务节点 properties.field 声明 PERMISSION_f_{全名}（前端约定，优先）或
+    PERMISSION_{去前缀名}（兼容）的字段，值非 EDIT(2)（只读 1/隐藏 3 等）→ 剔除不入变量。
+    键格式双兼容（issues/25），与 persist 拦截器 _is_editable 同契约。"""
+    if not args or node is None or node.type not in (TYPE_TASK, TYPE_CUSTOM):
+        return args
+    field_perm = node.properties.get("field") if node.properties else None
+    if not isinstance(field_perm, dict) or not field_perm:
+        return args
+    out = {}
+    for k, v in args.items():
+        if k.startswith("f_") and len(k) > 2:
+            name = k[2:]
+            perm = field_perm.get(f"PERMISSION_f_{name}")
+            if perm is None:
+                perm = field_perm.get(f"PERMISSION_{name}")
+            if perm is not None and int(perm) != 2:
+                continue  # 只读/隐藏：剔除（不入变量）
+        out[k] = v
+    return out

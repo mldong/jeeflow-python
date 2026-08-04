@@ -1,6 +1,6 @@
 [project]
 name = "jeeflow"
-version = "1.6.2"
+version = "1.6.3"
 description = "Lightweight async workflow engine - Python implementation"
 requires-python = ">=3.10"
 

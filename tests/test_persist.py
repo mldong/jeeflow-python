@@ -330,7 +330,7 @@ def _sync_define(repo: MemoryRepository, table: str) -> ProcessDefine:
     content = content.replace('"type": "approval"',
                               f'"type": "approval", "relTableName": "{table}", "persistMode": "SYNC"', 1)
     content = content.replace('"assignee": "leader"',
-                              '"assignee": "leader", "field": {"PERMISSION_title": 1, "PERMISSION_amount": 2}', 1)
+                              '"assignee": "leader", "field": {"PERMISSION_f_title": 1, "PERMISSION_amount": 2}', 1)
     content = content.replace('"id": "end"', '"id": "finish"')
     content = content.replace('"targetNodeId": "end"', '"targetNodeId": "finish"')
     d = ProcessDefine(name="simple", displayName="01-simple.json", type="approval",

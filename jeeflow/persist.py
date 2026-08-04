@@ -435,10 +435,16 @@ class PersistPostInterceptor(FlowInterceptor):
         return None
 
     def _is_editable(self, field_perm: Optional[dict], field_name: str) -> bool:
-        """字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新"""
+        """字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新。
+        键格式兼容两种（issues/25）：
+        - ``PERMISSION_f_{表单字段全名}``——前端 vben5-wf 设计器约定（优先）
+        - ``PERMISSION_{去前缀名}``——后端 1.8.0 首版格式（兼容）"""
         if not field_perm:
             return True
-        perm = field_perm.get(f"PERMISSION_{field_name}")
+        prefix = self.field_prefix or "f_"
+        perm = field_perm.get(f"PERMISSION_{prefix}{field_name}")
+        if perm is None:
+            perm = field_perm.get(f"PERMISSION_{field_name}")
         if perm is None:
             return True
         return int(perm) == PERM_EDIT

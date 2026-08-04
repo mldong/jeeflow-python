@@ -79,6 +79,9 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         self.update_time_column = update_time_column
         self.update_user_column = update_user_column
         self.is_deleted_column = is_deleted_column
+        # 用户列默认值（issues/19）：优先取 data 中已注入的 apply_user_id=流程 operator，
+        # 否则用此配置值，缺省 "system"——多数框架业务表 create_user/update_user 为 BIGINT 存 userId
+        self.default_user_value: Any = "system"
         self._cache: dict[str, list[str]] = {}
 
     # ── 表结构探测 ──
@@ -148,18 +151,24 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
             if self.create_time_column:
                 data.setdefault(self.create_time_column, now)
             if self.create_user_column:
-                data.setdefault(self.create_user_column, "system")
+                data.setdefault(self.create_user_column, self._resolve_default_user(data))
             if self.update_time_column:
                 data.setdefault(self.update_time_column, now)
             if self.update_user_column:
-                data.setdefault(self.update_user_column, "system")
+                data.setdefault(self.update_user_column, self._resolve_default_user(data))
             if self.is_deleted_column:
                 data.setdefault(self.is_deleted_column, 0)
         else:
             if self.update_time_column:
                 data[self.update_time_column] = now
             if self.update_user_column:
-                data.setdefault(self.update_user_column, "system")
+                data.setdefault(self.update_user_column, self._resolve_default_user(data))
+
+    def _resolve_default_user(self, data: dict[str, Any]) -> Any:
+        """默认用户值（issues/19）：优先取 data 中已注入的 apply_user_id
+        （拦截器场景 = 流程 operator，BIGINT 用户列表开箱即用），否则回落配置默认值。"""
+        operator = data.get("apply_user_id")
+        return operator if operator is not None else self.default_user_value
 
 
 def _check_table_name(table_name: str) -> None:
@@ -222,6 +231,15 @@ class PersistPostInterceptor(FlowInterceptor):
         submit_type = instance.variables.get(KEY_SUBMIT_TYPE)
         if submit_type is None or int(submit_type) != int(SubmitType.AGREE):
             return
+
+        # 同链重复触发防护（issues/19）：最后任务节点与结束节点都会触发后置拦截器，
+        # 同一执行链（共享 instance.variables）只插一次。标记写入时实例已完成持久化
+        # （引擎 _execute_node 先 update_instance 后触发拦截器，repo 存副本）不会落库；
+        # exists 保留作为跨请求/重启的幂等兜底（先查后插语义不变）。
+        chain_key = f"__persist_executed_{instance.id}"
+        if instance.variables.get(chain_key) is True:
+            return
+        instance.variables[chain_key] = True
 
         # 表名：流程定义顶层 relTableName，缺省回落流程 name
         table_name = await self._resolve_table_name(instance)

@@ -104,7 +104,7 @@ async def test_flow_finish_persist():
 
     row = conn.execute("SELECT title, amount, process_instance_id, apply_user_id, "
                        "apply_dept_id, create_user, is_deleted FROM biz_leave").fetchone()
-    assert row == ("年假申请", 800.0, inst.id, "user1", "D01", "system", 0)
+    assert row == ("年假申请", 800.0, inst.id, "user1", "D01", "user1", 0)  # issues/19: 用户列默认值优先 operator
     assert _count(conn) == 1
     conn.close()
 
@@ -177,7 +177,7 @@ def test_writer_insert_full():
     writer.insert("biz_leave", data)
     row = conn.execute("SELECT title, process_instance_id, create_user, is_deleted "
                        "FROM biz_leave").fetchone()
-    assert row == ("年假申请", 1, "system", 0)
+    assert row == ("年假申请", 1, "user1", 0)  # issues/19: 用户列默认值优先 operator
     conn.close()
 
 
@@ -213,4 +213,56 @@ def test_writer_exists_idempotent():
     writer.insert("biz_leave", {"title": "t", "process_instance_id": 99})
     assert writer.exists("biz_leave", "process_instance_id", 99) is True
     assert writer.exists("biz_leave", "process_instance_id", 100) is False
+    conn.close()
+
+
+# ─── ⑩ BIGINT 用户列（issues/19）：create_user 为 BIGINT 存 userId ────────────
+
+@pytest.mark.asyncio
+async def test_bigint_user_column():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE biz_settle (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        process_instance_id INTEGER,
+        apply_user_id INTEGER,
+        create_user INTEGER,
+        update_user INTEGER,
+        is_deleted INTEGER
+    )""")
+    writer = JdbcDynamicTableWriter(conn)
+    repo = MemoryRepository()
+    eng = setup_engine(repo, writer)
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), "r", encoding="utf-8") as f:
+        content = f.read().replace('"type": "approval"',
+                                   '"type": "approval", "relTableName": "biz_settle"', 1)
+    df = ProcessDefine(name="simple", type="approval", state=1, version=1, content=content)
+    repo.add_define(df)
+
+    inst = await eng.start_process_instance_by_id(df.id, "123",
+        {"f_title": "结算单", "u_deptId": "D01"})
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["123"])
+    await eng.execute_process_task(doing[0].id, "123", {KEY_SUBMIT_TYPE: 0})
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["leader"])
+    await eng.execute_process_task(doing[0].id, "leader", {KEY_SUBMIT_TYPE: 1})
+
+    row = conn.execute("SELECT create_user, apply_user_id FROM biz_settle").fetchone()
+    assert row == (123, 123), f"BIGINT 用户列应为 operator: {row}"
+    conn.close()
+
+
+# ─── ⑪ writer 用户列默认值：优先 apply_user_id，否则配置值回落 ────────────────
+
+def test_writer_default_user_value():
+    conn, writer = setup_db()
+    data = {"title": "t", "apply_user_id": "abc"}
+    writer.fill_system_fields(data, True)
+    assert data["create_user"] == "abc"
+    # 无 apply_user_id → 回落配置默认值
+    writer.default_user_value = 0
+    data2 = {"title": "t"}
+    writer.fill_system_fields(data2, True)
+    assert data2["create_user"] == 0
     conn.close()

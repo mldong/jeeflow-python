@@ -6,7 +6,7 @@ from .model import (
     FlowModel, FlowNode, FlowEdge,
     TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK, TYPE_JOIN, TYPE_CUSTOM,
     ProcessInstance, ProcessTask, ProcessDefine,
-    InstanceState, TaskState, SubmitType,
+    InstanceState, TaskState, SubmitType, PerformType,
     parse_flow_model,
 )
 from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
@@ -45,8 +45,11 @@ class EngineImpl(Engine):
         self.id_gen = id_gen
         self.expr_eval = expr_eval
         self.ext: Optional[EngineExtensions] = None
+        self._ic_cache: dict = {}   # 定义级拦截器解析缓存（issue 34，按 defineId）
 
-    def set_extensions(self, ext: EngineExtensions): self.ext = ext
+    def set_extensions(self, ext: EngineExtensions):
+        self.ext = ext
+        self._ic_cache.clear()
 
     async def eval_expr(self, expr: str, vars_: dict) -> Any:
         """表达式求值（v1.5.0，门面 highLight 决策分支过滤用）"""
@@ -256,7 +259,16 @@ class EngineImpl(Engine):
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict):
         actors = await self._resolve_actors(node, inst, operator, vars_)
         if not actors: return
-        perform_type = int(node.properties.get("performType", 0))
+        # performType 容错解析（对齐 Java codeOf）：int 优先；字符串枚举名（如旧版 "ANY"）映射；
+        # 未知回落 0（普通参与）——issues 待反馈：python 引擎解析兼容 Java 流程格式
+        _pt = node.properties.get("performType", 0)
+        try:
+            perform_type = int(_pt)
+        except (ValueError, TypeError):
+            try:
+                perform_type = PerformType[str(_pt).upper()].value
+            except (KeyError, AttributeError):
+                perform_type = 0
         ct = node.properties.get("countersignType", "")
         now = datetime.now()
         form = node.properties.get("form", "")
@@ -343,14 +355,44 @@ class EngineImpl(Engine):
 
     async def _fire_pre(self, node, inst) -> bool:
         if not self.ext: return True
-        for ic in sorted(self.ext.interceptors, key=lambda x: x.order):
+        for ic in sorted(await self._resolve_interceptors(inst), key=lambda x: x.order):
             if not await ic.pre_handle(node, inst): return False
         return True
 
     async def _fire_post(self, node, inst):
         if not self.ext: return
-        for ic in sorted(self.ext.interceptors, key=lambda x: x.order, reverse=True):
+        for ic in sorted(await self._resolve_interceptors(inst), key=lambda x: x.order, reverse=True):
             await ic.post_handle(node, inst)
+
+    async def _resolve_interceptors(self, inst) -> list:
+        """定义级拦截器解析（issue 34，对齐 Java 模型级 postInterceptors）：
+        流程定义顶层 postInterceptors 声明 → 按名从 interceptor_registry 取（未声明该流程不触发）；
+        未声明 → 回落引擎级列表（向后兼容现状）。结果按 defineId 缓存。"""
+        if not self.ext:
+            return []
+        define_id = getattr(inst, "defineId", None)
+        if define_id is None:
+            return list(self.ext.interceptors)
+        cached = self._ic_cache.get(define_id)
+        if cached is not None:
+            return cached
+        ic_list = list(self.ext.interceptors)
+        try:
+            def_ = await self.repo.find_define_by_id(define_id)
+            if def_ is not None:
+                content = def_.content
+                meta = json.loads(content) if isinstance(content, str) else json.loads(content.decode("utf-8"))
+                declared = str(meta.get("postInterceptors") or "").strip()
+                if declared:
+                    ic_list = []
+                    for name in declared.split(","):
+                        name = name.strip()
+                        if name and name in (self.ext.interceptor_registry or {}):
+                            ic_list.append(self.ext.interceptor_registry[name])
+        except Exception:
+            pass
+        self._ic_cache[define_id] = ic_list
+        return ic_list
 
     async def _fire_event(self, evt: ProcessEvent):
         if self.ext and self.ext.event_listener:

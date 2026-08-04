@@ -483,3 +483,132 @@ async def test_sync_perm_bypass():
     assert amount == 999.0
     assert (approve1, approve2, finish) == (10, 10, 20)
     conn.close()
+
+
+# ─── ⑱ issues/34：定义级拦截器（postInterceptors 声明 + 注册表按名解析） ─────────
+
+@pytest.mark.asyncio
+async def test_define_level_interceptor():
+    repo = MemoryRepository()
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE biz_decl (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
+        process_instance_id INTEGER, is_deleted INTEGER
+    )""")
+    writer = JdbcDynamicTableWriter(conn)
+    ic = PersistPostInterceptor(writer=writer, loader=repo.find_define_by_id)
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    # 注册表挂载（定义级）：名字 "persist"
+    eng.set_extensions(EngineExtensions(interceptors=[], interceptor_registry={"persist": ic}))
+
+    def load_flow(name: str, table: str, declared: str) -> ProcessDefine:
+        content = f'''{{"name": "{name}", "displayName": "{name}", "type": "approval",
+          "relTableName": "{table}", "persistMode": "SYNC",
+          "postInterceptors": "{declared}",
+          "nodes": [{{"id": "start", "type": "snaker:start", "properties": {{}}, "text": {{"value": "开始"}}}},
+                    {{"id": "finish", "type": "snaker:end", "properties": {{}}, "text": {{"value": "结束"}}}}],
+          "edges": [{{"id": "e0", "sourceNodeId": "start", "targetNodeId": "finish", "properties": {{}}}}]}}'''
+        return ProcessDefine(name=name, displayName=name, type="approval", state=1, version=1, content=content)
+
+    # 声明了 persist → 发起即入库
+    d1 = load_flow("decl1", "biz_decl", "persist")
+    repo.add_define(d1)
+    inst = await eng.start_process_instance_by_id(d1.id, "user1", {"f_title": "声明流程"})
+    assert conn.execute("SELECT COUNT(1) FROM biz_decl").fetchone()[0] == 1
+    # 未声明 → 不触发（定义级语义：只有声明了拦截器的流程才持久化）
+    d2 = load_flow("decl2", "biz_decl", "")
+    repo.add_define(d2)
+    await eng.start_process_instance_by_id(d2.id, "user2", {"f_title": "未声明流程"})
+    assert conn.execute("SELECT COUNT(1) FROM biz_decl").fetchone()[0] == 1, "未声明拦截器的流程不应落库"
+    conn.close()
+
+
+# ─── ⑲ issues/30/31：facade listByType/bizData/顶层 JSON ───────────────────────
+
+@pytest.mark.asyncio
+async def test_facade_listByType_and_topLevelJson():
+    from jeeflow import JeeflowFacade
+    repo = MemoryRepository()
+    from jeeflow.spi import ProcessExtRepository
+
+    class _Ext(ProcessExtRepository):
+        def __init__(self):
+            self.designs = {}
+            self.his = {}
+            self.seq = 1
+        # 委托代理方法（接口要求，本测试不用）
+        async def find_surrogate_by_id(self, surrogate_id): return None
+        async def save_surrogate(self, s): pass
+        async def update_surrogate(self, s): pass
+        async def remove_surrogate(self, surrogate_id): pass
+        async def page_surrogates(self, page_num, page_size, conditions=None): return [], 0
+        async def get_surrogate(self, operator, process_name, now): return None
+        async def find_design_by_id(self, design_id):
+            return self.designs.get(design_id)
+        async def save_design(self, d):
+            if not d.id: d.id = self.seq; self.seq += 1
+            self.designs[d.id] = d
+        async def update_design(self, d): self.designs[d.id] = d
+        async def remove_design(self, design_id):
+            self.designs.pop(design_id, None); self.his.pop(design_id, None)
+        async def page_designs(self, page_num, page_size, conditions=None):
+            rows = list(self.designs.values())
+            return rows, len(rows)
+        async def save_design_his(self, his):
+            self.his.setdefault(his.processDesignId, []).insert(0, his)
+        async def list_design_his(self, design_id):
+            return self.his.get(design_id, [])
+
+    ext = _Ext()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    facade = JeeflowFacade(eng, repo, ext)
+    from jeeflow.model import ProcessDesign
+    await ext.save_design(ProcessDesign(id=1, name="old", displayName="旧名", type="approval"))
+    await ext.save_design(ProcessDesign(id=2, name="old2", displayName="旧名2", type="approval"))
+
+    # 顶层 JSON 保存（无 content 字段）——issue 31
+    r = await facade.flow("processDesign/updateDefine", {
+        "processDesignId": 1, "operator": "user1",
+        "name": "topjson", "displayName": "顶层JSON", "type": "approval",
+        "relTableName": "biz_top", "nodes": [], "edges": []})
+    assert r["code"] == 0, r
+    d = await ext.find_design_by_id(1)
+    assert d.name == "topjson"
+    his = await ext.list_design_his(1)
+    assert his and '"nodes"' in his[0].content, "顶层 JSON 应序列化为内容快照"
+
+    # listByType 分组——issue 30
+    r = await facade.flow("processDesign/listByType", {})
+    assert r["code"] == 0, r
+    groups = r["data"]
+    assert "approval" in groups and groups["approval"][0]["name"] == "topjson"
+    assert groups["approval"][0]["processDesignId"] == 1
+    assert groups["approval"][0]["jsonObject"] is not None
+
+    # 真实流程（01-simple + relTableName 注入）供 bizData 测试
+    import os as _os
+    flow_dir = _os.path.join(_os.path.dirname(__file__), "..", "..", "jeeflow-java",
+                             "jeeflow-core", "src", "test", "resources", "flows")
+    simple = open(_os.path.join(flow_dir, "01-simple.json"), encoding="utf-8").read()
+    simple = simple.replace('"type": "approval"', '"type": "approval", "relTableName": "biz_top"', 1)
+    r = await facade.flow("processDesign/updateDefine", {
+        "processDesignId": 2, "operator": "user1", "content": simple})
+    assert r["code"] == 0, r
+    r = await facade.flow("processDesign/deploy", {"id": 2, "operator": "user1"})
+    assert r["code"] == 0, r
+    define_id = r["data"]["processDefineId"]
+    sr = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": define_id, "operator": "user1", "f_title": "x"})
+    assert sr["code"] == 0, sr
+    inst_id = sr["data"]["processInstanceId"]
+    r = await facade.flow("processInstance/bizData", {"processInstanceId": inst_id})
+    assert r["code"] != 0 and "meta_reader" in r["msg"], r
+
+    class _Reader:
+        def read_by_process_instance(self, table_name, process_instance_id):
+            return {"tableName": table_name, "title": "业务数据"}
+    facade.set_meta_reader(_Reader())
+    r = await facade.flow("processInstance/bizData", {"processInstanceId": inst_id})
+    assert r["code"] == 0, r
+    assert r["data"]["tableName"] == "biz_top"
+    assert r["data"]["title"] == "业务数据"

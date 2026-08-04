@@ -39,6 +39,12 @@ class JeeflowFacade:
         self._ext = ext_repo
         self._user_search = user_search  # 可空：candidatePage 用户分页搜索依赖
         self._org_prov = org_prov  # 可空：candidatePage candidateGroups 角色取人（v1.6.0）
+        self._meta_reader = None  # 可空：bizData 业务数据读取器（issue 30，注入式）
+
+    def set_meta_reader(self, reader) -> "JeeflowFacade":
+        """注入业务数据读取器（issue 30）：需有 read_by_process_instance(table_name, process_instance_id)"""
+        self._meta_reader = reader
+        return self
 
     def set_user_search(self, fn: callable) -> "JeeflowFacade":
         """注入用户搜索钩子：fn(query: dict) -> (rows: list[dict], total: int)"""
@@ -462,11 +468,79 @@ class JeeflowFacade:
         return {"processDefineId": define_id}
 
     async def _processDesign_remove(self, args: dict) -> dict:
-        design_id = self._to_int(args.get("id"))
-        if not design_id:
-            raise ValueError("id 缺失或非法")
-        await self._ext_repo().remove_design(design_id)
+        # issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
+        ids = args.get("ids")
+        if isinstance(ids, (list, tuple)):
+            for i in ids:
+                await self._ext_repo().remove_design(self._to_int(i))
+        else:
+            design_id = self._to_int(args.get("id"))
+            if not design_id:
+                raise ValueError("id 缺失或非法")
+            await self._ext_repo().remove_design(design_id)
         return None
+
+    async def _processDesign_listByType(self, args: dict) -> dict:
+        """按类型分组列出流程设计（issue 30，对齐 Java issues/28）——不依赖框架字典：
+        设计全量 → 按 type 分组 → 组内每 name 取最新 define 的 {processDefineId, name,
+        displayName, icon, remark, jsonObject}。"""
+        ext = self._ext_repo()
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10000
+        rows, _total = await ext.page_designs(page_num, page_size, self._parse_m_query(args))
+        # 每 name 最新 define（version 最大）
+        def_rows, _ = await self._repo.page_defines(1, 10000, [])
+        latest_by_name: dict = {}
+        for r in def_rows:
+            prev = latest_by_name.get(r.name)
+            if prev is None or r.version > prev.version:
+                latest_by_name[r.name] = r
+        groups: dict = {}
+        for d in rows:
+            groups.setdefault(d.type or "", []).append({
+                "processDesignId": d.id,
+                "name": d.name,
+                "displayName": d.displayName,
+                "icon": getattr(d, "icon", None),
+                "remark": getattr(d, "remark", None),
+                "processDefineId": latest_by_name[d.name].id if d.name in latest_by_name else None,
+                "processDefineState": latest_by_name[d.name].state if d.name in latest_by_name else None,
+                "jsonObject": self._parse_graph((await ext.list_design_his(d.id))[0].content)
+                              if await ext.list_design_his(d.id) else None,
+            })
+        return groups
+
+    async def _processInstance_bizData(self, args: dict) -> dict:
+        """按流程实例回显业务数据（issue 30，对齐 Java issues/28）——meta_reader 注入式，未注入清晰报错"""
+        instance_id = self._to_int(args.get("processInstanceId") or args.get("id"))
+        if not instance_id:
+            raise ValueError("processInstanceId 缺失")
+        inst = await self._repo.find_instance_by_id(instance_id)
+        if not inst:
+            raise ValueError("流程实例不存在")
+        def_ = await self._repo.find_define_by_id(inst.defineId)
+        if not def_:
+            raise ValueError("流程定义不存在")
+        table_name = self._rel_table_name(def_.content)
+        if not table_name:
+            raise ValueError("流程定义未配置 relTableName")
+        if self._meta_reader is None:
+            raise ValueError("业务数据读取器未注册（facade.set_meta_reader(MetaTableReader(...))，需引入 jeeflow.meta）")
+        return self._meta_reader.read_by_process_instance(table_name, instance_id)
+
+    @staticmethod
+    def _rel_table_name(content) -> Optional[str]:
+        """从流程定义 content 顶层解析 relTableName（缺省回落 name）"""
+        try:
+            if isinstance(content, bytes):
+                content = content.decode("utf-8")
+            meta = json.loads(str(content))
+            table = str(meta.get("relTableName") or "").strip()
+            if not table:
+                table = str(meta.get("name") or "").strip()
+            return table or None
+        except Exception:
+            return None
 
     # ── 委托代理（需扩展仓储） ───────────────────────────────────────────────
 
@@ -824,9 +898,13 @@ class JeeflowFacade:
     def _content(args: dict, required: bool = True) -> Optional[str]:
         content = args.get("content")
         if content is None:
-            if required:
-                raise ValueError("content 缺失")
-            return None
+            # issues/31：兼容 boot3 顶层 JSON（无 content 字段）——非保留字段序列化为内容快照
+            copy = {k: v for k, v in args.items() if k not in ("processDesignId", "operator")}
+            if not copy:
+                if required:
+                    raise ValueError("content 缺失")
+                return None
+            content = json.dumps(copy, ensure_ascii=False)
         if isinstance(content, bytes):
             return content.decode("utf-8")
         return str(content)

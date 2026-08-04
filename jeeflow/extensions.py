@@ -84,6 +84,8 @@ class HandlerRegistry:
 @dataclass
 class EngineExtensions:
     interceptors: list[FlowInterceptor] = field(default_factory=list)
+    # 定义级拦截器注册表（issue 34）：名字 → 实例；流程定义顶层 postInterceptors 按名解析
+    interceptor_registry: dict[str, FlowInterceptor] = field(default_factory=dict)
     assignment_handler: Optional[AssignmentHandler] = None
     decision_handler: Optional[DecisionHandler] = None
     event_listener: Optional[Callable[[ProcessEvent], Awaitable[None]]] = None

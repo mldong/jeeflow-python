@@ -103,20 +103,33 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
 
     # ── 表结构探测 ──
 
+    def _execute(self, query: str, params: tuple = ()):
+        """统一执行入口（issues/33）：兼容 sqlite3 快捷 execute 与标准 DB-API 连接
+        （pymysql/aiomysql 等只有 cursor()，无 execute 快捷方法）——两者返回均视为 cursor。"""
+        if hasattr(self._conn, "execute"):
+            return self._conn.execute(query, params)
+        cur = self._conn.cursor()
+        cur.execute(query, params)
+        return cur
+
+    def _placeholder(self) -> str:
+        """方言占位符（issues/33）：sqlite/h2 用 ?，mysql/postgres 用 %s"""
+        return "?" if self._dialect in ("sqlite", "h2") else "%s"
+
     def _table_columns(self, table_name: str) -> list[_Column]:
         cached = self._cache.get(table_name)
         if cached is not None:
             return cached
         if self._dialect == "sqlite":
             # PRAGMA table_info：cid,name,type,notnull,dflt_value,pk——INTEGER PRIMARY KEY 为 rowid 别名（自增）
-            rows = self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            rows = self._execute(f"PRAGMA table_info({table_name})").fetchall()
             cols = [_Column(r[1].upper(), r[5] == 1,
                             r[5] == 1 and r[2].strip().upper() == "INTEGER") for r in rows]
         elif self._dialect == "mysql":
             # issues/22：限定当前 schema（DATABASE()），防多库同名表列重复
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT column_name, extra, column_key FROM information_schema.columns "
-                "WHERE UPPER(table_name) = UPPER(?) AND table_schema = DATABASE() "
+                f"WHERE UPPER(table_name) = UPPER({self._placeholder()}) AND table_schema = DATABASE() "
                 "ORDER BY ordinal_position",
                 (table_name,)).fetchall()
             cols = [_Column(r[0].upper(), r[2].upper() == "PRI",
@@ -124,7 +137,7 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         else:
             # PG/H2 标准 SQL：IS_IDENTITY（identity）+ column_default nextval（PG serial）+ 主键约束 JOIN
             # issues/22：限定当前 schema（CURRENT_SCHEMA()，H2/PG 均支持）
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT c.column_name, c.is_identity, c.column_default, "
                 "CASE WHEN kcu.column_name IS NOT NULL THEN 'PRI' ELSE '' END AS column_key "
                 "FROM information_schema.columns c "
@@ -134,7 +147,7 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
                 "LEFT JOIN information_schema.key_column_usage kcu "
                 "  ON kcu.constraint_name = tc.constraint_name AND kcu.column_name = c.column_name "
                 "  AND kcu.table_schema = c.table_schema "
-                "WHERE UPPER(c.table_name) = UPPER(?) AND c.table_schema = CURRENT_SCHEMA() "
+                f"WHERE UPPER(c.table_name) = UPPER({self._placeholder()}) AND c.table_schema = CURRENT_SCHEMA() "
                 "ORDER BY c.ordinal_position",
                 (table_name,)).fetchall()
             cols = [_Column(r[0].upper(), r[3].upper() == "PRI",
@@ -173,10 +186,10 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
                 values.append(self.primary_key_generator(table_name))
         if not names:
             raise ValueError(f"persist: no matching columns for {table_name}")
-        placeholder = "?" if self._dialect in ("sqlite", "h2") else "%s"
+        placeholder = self._placeholder()
         placeholders = ",".join([placeholder] * len(names))
         query = f"INSERT INTO {table_name} ({','.join(names)}) VALUES ({placeholders})"
-        cur = self._conn.execute(query, values)
+        cur = self._execute(query, values)
         self._conn.commit()
         return cur.lastrowid
 
@@ -184,7 +197,7 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         _check_table_name(table_name)
         self._table_columns(table_name)  # 表不存在提前报错
         query = f"SELECT COUNT(1) FROM {table_name} WHERE {biz_key} = ?"
-        row = self._conn.execute(query, (biz_key_value,)).fetchone()
+        row = self._execute(query, (biz_key_value,)).fetchone()
         return bool(row and row[0] > 0)
 
     def update(self, table_name: str, data: dict[str, Any], where_column: str, where_value: Any) -> int:
@@ -205,10 +218,10 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
                 values.append(data[key])
         if not sets:
             return 0  # 无更新列（如结束节点仅状态探测未命中）
-        placeholder = "?" if self._dialect in ("sqlite", "h2") else "%s"
+        placeholder = self._placeholder()
         query = f"UPDATE {table_name} SET {','.join(sets)} WHERE {where_column} = {placeholder}"
         values.append(where_value)
-        cur = self._conn.execute(query, values)
+        cur = self._execute(query, values)
         self._conn.commit()
         return cur.rowcount
 

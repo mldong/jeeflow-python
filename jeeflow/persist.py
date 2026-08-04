@@ -108,23 +108,29 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
             cols = [_Column(r[1].upper(), r[5] == 1,
                             r[5] == 1 and r[2].strip().upper() == "INTEGER") for r in rows]
         elif self._dialect == "mysql":
+            # issues/22：限定当前 schema（DATABASE()），防多库同名表列重复
             rows = self._conn.execute(
                 "SELECT column_name, extra, column_key FROM information_schema.columns "
-                "WHERE UPPER(table_name) = UPPER(?) ORDER BY ordinal_position",
+                "WHERE UPPER(table_name) = UPPER(?) AND table_schema = DATABASE() "
+                "ORDER BY ordinal_position",
                 (table_name,)).fetchall()
             cols = [_Column(r[0].upper(), r[2].upper() == "PRI",
                             "auto_increment" in (r[1] or "").lower()) for r in rows]
         else:
             # PG/H2 标准 SQL：IS_IDENTITY（identity）+ column_default nextval（PG serial）+ 主键约束 JOIN
+            # issues/22：限定当前 schema（CURRENT_SCHEMA()，H2/PG 均支持）
             rows = self._conn.execute(
                 "SELECT c.column_name, c.is_identity, c.column_default, "
                 "CASE WHEN kcu.column_name IS NOT NULL THEN 'PRI' ELSE '' END AS column_key "
                 "FROM information_schema.columns c "
                 "LEFT JOIN information_schema.table_constraints tc "
                 "  ON tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY' "
+                "  AND tc.table_schema = c.table_schema "
                 "LEFT JOIN information_schema.key_column_usage kcu "
                 "  ON kcu.constraint_name = tc.constraint_name AND kcu.column_name = c.column_name "
-                "WHERE UPPER(c.table_name) = UPPER(?) ORDER BY c.ordinal_position",
+                "  AND kcu.table_schema = c.table_schema "
+                "WHERE UPPER(c.table_name) = UPPER(?) AND c.table_schema = CURRENT_SCHEMA() "
+                "ORDER BY c.ordinal_position",
                 (table_name,)).fetchall()
             cols = [_Column(r[0].upper(), r[3].upper() == "PRI",
                             (r[1] or "").upper() == "YES" or "nextval" in (r[2] or "")) for r in rows]

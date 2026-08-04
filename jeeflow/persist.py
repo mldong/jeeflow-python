@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, NamedTuple, Optional, Sequence
 
 from .extensions import FlowInterceptor
-from .model import ProcessDefine, ProcessInstance, TYPE_END, InstanceState
+from .model import ProcessDefine, ProcessInstance, TYPE_END, TYPE_TASK, TYPE_CUSTOM, InstanceState
 from .engine import KEY_SUBMIT_TYPE, KEY_DEPT_ID
 from .model import SubmitType
 
@@ -34,6 +34,11 @@ class DynamicTableWriter(ABC):
     @abstractmethod
     def insert(self, table_name: str, data: dict[str, Any]) -> Any:
         """参数化 INSERT（按列过滤结果落库），返回生成主键"""
+
+    @abstractmethod
+    def update(self, table_name: str, data: dict[str, Any], where_column: str, where_value: Any) -> int:
+        """参数化 UPDATE（按列过滤结果组装 SET；条件列排除，防注入），返回受影响行数
+        （SYNC 同步演进，issues/24）"""
 
     @abstractmethod
     def exists(self, table_name: str, biz_key: str, biz_key_value: Any) -> bool:
@@ -182,6 +187,31 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         row = self._conn.execute(query, (biz_key_value,)).fetchone()
         return bool(row and row[0] > 0)
 
+    def update(self, table_name: str, data: dict[str, Any], where_column: str, where_value: Any) -> int:
+        """参数化 UPDATE（SYNC 同步演进，issues/24）：列过滤（宽松匹配）+ 条件列排除 +
+        参数化 SET，返回受影响行数。对齐 Java JdbcDynamicTableWriter.update。"""
+        _check_table_name(table_name)
+        if not where_column:
+            raise ValueError(f"persist: update {table_name} requires where column")
+        cols = self._table_columns(table_name)
+        sets: list[str] = []
+        values: list[Any] = []
+        for col in cols:
+            if self._normalize(col.name) == self._normalize(where_column):
+                continue  # 条件列不参与 SET
+            key = self._find_data_key(data, col.name)
+            if key is not None:
+                sets.append(f"{col.name} = ?")
+                values.append(data[key])
+        if not sets:
+            return 0  # 无更新列（如结束节点仅状态探测未命中）
+        placeholder = "?" if self._dialect in ("sqlite", "h2") else "%s"
+        query = f"UPDATE {table_name} SET {','.join(sets)} WHERE {where_column} = {placeholder}"
+        values.append(where_value)
+        cur = self._conn.execute(query, values)
+        self._conn.commit()
+        return cur.rowcount
+
     def fill_system_fields(self, data: dict[str, Any], is_insert: bool) -> None:
         now = time.strftime(_TIME_LAYOUT)
         if is_insert:
@@ -248,33 +278,41 @@ def _check_table_name(table_name: str) -> None:
 
 DefineLoader = Any  # 类型别名：Callable[[int], Awaitable[ProcessDefine]]
 
+# 持久化模式（流程定义顶层 persistMode，缺省 ARCHIVE）
+PERSIST_MODE_ARCHIVE = "ARCHIVE"  # 结束归档（现状）：流程结束同意后落库
+PERSIST_MODE_SYNC = "SYNC"        # 同步演进：发起 INSERT → 任务节点 UPDATE → 结束定稿
+
+# 字段权限值（任务节点 properties.field 的 PERMISSION_{字段名}，vben5-wf 机制）
+PERM_READ_ONLY = 1  # 只读：不更新
+PERM_EDIT = 2       # 可编辑：更新
+PERM_HIDDEN = 3     # 隐藏：不更新
+
 
 class PersistPostInterceptor(FlowInterceptor):
-    """工作流业务数据入库适配拦截器——流程结束同意后，f_ 表单数据写入业务表。
+    """工作流业务数据入库适配拦截器——按流程定义顶层 persistMode 分派：
 
-    语义（spec 契约，四语言一致）：
+    - ARCHIVE（缺省）：流程结束同意后，f_ 表单数据写入业务表（一次落库）
+    - SYNC（1.8.0，issues/24 同步演进）：提交申请即入库（start 节点 INSERT 全量），
+      任务节点推进 UPDATE（f_ 按节点字段权限过滤 + tf_ 冗余 + 状态字段=DOING），
+      结束节点定稿 UPDATE（最终状态 FINISHED/REJECT）——不管成功失败都入库
 
-    - 时机：结束节点执行后 + 实例 DONE（Python finish() 置 InstanceState.DONE）
-      + submitType=AGREE（不同意/退回不入库）
-    - 字段：实例 Variables 中 ``f_`` 前缀字段，去前缀
-    - 表名：流程定义 content 顶层 ``relTableName``，缺省回落流程 name
-    - 系统字段：writer 通用字段 + 流程上下文（process_instance_id / apply_user_id /
-      apply_dept_id，蛇形列名约定）
-    - 幂等：biz_key = process_instance_id（先查后插，跨请求有效）
-    - 静默跳过：非结束节点 / 非同意 / 未配置表名 / writer 未注入
+    对标 Java PersistPostInterceptor（1.8.0）。
 
     :param writer: 动态表写入器（必须注入，否则静默跳过）
     :param loader: 流程定义加载器（``async def loader(define_id) -> ProcessDefine``，
         通常透传 ``repo.find_define_by_id``）
     :param field_prefix: 实例表单字段前缀，默认 "f_"
+    :param task_field_prefix: 任务冗余字段前缀（审批意见等，SYNC 下冗余到业务表对应列），默认 "tf_"
     """
 
     def __init__(self, writer: Optional[DynamicTableWriter] = None,
                  loader: Optional[DefineLoader] = None,
-                 field_prefix: str = "f_"):
+                 field_prefix: str = "f_",
+                 task_field_prefix: str = "tf_"):
         self.writer = writer
         self.loader = loader
         self.field_prefix = field_prefix
+        self.task_field_prefix = task_field_prefix
 
     async def pre_handle(self, node, instance) -> bool:
         return True
@@ -286,60 +324,135 @@ class PersistPostInterceptor(FlowInterceptor):
     async def post_handle(self, node, instance: ProcessInstance) -> None:
         if self.writer is None or self.loader is None:
             return  # 未注入：静默跳过
-        # 时机：仅结束节点 + 流程正常完成（DONE）+ 同意
-        if node is None or node.type != TYPE_END:
+        if node is None or instance is None:
             return
-        if instance is None or instance.state != InstanceState.DONE:
+        table_name, persist_mode = await self._resolve_define(instance)
+        if not table_name:
+            return  # 未配置：静默跳过
+        if str(persist_mode).upper() == PERSIST_MODE_SYNC:
+            await self._handle_sync(node, instance, table_name)
+            return
+        await self._handle_archive(node, instance, table_name)
+
+    # ── ARCHIVE（现状：结束同意归档） ──
+
+    async def _handle_archive(self, node, instance: ProcessInstance, table_name: str) -> None:
+        # 时机：仅结束节点 + 流程正常完成（DONE）+ 同意
+        if node.type != TYPE_END:
+            return
+        if instance.state != InstanceState.DONE:
             return
         submit_type = instance.variables.get(KEY_SUBMIT_TYPE)
         if submit_type is None or int(submit_type) != int(SubmitType.AGREE):
             return
-
-        # 同链重复触发防护（issues/19）：最后任务节点与结束节点都会触发后置拦截器，
-        # 同一执行链（共享 instance.variables）只插一次。标记写入时实例已完成持久化
-        # （引擎 _execute_node 先 update_instance 后触发拦截器，repo 存副本）不会落库；
-        # exists 保留作为跨请求/重启的幂等兜底（先查后插语义不变）。
-        chain_key = f"__persist_executed_{instance.id}"
-        if instance.variables.get(chain_key) is True:
+        if not self._mark_chain(node, instance):
             return
-        instance.variables[chain_key] = True
-
-        # 表名：流程定义顶层 relTableName，缺省回落流程 name
-        table_name = await self._resolve_table_name(instance)
-        if not table_name:
-            return  # 未配置：静默跳过
-
         # 幂等：以 process_instance_id 为键，先查后插
         if self.writer.exists(table_name, "process_instance_id", instance.id):
             return
-
-        # 提取 f_ 前缀字段（去前缀）
-        prefix = self.field_prefix or "f_"
-        data = {
-            k[len(prefix):]: v
-            for k, v in instance.variables.items()
-            if k.startswith(prefix) and len(k) > len(prefix)
-        }
-
-        # 流程上下文字段（蛇形列名约定，与 writer 系统字段一致）
-        data.setdefault("process_instance_id", instance.id)
-        data.setdefault("apply_user_id", instance.operator)
-        data.setdefault("apply_dept_id", instance.variables.get(KEY_DEPT_ID))
-
-        # 通用系统字段（writer 按配置列填充）
+        data = self._extract_fields(instance, None, False, True)  # 只 f_ 全量
+        self._fill_context(data, instance)
         self.writer.fill_system_fields(data, True)
-
         self.writer.insert(table_name, data)
 
-    async def _resolve_table_name(self, instance: ProcessInstance) -> str:
+    # ── SYNC（1.8.0 同步演进：发起入库 → 节点推进 → 结束定稿） ──
+
+    async def _handle_sync(self, node, instance: ProcessInstance, table_name: str) -> None:
+        if not self._mark_chain(node, instance):
+            return  # 同链同节点不重复（节点级，issues/19 演进）
+        exists = self.writer.exists(table_name, "process_instance_id", instance.id)
+
+        # 任务节点（TYPE_TASK/TYPE_CUSTOM）才更新业务字段：f_ 按节点字段权限过滤；
+        # 结束/网关等非任务节点只定稿状态，避免全量覆盖任务节点的只读/隐藏限制
+        is_task = node.type in (TYPE_TASK, TYPE_CUSTOM)
+        field_perm = self._resolve_field_permission(node) if is_task else None
+        data = self._extract_fields(instance, field_perm, not exists or is_task, not exists or is_task)
+
+        # 状态字段：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列。
+        # 任务节点写 DOING(10)——任务推进状态；结束节点写实例最终状态（FINISHED/REJECT）
+        state_code = int(instance.state)
+        if is_task:
+            state_code = int(InstanceState.DOING)
+        self._put_state_field(table_name, data, node.id, state_code)
+
+        self._fill_context(data, instance)
+        if not exists:
+            self.writer.fill_system_fields(data, True)
+            self.writer.insert(table_name, data)
+            return
+        self.writer.fill_system_fields(data, False)  # 只填 update 组
+        self.writer.update(table_name, data, "process_instance_id", instance.id)
+
+    # ── 公共 ──
+
+    async def _resolve_define(self, instance: ProcessInstance) -> tuple[str, str]:
         define: Optional[ProcessDefine] = await self.loader(instance.defineId)
         if define is None:
-            return ""
+            return "", ""
         try:
             meta = json.loads(define.content) if isinstance(define.content, str) else json.loads(define.content.decode("utf-8"))
         except (ValueError, AttributeError):
-            return ""
+            return "", ""
         table_name = (meta.get("relTableName") or "").strip()
         if not table_name:
             table_name = (meta.get("name") or "").strip()  # 缺省回落流程 name
-        return table_name
+        return table_name, str(meta.get("persistMode") or "").strip()
+
+    def _mark_chain(self, node, instance: ProcessInstance) -> bool:
+        """同链重复触发防护（issues/19，1.8.0 节点级）：同一执行链中**每个节点**
+        触发一次（任务推进更新 + 结束定稿是不同节点，都要生效），同节点不重复；
+        exists 兜底跨请求。"""
+        chain_key = f"__persist_executed_{instance.id}_{node.id}"
+        if instance.variables.get(chain_key) is True:
+            return False
+        instance.variables[chain_key] = True
+        return True
+
+    def _extract_fields(self, instance: ProcessInstance, field_perm: Optional[dict],
+                        include_task_fields: bool, include_form_fields: bool) -> dict[str, Any]:
+        """提取字段：f_ 去前缀（SYNC 下按字段权限过滤——只读/隐藏不更新；
+        include_form_fields=False 时不带出，用于非任务节点定稿避免覆盖只读限制）；
+        tf_ 去前缀冗余（有列则写，列过滤由 writer 做）。"""
+        prefix = self.field_prefix or "f_"
+        task_prefix = self.task_field_prefix or "tf_"
+        data: dict[str, Any] = {}
+        for k, v in instance.variables.items():
+            if include_form_fields and k.startswith(prefix) and len(k) > len(prefix):
+                name = k[len(prefix):]
+                if not self._is_editable(field_perm, name):
+                    continue
+                data[name] = v
+            elif include_task_fields and k.startswith(task_prefix) and len(k) > len(task_prefix):
+                data[k[len(task_prefix):]] = v
+        return data
+
+    def _resolve_field_permission(self, node) -> Optional[dict]:
+        """任务节点字段权限（node.properties.field 的 PERMISSION_x；缺省 None=全部可编辑）"""
+        props = getattr(node, "properties", None) or {}
+        field = props.get("field")
+        if isinstance(field, dict) and field:
+            return field
+        return None
+
+    def _is_editable(self, field_perm: Optional[dict], field_name: str) -> bool:
+        """字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新"""
+        if not field_perm:
+            return True
+        perm = field_perm.get(f"PERMISSION_{field_name}")
+        if perm is None:
+            return True
+        return int(perm) == PERM_EDIT
+
+    def _put_state_field(self, table_name: str, data: dict[str, Any], node_id: str, state_code: int) -> None:
+        """状态字段写入：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列（列探测过滤）"""
+        if not node_id:
+            return
+        kept = self.writer.filter_columns(table_name, [f"{node_id}_{state_code}", node_id])
+        if kept:
+            data[kept[0]] = state_code
+
+    def _fill_context(self, data: dict[str, Any], instance: ProcessInstance) -> None:
+        """流程上下文字段（蛇形列名约定，与 writer 系统字段一致）"""
+        data.setdefault("process_instance_id", instance.id)
+        data.setdefault("apply_user_id", instance.operator)
+        data.setdefault("apply_dept_id", instance.variables.get(KEY_DEPT_ID))

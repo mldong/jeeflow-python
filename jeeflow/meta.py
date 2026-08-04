@@ -173,10 +173,36 @@ class MetaTableWriter(DynamicTableWriter):
         pk = self.base.insert(table_name, row)  # 主表插入（自增/生成器返回主键）
         if pk is None:
             pk = _find_row_value(row, meta.pk())
-        # 子表递归插入（外键=主表主键）
+        # 子表递归插入（外键=主表主键；继承主表 apply_user_id，issues/24）
         for name, v in sub_data.items():
-            self._insert_sub_table(meta, meta.find_field(name), v, pk)
+            self._insert_sub_table(meta, meta.find_field(name), v, pk, data)
         return pk
+
+    def update(self, table_name: str, data: dict[str, Any], where_column: str, where_value: Any) -> int:
+        """按元数据 storageType 组装 SET 列（SYNC 同步演进，issues/24）——
+        NORMAL/JSON/EXPAND 参与更新；ONE2ONE/ONE2MANY 子表不参与中途更新
+        （任务推进只更新主表行状态，子表数据变动走重新提交）；未消费字段直通。"""
+        meta = self.provider.load_table_meta(table_name)
+        if meta is None:
+            return self.base.update(table_name, data, where_column, where_value)  # 无元数据：回落基础 writer
+        row: dict[str, Any] = {}
+        for f in meta.fields:
+            v = data.get(f.name)
+            if v is None:
+                continue
+            if f.storage_type == StorageType.JSON:
+                row[f.column()] = json.dumps(v, ensure_ascii=False)
+            elif f.storage_type == StorageType.EXPAND:
+                self._expand_into(f, v, row)
+            elif f.storage_type in (StorageType.ONE2ONE, StorageType.ONE2MANY):
+                continue  # 子表不参与中途更新
+            else:
+                row[f.column()] = v
+        # 未消费字段（流程上下文/状态字段等）直通基础 writer
+        for k, v in data.items():
+            if meta.find_field(k) is None:
+                row.setdefault(k, v)
+        return self.base.update(table_name, row, where_column, where_value)
 
     def exists(self, table_name: str, biz_key: str, biz_key_value: Any) -> bool:
         return self.base.exists(table_name, biz_key, biz_key_value)
@@ -192,20 +218,27 @@ class MetaTableWriter(DynamicTableWriter):
             if v.get(sub) is not None:
                 row[col] = v[sub]
 
-    def _insert_sub_table(self, parent_meta: TableMeta, f: FieldMeta, v: Any, parent_pk: Any) -> None:
+    def _insert_sub_table(self, parent_meta: TableMeta, f: FieldMeta, v: Any, parent_pk: Any,
+                          parent_data: dict[str, Any]) -> None:
         if parent_pk is None:
             raise ValueError(f"persist: parent primary key missing, cannot insert sub table {f.name}")
         fk = f.foreign_key or parent_meta.pk()
         if f.storage_type == StorageType.ONE2ONE:
             if isinstance(v, dict):
-                self._insert_sub_row(f, v, fk, parent_pk)
+                self._insert_sub_row(f, v, fk, parent_pk, parent_data)
         elif isinstance(v, list):
             for item in v:
                 if isinstance(item, dict):
-                    self._insert_sub_row(f, item, fk, parent_pk)
+                    self._insert_sub_row(f, item, fk, parent_pk, parent_data)
 
-    def _insert_sub_row(self, f: FieldMeta, sub_data: dict, fk: str, parent_pk: Any) -> None:
+    def _insert_sub_row(self, f: FieldMeta, sub_data: dict, fk: str, parent_pk: Any,
+                        parent_data: dict[str, Any]) -> None:
         row = dict(sub_data)
+        # issues/24：继承主表 apply_user_id（拦截器场景=流程 operator），子表单显式同名字段优先
+        # （setdefault）——fill_system_fields 的用户列默认值可解析到 operator，
+        # 避免 BIGINT create_user/update_user 列回落 "system" 严格模式报错
+        if "apply_user_id" in parent_data:
+            row.setdefault("apply_user_id", parent_data["apply_user_id"])
         row[fk] = parent_pk
         self.insert(f.target_table, row)  # 递归走子表自身元数据
 
@@ -277,9 +310,10 @@ class MetaTableReader:
                     result[f.name] = sub
             elif v is not None:
                 result[f.name] = v
-        # 未在元数据中的列带出（key 统一小写）
+        # 未在元数据中的列带出（key 统一小写）；
+        # EXPAND 展开列（挂在某字段 expand_fields 映射里，对象形式已带出）不重复平铺（issues/24）
         for k, v in row.items():
-            if meta.find_field_by_column(k) is None:
+            if meta.find_field_by_column(k) is None and not _is_expand_column(meta, k):
                 result.setdefault(k.lower(), v)
         return result
 
@@ -312,3 +346,12 @@ def _find_row_value(row: dict[str, Any], column_name: str) -> Any:
         if k.lower() == (column_name or "").lower():
             return v
     return None
+
+
+def _is_expand_column(meta: TableMeta, column: str) -> bool:
+    """列是否为某字段的 EXPAND 展开列（issues/24：已消费，不重复平铺带出）"""
+    for f in meta.fields:
+        for col in f.expand_fields.values():
+            if col.lower() == (column or "").lower():
+                return True
+    return False

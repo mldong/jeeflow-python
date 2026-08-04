@@ -320,3 +320,101 @@ def test_missing_primary_key_generator():
     with pytest.raises(ValueError, match="primary key generator"):
         writer.insert("biz_snow", {"title": "x"})
     conn.close()
+
+
+# ─── ⑯ SYNC 同步演进（1.8.0）：发起入库 → 任务推进 → 结束定稿 ─────────────────
+
+def _sync_define(repo: MemoryRepository, table: str) -> ProcessDefine:
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), "r", encoding="utf-8") as f:
+        content = f.read()
+    content = content.replace('"type": "approval"',
+                              f'"type": "approval", "relTableName": "{table}", "persistMode": "SYNC"', 1)
+    content = content.replace('"assignee": "leader"',
+                              '"assignee": "leader", "field": {"PERMISSION_title": 1, "PERMISSION_amount": 2}', 1)
+    content = content.replace('"id": "end"', '"id": "finish"')
+    content = content.replace('"targetNodeId": "end"', '"targetNodeId": "finish"')
+    d = ProcessDefine(name="simple", displayName="01-simple.json", type="approval",
+                      state=1, version=1, content=content)
+    repo.add_define(d)
+    return d
+
+
+def _sync_db():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE biz_sync (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        amount REAL,
+        opinion TEXT,
+        apply INTEGER,
+        task1 INTEGER,
+        finish INTEGER,
+        process_instance_id INTEGER,
+        apply_user_id TEXT,
+        apply_dept_id TEXT,
+        create_time TEXT,
+        create_user TEXT,
+        update_time TEXT,
+        update_user TEXT,
+        is_deleted INTEGER
+    )""")
+    return conn, JdbcDynamicTableWriter(conn)
+
+
+@pytest.mark.asyncio
+async def test_sync_mode_full_cycle():
+    repo = MemoryRepository()
+    conn, writer = _sync_db()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    eng.set_extensions(EngineExtensions(interceptors=[
+        PersistPostInterceptor(writer=writer, loader=repo.find_define_by_id)]))
+    _sync_define(repo, "biz_sync")
+
+    # ① 发起 → INSERT（title/amount）
+    inst = await eng.start_process_instance_by_id(1, "user1",
+        {"f_title": "年假申请", "f_amount": 800.0, "u_deptId": "D01"})
+    # ② apply 完成 → UPDATE（apply 状态=10）
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["user1"])
+    await eng.execute_process_task(doing[0].id, "user1", {KEY_SUBMIT_TYPE: 0})
+    assert conn.execute("SELECT apply FROM biz_sync").fetchone()[0] == 10
+    # ③ task1（leader）→ UPDATE：title 只读不更新 / amount 可编辑更新 / opinion(tf_) / task1=10 / finish=20
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["leader"])
+    await eng.execute_process_task(doing[0].id, "leader",
+        {KEY_SUBMIT_TYPE: 1, "tf_opinion": "同意", "f_title": "修改标题", "f_amount": 999.0})
+    title, amount, opinion, task1, finish = conn.execute(
+        "SELECT title, amount, opinion, task1, finish FROM biz_sync").fetchone()
+    assert title == "年假申请", f"只读字段不应更新: {title}"
+    assert amount == 999.0, f"可编辑字段应更新: {amount}"
+    assert opinion == "同意", f"tf_ 冗余未落库: {opinion}"
+    assert task1 == 10
+    assert finish == 20
+    assert conn.execute("SELECT COUNT(1) FROM biz_sync").fetchone()[0] == 1, "先插后更应仅 1 条"
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_mode_reject():
+    repo = MemoryRepository()
+    conn, writer = _sync_db()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    eng.set_extensions(EngineExtensions(interceptors=[
+        PersistPostInterceptor(writer=writer, loader=repo.find_define_by_id)]))
+    _sync_define(repo, "biz_sync")
+
+    inst = await eng.start_process_instance_by_id(1, "user1",
+        {"f_title": "驳回单", "u_deptId": "D01"})
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["user1"])
+    await eng.execute_process_task(doing[0].id, "user1", {KEY_SUBMIT_TYPE: 0})
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["leader"])
+    await eng.execute_process_task(doing[0].id, "leader", {KEY_SUBMIT_TYPE: 2})
+
+    title, finish, create_user = conn.execute(
+        "SELECT title, finish, create_user FROM biz_sync").fetchone()
+    assert title == "驳回单"
+    assert finish == 45, f"驳回最终状态应为 REJECT: {finish}"
+    assert create_user == "user1"
+    conn.close()

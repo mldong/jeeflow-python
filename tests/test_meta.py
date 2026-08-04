@@ -113,3 +113,71 @@ def test_meta_fallback():
     result = reader.read_by_process_instance("biz_leave", 1)
     assert result["title"] == "回落"
     conn.close()
+
+
+# ─── issues/24：子表继承 apply_user_id + EXPAND 去冗余 + Update 组装 ────────────
+
+class _MapProvider:
+    def __init__(self, metas):
+        self.metas = metas
+
+    def load_table_meta(self, table_name):
+        return self.metas.get(table_name)
+
+
+def test_sub_table_user_propagation_and_update():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE biz_parent (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT, apply_user_id INTEGER, create_user INTEGER, finish INTEGER,
+        process_instance_id INTEGER, province TEXT, city TEXT, is_deleted INTEGER
+    )""")
+    conn.execute("""CREATE TABLE biz_child (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER,
+        item_name TEXT, create_user INTEGER, update_user INTEGER, is_deleted INTEGER
+    )""")
+    provider = _MapProvider({
+        "biz_parent": TableMeta(table_name="biz_parent", primary_key="id", fields=[
+            FieldMeta(name="title"),
+            FieldMeta(name="address", storage_type=StorageType.EXPAND,
+                      expand_fields={"province": "province", "city": "city"}),
+            FieldMeta(name="items", storage_type=StorageType.ONE2MANY,
+                      target_table="biz_child", foreign_key="parent_id"),
+        ]),
+        "biz_child": TableMeta(table_name="biz_child", primary_key="id", fields=[
+            FieldMeta(name="itemName"),
+        ]),
+    })
+    base = JdbcDynamicTableWriter(conn)
+    writer = MetaTableWriter(base, provider)
+    reader = MetaTableReader(JdbcTableReader(conn), provider)
+
+    operator = 1567738052492341249
+    pk = writer.insert("biz_parent", {
+        "title": "传播测试",
+        "apply_user_id": operator,
+        "address": {"province": "广东省", "city": "深圳市"},
+        "items": [{"itemName": "测试项目A"}],
+        "process_instance_id": 999,
+    })
+    assert pk is not None
+    # 子表 create_user = operator（不回落 "system"）
+    child_user = conn.execute("SELECT create_user FROM biz_child WHERE parent_id = ?", (pk,)).fetchone()[0]
+    assert child_user == operator, f"子表 create_user 应继承 operator: {child_user}"
+    # 主表 create_user 同 operator
+    parent_user = conn.execute("SELECT create_user FROM biz_parent WHERE id = ?", (pk,)).fetchone()[0]
+    assert parent_user == operator
+    # Update：EXPAND 展开列 + 状态字段直通（子表不参与中途更新）
+    writer.update("biz_parent", {
+        "address": {"province": "北京市", "city": "海淀区"},
+        "finish": 20,
+    }, "process_instance_id", 999)
+    province, city, finish = conn.execute(
+        "SELECT province, city, finish FROM biz_parent WHERE id = ?", (pk,)).fetchone()
+    assert (province, city, finish) == ("北京市", "海淀区", 20)
+    # 读侧：EXPAND 展开列不重复平铺带出（对象形式已消费）
+    result = reader.read_by_process_instance("biz_parent", 999)
+    assert result is not None
+    assert "province" not in result, f"EXPAND 展开列不应平铺: {result}"
+    assert result["address"]["city"] == "海淀区"
+    conn.close()

@@ -6,7 +6,7 @@ from .model import (
     FlowModel, FlowNode, FlowEdge,
     TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK, TYPE_JOIN, TYPE_CUSTOM,
     ProcessInstance, ProcessTask, ProcessDefine,
-    InstanceState, TaskState,
+    InstanceState, TaskState, SubmitType,
     parse_flow_model,
 )
 from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
@@ -96,6 +96,9 @@ class EngineImpl(Engine):
 
         cur_node = _find_node(flow, task.taskName)
         if cur_node:
+            # 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
+            # _create_task 不再触发（引擎语义修正），此处为完成任务节点的唯一触发点
+            await self._fire_post(cur_node, inst)
             ct = cur_node.properties.get("countersignType", "")
             if ct == "SEQUENTIAL":
                 doing = await self.repo.find_doing_tasks(inst.id)
@@ -195,11 +198,14 @@ class EngineImpl(Engine):
         return task, inst
 
     async def _execute_node(self, flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: str, vars_: dict):
+        # 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
+        # 任务完成的拦截器由 execute_process_task 显式触发，1.8.0 SYNC 同步演进）
+        if node.type in (TYPE_TASK, TYPE_CUSTOM):
+            await self._create_task(node, inst, operator, vars_)
+            return
         if not await self._fire_pre(node, inst): return
         try:
-            if node.type in (TYPE_TASK, TYPE_CUSTOM):
-                await self._create_task(node, inst, operator, vars_)
-            elif node.type == TYPE_DECISION:
+            if node.type == TYPE_DECISION:
                 await self._evaluate_decision(flow, inst, node, operator, vars_)
             elif node.type == TYPE_FORK:
                 for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_)
@@ -207,7 +213,12 @@ class EngineImpl(Engine):
                 if not await self.repo.find_doing_tasks(inst.id):
                     for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_)
             elif node.type == TYPE_END:
-                inst.finish(datetime.now())
+                # 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish
+                submit_type = inst.variables.get(KEY_SUBMIT_TYPE)
+                if submit_type is not None and int(submit_type) == int(SubmitType.REJECT):
+                    inst.reject(datetime.now())
+                else:
+                    inst.finish(datetime.now())
                 inst.variables = vars_
                 await self.repo.update_instance(inst)
                 await self._fire_event(ProcessEvent(EventType.PROCESS_FINISH, inst.id, operator=operator))

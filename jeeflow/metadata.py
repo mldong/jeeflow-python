@@ -74,11 +74,41 @@ class HandlerMeta:
     group: Optional[str] = None                    # 拦截器 pre/post 分组，可为空
 
 
+BUILTIN_ASSIGNMENT_METAS: list[HandlerMeta] = [
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler",
+                displayName="流程发起人", order=-9999),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptLeaderAssignmentHandler",
+                displayName="发起人所属部门经理", order=10),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptMainLeaderAssignmentHandler",
+                displayName="发起人所属部门分管领导", order=20),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptLeaderAssignmentHandler",
+                displayName="当前用户所属部门经理", order=30),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptMainLeaderAssignmentHandler",
+                displayName="当前用户所属部门分管领导", order=40),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler",
+                displayName="根据表单字段值分配参与者", order=50),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler",
+                displayName="根据任务节点唯一编码关联角色分配参与者", order=60),
+]
+
+
 class HandlerRegistry:
-    """处理器注册中心（可选能力：不注册不影响引擎加载行为）"""
+    """处理器注册中心（可选能力：不注册不影响引擎加载行为）
+
+    构造即内置 7 个通用 AssignmentHandler 元数据（v1.6.0 issues/16，
+    注册名与 Java 类全限定名一致，四语言通用）。
+    """
 
     def __init__(self):
         self._handlers: dict[str, list[HandlerMeta]] = {}
+        self.register_all(BUILTIN_ASSIGNMENT_METAS)
 
     def register(self, meta: HandlerMeta) -> None:
         self._handlers.setdefault(meta.type, []).append(meta)

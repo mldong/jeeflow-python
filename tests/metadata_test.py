@@ -55,10 +55,13 @@ def test_handler_registry():
                            displayName="日志记录", order=1, group="pre"))
 
     assignments = r.list_handlers("AssignmentHandler")
-    assert len(assignments) == 2
-    # order 升序
-    assert assignments[0].className == "com.example.BossHandler"
-    assert assignments[0].displayName == "老板审批"
+    # 内置 7 个通用 handler（v1.6.0 issues/16）+ 2 个自定义
+    assert len(assignments) == 9
+    # order 升序：内置 OperatorAssignmentHandler order=-9999 最前
+    assert assignments[0].className == "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler"
+    assert assignments[0].displayName == "流程发起人"
+    assert assignments[1].className == "com.example.BossHandler"
+    assert assignments[1].displayName == "老板审批"
 
     pre = r.list_handlers_group("FlowInterceptor", "pre")
     assert len(pre) == 1 and pre[0].className == "com.example.LogInterceptor"
@@ -69,5 +72,5 @@ def test_handler_registry():
 
 def test_empty_registry():
     r = HandlerRegistry()
-    assert r.list_handlers("AssignmentHandler") == []
-    assert r.list_handler_types() == []
+    # 构造即内置 7 个通用 handler（v1.6.0 issues/16），空注册表不再为空
+    assert len(r.list_handlers("AssignmentHandler")) == 7

@@ -116,14 +116,9 @@ class EngineImpl(Engine):
                 if doing: return await self.repo.find_instance_by_id(inst.id)
 
             for node in _follow_edges(flow, cur_node.id):
-                if node.type == TYPE_END:
-                    # 聚合根：流程完成
-                    inst.finish(datetime.now())
-                    inst.variables = vars_
-                    await self.repo.update_instance(inst)
-                    await self._fire_event(ProcessEvent(EventType.PROCESS_FINISH, inst.id, operator=operator))
-                else:
-                    await self._execute_node(flow, inst, node, operator, vars_)
+                # 统一走 _execute_node：结束节点也经节点执行链（拦截器/事件完整触发），
+                # _execute_node 内部 TYPE_END 分支完成聚合根 finish + 事件发布
+                await self._execute_node(flow, inst, node, operator, vars_)
         return await self.repo.find_instance_by_id(inst.id)
 
     # ─── Reject ───────────────────────────────────────────────────────────────

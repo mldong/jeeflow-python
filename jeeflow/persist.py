@@ -82,6 +82,9 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         # 用户列默认值（issues/19）：优先取 data 中已注入的 apply_user_id=流程 operator，
         # 否则用此配置值，缺省 "system"——多数框架业务表 create_user/update_user 为 BIGINT 存 userId
         self.default_user_value: Any = "system"
+        # 列匹配（issues/20）：默认宽松——驼峰↔下划线归一匹配（表单字段 companyName ↔ 表列 company_name）；
+        # 需要精确控制列名的集成方显式开启严格模式（忽略大小写精确匹配）
+        self.strict_column_match: bool = False
         self._cache: dict[str, list[str]] = {}
 
     # ── 表结构探测 ──
@@ -109,26 +112,21 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
 
     def filter_columns(self, table_name: str, columns: Sequence[str]) -> list[str]:
         _check_table_name(table_name)
-        upper_set = set(self._table_columns(table_name))
-        return [c for c in columns if c.upper() in upper_set]
+        cols = self._table_columns(table_name)
+        return [c for c in columns if self._find_table_column(cols, c) is not None]
 
     def insert(self, table_name: str, data: dict[str, Any]) -> Any:
         _check_table_name(table_name)
-        upper_set = set(self._table_columns(table_name))
+        cols = self._table_columns(table_name)
         names: list[str] = []
         values: list[Any] = []
-        # 保持插入顺序稳定（data 无序，按表列顺序取）
-        for col in self._table_columns(table_name):
-            v = data.get(col)
-            if v is None and col not in data:
-                # 大小写变体匹配
-                v = next((vv for k, vv in data.items() if k.upper() == col), None)
-                if v is None:
-                    continue
-            elif v is None and col in data:
-                pass  # 显式 null 值，保留
+        # 保持插入顺序稳定（data 无序，按表列顺序取）；写入用表列原名（issues/20）
+        for col in cols:
+            key = self._find_data_key(data, col)
+            if key is None:
+                continue
             names.append(col)
-            values.append(v)
+            values.append(data[key])
         if not names:
             raise ValueError(f"persist: no matching columns for {table_name}")
         placeholder = "?" if self._dialect in ("sqlite", "h2") else "%s"
@@ -169,6 +167,29 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         （拦截器场景 = 流程 operator，BIGINT 用户列表开箱即用），否则回落配置默认值。"""
         operator = data.get("apply_user_id")
         return operator if operator is not None else self.default_user_value
+
+    # ── 列匹配（issues/20）──
+
+    def _find_table_column(self, cols: Sequence[str], key: str) -> Optional[str]:
+        """在表列中匹配输入 key：宽松（默认）驼峰↔下划线归一；严格忽略大小写精确。"""
+        for col in cols:
+            if self.strict_column_match:
+                if col.upper() == key.upper():
+                    return col
+            elif self._normalize(col) == self._normalize(key):
+                return col
+        return None
+
+    def _find_data_key(self, data: dict[str, Any], col: str) -> Optional[str]:
+        for k in data:
+            if self._find_table_column([col], k) is not None:
+                return k
+        return None
+
+    @staticmethod
+    def _normalize(name: str) -> str:
+        """列名归一：转小写 + 去下划线（companyName / company_name / COMPANY_NAME 等价）"""
+        return name.lower().replace("_", "")
 
 
 def _check_table_name(table_name: str) -> None:

@@ -266,3 +266,29 @@ def test_writer_default_user_value():
     writer.fill_system_fields(data2, True)
     assert data2["create_user"] == 0
     conn.close()
+
+
+# ─── ⑫ 宽松列匹配（issues/20）：驼峰表单字段 ↔ 下划线表列 ─────────────────────
+
+def test_loose_camel_match():
+    conn, writer = setup_db()
+    conn.execute("ALTER TABLE biz_leave ADD COLUMN start_time TEXT")
+    writer.insert("biz_leave", {"startTime": "09:00:00", "processInstanceId": 55,
+                                "title": "camel"})
+    row = conn.execute("SELECT start_time, process_instance_id FROM biz_leave").fetchone()
+    assert row == ("09:00:00", 55), f"驼峰 key 应落到下划线列: {row}"
+    kept = writer.filter_columns("biz_leave", ["startTime", "processInstanceId", "no_such"])
+    assert set(kept) == {"startTime", "processInstanceId"}
+    conn.close()
+
+
+# ─── ⑬ 严格列匹配（issues/20）：显式开启后驼峰不再匹配 ────────────────────────
+
+def test_strict_column_match():
+    conn, writer = setup_db()
+    conn.execute("ALTER TABLE biz_leave ADD COLUMN start_time TEXT")
+    writer.strict_column_match = True
+    writer.insert("biz_leave", {"startTime": "09:00:00", "title": "strict"})
+    row = conn.execute("SELECT title, start_time FROM biz_leave").fetchone()
+    assert row == ("strict", None), f"严格模式应过滤驼峰 key: {row}"
+    conn.close()

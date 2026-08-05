@@ -196,7 +196,8 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
     def exists(self, table_name: str, biz_key: str, biz_key_value: Any) -> bool:
         _check_table_name(table_name)
         self._table_columns(table_name)  # 表不存在提前报错
-        query = f"SELECT COUNT(1) FROM {table_name} WHERE {biz_key} = ?"
+        # 占位符走方言（issues/33 遗留：exists 的 ? 未走 _placeholder，pymysql 需 %s）
+        query = f"SELECT COUNT(1) FROM {table_name} WHERE {biz_key} = {self._placeholder()}"
         row = self._execute(query, (biz_key_value,)).fetchone()
         return bool(row and row[0] > 0)
 
@@ -214,7 +215,8 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
                 continue  # 条件列不参与 SET
             key = self._find_data_key(data, col.name)
             if key is not None:
-                sets.append(f"{col.name} = ?")
+                # SET 占位符走方言（issues/33 遗留：SET 的 ? 未走 _placeholder，pymysql 需 %s）
+                sets.append(f"{col.name} = {self._placeholder()}")
                 values.append(data[key])
         if not sets:
             return 0  # 无更新列（如结束节点仅状态探测未命中）

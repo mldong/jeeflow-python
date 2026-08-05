@@ -259,16 +259,13 @@ class EngineImpl(Engine):
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict):
         actors = await self._resolve_actors(node, inst, operator, vars_)
         if not actors: return
-        # performType 容错解析（对齐 Java codeOf）：int 优先；字符串枚举名（如旧版 "ANY"）映射；
-        # 未知回落 0（普通参与）——issues 待反馈：python 引擎解析兼容 Java 流程格式
+        # performType 容错解析（对齐 Java codeOf，issue 42）：int 优先；
+        # 字符串 'ALL'/'COUNTERSIGN'（设计器面板格式，大小写不敏感）映射为会签；未知回落 0
         _pt = node.properties.get("performType", 0)
         try:
             perform_type = int(_pt)
         except (ValueError, TypeError):
-            try:
-                perform_type = PerformType[str(_pt).upper()].value
-            except (KeyError, AttributeError):
-                perform_type = 0
+            perform_type = 1 if str(_pt).strip().upper() in ("ALL", "COUNTERSIGN") else 0
         ct = node.properties.get("countersignType", "")
         now = datetime.now()
         form = node.properties.get("form", "")

@@ -649,7 +649,7 @@ class JeeflowFacade:
             node = next((n for n in flow.get("nodes", []) if n.get("id") == name), None)
             props = (node or {}).get("properties", {}) or {}
             cs_type = props.get("countersignType")
-            is_cs = cs_type is not None or str(props.get("performType")) == "1"
+            is_cs = cs_type is not None or str(props.get("performType", "")).strip().upper() in ("1", "ALL", "COUNTERSIGN")
             members_out = []
             for uid in members:
                 m = {"id": uid, "name": ""}

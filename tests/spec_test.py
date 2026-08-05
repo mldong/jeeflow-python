@@ -791,3 +791,26 @@ async def test_highlight_node_progress():
     np3 = (await facade.flow("processInstance/highLight", {"id": instance_id}))["data"]["nodeProgress"]
     m3 = np3["task1"]["members"]
     assert m3[0].get("done") is True and m3[1].get("done") is True and "active" not in m3[1], m3
+
+
+@pytest.mark.asyncio
+async def test_perform_type_string_compat():
+    """performType 字符串兼容（issue 42）：'ALL' 面板格式会签行为与数字 1 一致"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "05-countersign-parallel.json"), encoding="utf-8") as f:
+        content = f.read()
+    # 面板格式：performType 存 'ALL' 字符串
+    r0 = await facade.flow("processDefine/deploy", {"content": content.replace('"performType": 1', '"performType": "ALL"')})
+    assert r0["code"] == 0, r0
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r0["data"]["processDefineId"], "operator": "user1"})
+    assert r1["code"] == 0, r1
+    doing = await repo.find_doing_tasks(int(r1["data"]["processInstanceId"]))
+    cs = [t.actorIds[0] for t in doing if t.taskName == "task1"]
+    assert len(cs) == 3, f"ALL 格式应生成 3 个会签任务: {cs}"
+    assert sorted(cs) == ["userA", "userB", "userC"], cs
+    # nodeProgress 对 ALL 格式同样识别为会签
+    hl = await facade.flow("processInstance/highLight", {"id": r1["data"]["processInstanceId"]})
+    assert hl["code"] == 0, hl
+    assert hl["data"]["nodeProgress"]["task1"]["type"] == "PARALLEL", hl["data"]["nodeProgress"]

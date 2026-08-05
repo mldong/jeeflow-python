@@ -772,6 +772,8 @@ async def test_highlight_node_progress():
     assert np["task1"]["type"] == "SEQUENTIAL", np["task1"]
     m = np["task1"]["members"]
     assert m[0]["id"] == "userA" and m[0].get("active") is True, m
+    # 姓名走 UserProvider SPI 解析（_TestUserProv realName = '用户' + id）
+    assert m[0]["name"] == "用户userA", m
     assert m[1]["id"] == "userB" and "done" not in m[1] and "active" not in m[1], m
     # 推进会签：userA done → userB active
     doing = await repo.find_doing_tasks(int(instance_id))

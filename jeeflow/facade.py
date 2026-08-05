@@ -619,7 +619,7 @@ class JeeflowFacade:
         if def_:
             try:
                 flow = json.loads(def_.content)
-                node_progress = self._build_node_progress(flow, his)
+                node_progress = await self._build_node_progress(flow, his)
                 await self._collect_path(flow, "start", "", active, history, edges, set(),
                                          inst.variables, his)
             except Exception:
@@ -627,7 +627,7 @@ class JeeflowFacade:
         return {"activeNodeNames": active, "historyNodeNames": history,
                 "historyEdgeNames": edges, "nodeProgress": node_progress}
 
-    def _build_node_progress(self, flow: dict, tasks: list) -> dict:
+    async def _build_node_progress(self, flow: dict, tasks: list) -> dict:
         """节点成员进度（issue 41，对齐 boot3 highLight）：按任务状态 + 会签变量组装。
         会签节点带 type（PARALLEL/SEQUENTIAL）；done 按任务完成状态逐人标记，
         active = 进行中任务首位；动态参与人无静态成员不返回；name 缺省（前端降级显示 id）"""
@@ -650,9 +650,19 @@ class JeeflowFacade:
             props = (node or {}).get("properties", {}) or {}
             cs_type = props.get("countersignType")
             is_cs = cs_type is not None or str(props.get("performType", "")).strip().upper() in ("1", "ALL", "COUNTERSIGN")
+            # 姓名走 UserProvider SPI 解析（issue 41 补强）：未注入/查不到缺省空串
+            name_map = {}
+            if self._engine.user_prov is not None:
+                for uid in members:
+                    try:
+                        u = await self._engine.user_prov.get_user(uid)
+                        if u and u.realName:
+                            name_map[uid] = u.realName
+                    except Exception:
+                        pass  # 单用户失败不影响其余
             members_out = []
             for uid in members:
-                m = {"id": uid, "name": ""}
+                m = {"id": uid, "name": name_map.get(uid, "")}
                 if uid in done_set:
                     m["done"] = True
                 elif uid == active_actor:

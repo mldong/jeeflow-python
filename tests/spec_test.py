@@ -361,7 +361,7 @@ async def test_facade_deploy_version():
 
     r = await facade.flow("processDefine/deploy", {"content": content})
     assert r["code"] == 0, r
-    define_id = r["data"]["processDefineId"]
+    define_id = int(r["data"]["processDefineId"])
     d1 = await repo.find_define_by_id(define_id)
     assert d1.version == 0, f"首次部署 version = {d1.version}, want 0"
 
@@ -392,7 +392,7 @@ async def test_facade_instance_task_and_withdraw():
     r = await facade.flow("processInstance/startAndExecute",
                           {"processDefineId": define_id, "operator": "zhangsan", "amount": "1000"})
     assert r["code"] == 0, r
-    instance_id = r["data"]["processInstanceId"]
+    instance_id = int(r["data"]["processInstanceId"])
 
     doing = await repo.find_doing_tasks(instance_id)
     assert len(doing) == 1 and doing[0].taskName == "task1", [t.taskName for t in doing]
@@ -433,7 +433,7 @@ async def test_facade_design_and_surrogate():
 
     r = await facade.flow("processDesign/deploy", {"id": design_id, "operator": "zhangsan"})
     assert r["code"] == 0, r
-    assert r["data"]["processDefineId"] > 0
+    assert int(r["data"]["processDefineId"]) > 0
 
     r = await facade.flow("processSurrogate/save",
                           {"operator": "zhangsan", "surrogate": "lisi", "processName": "leave"})
@@ -490,7 +490,7 @@ async def test_facade_view_endpoints():
     r = await facade.flow("processInstance/getAssigneeTextData", {"id": instance_id})
     assert r["code"] == 0 and len(r["data"]) == 1, r  # task1 → leader
 
-    doing = await repo.find_doing_tasks(instance_id)
+    doing = await repo.find_doing_tasks(int(instance_id))
     r = await facade.flow("processTask/detail", {"id": doing[0].id, "operator": "leader"})
     assert r["code"] == 0 and r["data"]["executable"] is True, r
     assert r["data"]["taskModel"] is not None, r
@@ -645,7 +645,7 @@ async def test_design_deploy_redeploy_is_deployed():
     r = await facade.flow("processDesign/save", {"name": "leave08", "displayName": "请假流程08",
                                                  "content": content, "operator": "zhangsan"})
     assert r["code"] == 0, r
-    design_id = r["data"]["id"]
+    design_id = int(r["data"]["id"])
     assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 0
 
     # 部署 → is_deployed=1
@@ -720,3 +720,29 @@ async def test_form_data_contract():
     r = await facade.flow("processInstance/approvalRecord", {"id": inst_id})
     assert r["code"] == 0, r
     assert any(row.get("ext") is not None for row in r["data"]), r
+
+
+@pytest.mark.asyncio
+async def test_snowflake_id_string_roundtrip():
+    """Java 雪花 id（>2^53）跨语言共享（issue 38 E9）：入口字符串精确 + 出口 string"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    snow = 2084320543834124290
+    await repo.save_define(ProcessDefine(id=snow, name="snow-flow", displayName="雪花流程", type="approval",
+                                   state=1, content=content, version=1,
+                                   createTime=__import__("datetime").datetime.now(),
+                                   updateTime=__import__("datetime").datetime.now(),
+                                   createUser="", updateUser=""))
+    # 前端回传字符串雪花 id → 引擎精确解析（_to_int 无损）
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": str(snow), "operator": "user1"})
+    assert r["code"] == 0, r
+    # 出口 id 必须是 string（JS number 无法承载雪花值）
+    assert isinstance(r["data"]["processInstanceId"], str), r
+    # 列表行 id 也为 string
+    r2 = await facade.flow("processDefine/page", {"pageNum": 1, "pageSize": 10})
+    assert r2["code"] == 0, r2
+    row = [x for x in r2["data"]["rows"] if x["name"] == "snow-flow"][0]
+    assert row["id"] == str(snow), row

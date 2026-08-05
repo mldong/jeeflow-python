@@ -582,7 +582,7 @@ async def test_facade_listByType_and_topLevelJson():
     assert r["code"] == 0, r
     groups = r["data"]
     assert "approval" in groups and groups["approval"][0]["name"] == "topjson"
-    assert groups["approval"][0]["processDesignId"] == 1
+    assert groups["approval"][0]["processDesignId"] == "1"  # 出口 id string（issue 38 E9）
     assert groups["approval"][0]["jsonObject"] is not None
 
     # 真实流程（01-simple + relTableName 注入）供 bizData 测试

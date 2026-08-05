@@ -63,7 +63,9 @@ class JeeflowFacade:
             if handler is None:
                 return self._error(f"未知 action: {action}")
             data = await handler(args)
-            return self._ok(data)
+            # issues/38 E9 出口统一：id 类字段转 string（对齐 Node 全程 string / Java 全局
+            # ToStringSerializer）——前端 JS number 无法承载雪花 id（>2^53）
+            return self._ok(_stringify_ids(data))
         except Exception as e:
             return self._error(str(e))
 
@@ -1075,3 +1077,23 @@ class JeeflowFacade:
                 "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
                 "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion,
                 "taskFormData": self._form_data_of(ext, "tf_")}  # issues/15
+
+
+def _is_id_key(k: str) -> bool:
+    """id 类字段名判定（对齐 Java 实体 id 命名）：精确 'id' 或以 'Id' 结尾
+    （processDefineId/processInstanceId/processTaskId/processDesignId/parentId/...）"""
+    return k == "id" or k.endswith("Id")
+
+
+def _stringify_ids(v):
+    """出口 id 统一 string 化（issues/38 E9，对齐 Node 全程 string / Java 全局
+    ToStringSerializer）——递归处理 dict/list；id 类字段的 int 值转 str，
+    None 保持 None（parentId 无值不出 'None'），字符串直通。"""
+    if isinstance(v, dict):
+        return {k: (_stringify_ids(val) if not _is_id_key(k) else
+                    (None if val is None else
+                     (str(val) if isinstance(val, int) and not isinstance(val, bool) else val)))
+                for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_stringify_ids(x) for x in v]
+    return v

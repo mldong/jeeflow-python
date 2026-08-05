@@ -208,7 +208,7 @@ class JdbcRepository(ProcessRepository):
         return ProcessDefine(
             id=row[0], name=row[1], displayName=row[2], type=row[3], state=row[4],
             content=row[5].decode() if isinstance(row[5], (bytes, bytearray)) else (row[5] or ""),
-            version=row[6], createTime=row[7], createUser=row[8], updateTime=row[9], updateUser=row[10],
+            version=row[6], createTime=row[7], createUser=_user_str(row[8]), updateTime=row[9], updateUser=_user_str(row[10]),
         )
 
     async def find_define_by_id(self, id: int) -> Optional[ProcessDefine]:
@@ -222,7 +222,7 @@ class JdbcRepository(ProcessRepository):
         return ProcessDefine(
             id=row[0], name=row[1], displayName=row[2], type=row[3], state=row[4],
             content=row[5].decode() if isinstance(row[5], (bytes, bytearray)) else (row[5] or ""),
-            version=row[6], createTime=row[7], createUser=row[8], updateTime=row[9], updateUser=row[10],
+            version=row[6], createTime=row[7], createUser=_user_str(row[8]), updateTime=row[9], updateUser=_user_str(row[10]),
         )
 
     # 定义写操作（v1.0.1，集成反馈①）。SQL 与 jeeflow-java JdbcProcessRepository 对齐；
@@ -282,7 +282,7 @@ class JdbcRepository(ProcessRepository):
         inst = ProcessInstance(
             id=row[0], parentId=row[1], defineId=row[2], state=InstanceState(row[3]),
             parentNodeName=row[4], businessNo=row[5], operator=row[6], expireTime=row[7],
-            createTime=row[9], createUser=row[10], updateTime=row[11], updateUser=row[12],
+            createTime=row[9], createUser=_user_str(row[10]), updateTime=row[11], updateUser=_user_str(row[12]),
         )
         if row[8]:
             inst.variables = json.loads(row[8])
@@ -397,7 +397,7 @@ class JdbcRepository(ProcessRepository):
             id=row[0], processInstanceId=row[1], taskName=row[2], displayName=row[3],
             taskType=row[4], performType=row[5], taskState=TaskState(row[6]), actorId=row[7],
             finishTime=row[8], expireTime=row[9], formKey=row[10], parentTaskId=row[11],
-            createTime=row[13], createUser=row[14], updateTime=row[15], updateUser=row[16],
+            createTime=row[13], createUser=_user_str(row[14]), updateTime=row[15], updateUser=_user_str(row[16]),
         )
         task.actorIds = actors
         if row[12]:
@@ -494,8 +494,8 @@ class JdbcRepository(ProcessRepository):
         return CcInstanceRow(
             id=r[0], parentId=r[1], defineId=r[2], state=InstanceState(r[3]),
             parentNodeName=r[4], businessNo=r[5], operator=r[6], expireTime=r[7],
-            variables=variables, createTime=r[9], createUser=r[10],
-            updateTime=r[11], updateUser=r[12],
+            variables=variables, createTime=r[9], createUser=_user_str(r[10]),
+            updateTime=r[11], updateUser=_user_str(r[12]),
             defineName=r[13], defineDisplayName=r[14], defineVersion=r[15] or 0)
 
     # ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
@@ -512,8 +512,8 @@ class JdbcRepository(ProcessRepository):
                 " update_time, update_user" + where + " ORDER BY t.id DESC LIMIT ? OFFSET ?"),
                 (*cond_args, page_size, (page_num - 1) * page_size))
         return [DefineRow(id=r[0], name=r[1], displayName=r[2], type=r[3], state=r[4],
-                          version=r[5], createTime=r[6], createUser=r[7],
-                          updateTime=r[8], updateUser=r[9]) for r in rows], total
+                          version=r[5], createTime=r[6], createUser=_user_str(r[7]),
+                          updateTime=r[8], updateUser=_user_str(r[9])) for r in rows], total
 
     async def page_instances(self, page_num: int = 1, page_size: int = 10,
                              operator: Optional[str] = None,
@@ -574,8 +574,8 @@ class JdbcRepository(ProcessRepository):
         return InstanceRow(
             id=r[0], parentId=r[1], defineId=r[2], state=InstanceState(r[3]),
             parentNodeName=r[4], businessNo=r[5], operator=r[6], expireTime=r[7],
-            variables=variables, createTime=r[9], createUser=r[10],
-            updateTime=r[11], updateUser=r[12],
+            variables=variables, createTime=r[9], createUser=_user_str(r[10]),
+            updateTime=r[11], updateUser=_user_str(r[12]),
             defineName=r[13], defineDisplayName=r[14], defineVersion=r[15] or 0)
 
     def _map_task_row(self, r: Sequence[Any]) -> TaskRow:
@@ -585,7 +585,13 @@ class JdbcRepository(ProcessRepository):
             id=r[0], processInstanceId=r[1], taskName=r[2], displayName=r[3],
             taskType=r[4], performType=r[5], taskState=TaskState(r[6]), operator=r[7],
             finishTime=r[8], expireTime=r[9], formKey=r[10], taskParentId=r[11],
-            variables=variables, createTime=r[13], createUser=r[14],
-            updateTime=r[15], updateUser=r[16],
+            variables=variables, createTime=r[13], createUser=_user_str(r[14]),
+            updateTime=r[15], updateUser=_user_str(r[16]),
             processDefineName=r[17], processDefineDisplayName=r[18],
             defineVersion=r[19] or 0, instanceVariable=r[20] or "", instanceCreateTime=r[21])
+
+
+def _user_str(v):
+    """审计用户列归一化（issue 38 E9 防御）：BIGINT 雪花 userId 列读回 int 时转 str，
+    VARCHAR 列 str 直通，NULL 保持 None"""
+    return None if v is None else str(v)

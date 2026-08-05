@@ -155,7 +155,7 @@ class JdbcProcessExtRepository(ProcessExtRepository):
         for r in rows:
             content = r[2].decode() if isinstance(r[2], (bytes, bytearray)) else (r[2] or "")
             result.append(ProcessDesignHis(id=r[0], processDesignId=r[1], content=content,
-                                           createTime=r[3], createUser=r[4]))
+                                           createTime=r[3], createUser=_user_str(r[4])))
         return result
 
     # ── 委托代理 ─────────────────────────────────────────────────────────────
@@ -251,14 +251,14 @@ class JdbcProcessExtRepository(ProcessExtRepository):
     @staticmethod
     def _map_design(r: Sequence[Any]) -> ProcessDesign:
         return ProcessDesign(id=r[0], name=r[1], displayName=r[2], type=r[3], icon=r[4],
-                             isDeployed=r[5], remark=r[6], createTime=r[7], createUser=r[8],
-                             updateTime=r[9], updateUser=r[10])
+                             isDeployed=r[5], remark=r[6], createTime=r[7], createUser=_user_str(r[8]),
+                             updateTime=r[9], updateUser=_user_str(r[10]))
 
     @staticmethod
     def _map_surrogate(r: Sequence[Any]) -> ProcessSurrogate:
         return ProcessSurrogate(id=r[0], processName=r[1], operator=r[2], surrogate=r[3],
                                 startTime=r[4], endTime=r[5], enabled=r[6], createTime=r[7],
-                                createUser=r[8], updateTime=r[9], updateUser=r[10])
+                                createUser=_user_str(r[8]), updateTime=r[9], updateUser=_user_str(r[10]))
 
 
 # ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══

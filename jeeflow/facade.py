@@ -614,15 +614,55 @@ class JeeflowFacade:
             if t.taskName not in active and t.taskName not in history:
                 history.append(t.taskName)
         # 路径补全：start 沿边递归（遇活跃节点停止）
+        node_progress = {}
         def_ = await self._repo.find_define_by_id(inst.defineId)
         if def_:
             try:
                 flow = json.loads(def_.content)
+                node_progress = self._build_node_progress(flow, his)
                 await self._collect_path(flow, "start", "", active, history, edges, set(),
                                          inst.variables, his)
             except Exception:
                 pass
-        return {"activeNodeNames": active, "historyNodeNames": history, "historyEdgeNames": edges}
+        return {"activeNodeNames": active, "historyNodeNames": history,
+                "historyEdgeNames": edges, "nodeProgress": node_progress}
+
+    def _build_node_progress(self, flow: dict, tasks: list) -> dict:
+        """节点成员进度（issue 41，对齐 boot3 highLight）：按任务状态 + 会签变量组装。
+        会签节点带 type（PARALLEL/SEQUENTIAL）；done 按任务完成状态逐人标记，
+        active = 进行中任务首位；动态参与人无静态成员不返回；name 缺省（前端降级显示 id）"""
+        from .model import TaskState
+        progress = {}
+        for name in dict.fromkeys(t.taskName for t in tasks):
+            ts = [t for t in tasks if t.taskName == name]
+            vars_ = ts[0].variables or {}
+            # 完整办理人列表：会签变量 operatorList_{node} 优先（顺序会签全量），否则任务 actorIds 并集
+            members = vars_.get(f"operatorList_{name}")
+            if not members:
+                members = list(dict.fromkeys(a for t in ts for a in (t.actorIds or [])))
+            if not members:
+                continue  # 动态参与人：无静态成员，不返回
+            done_set = {a for t in ts if t.taskState == TaskState.DONE for a in (t.actorIds or [])}
+            active_actor = next((t.actorIds[0] for t in ts
+                                 if t.taskState == TaskState.DOING and t.actorIds), None)
+            # 会签判定：定义节点属性（引擎创建任务时 performType 未落任务表，取模型为准）
+            node = next((n for n in flow.get("nodes", []) if n.get("id") == name), None)
+            props = (node or {}).get("properties", {}) or {}
+            cs_type = props.get("countersignType")
+            is_cs = cs_type is not None or str(props.get("performType")) == "1"
+            members_out = []
+            for uid in members:
+                m = {"id": uid, "name": ""}
+                if uid in done_set:
+                    m["done"] = True
+                elif uid == active_actor:
+                    m["active"] = True
+                members_out.append(m)
+            item = {"members": members_out}
+            if is_cs and cs_type:
+                item["type"] = cs_type
+            progress[name] = item
+        return progress
 
     async def _collect_path(self, flow: dict, node_id: str, edge_name: str,
                             active: list, history: list, edges: list, visited: set,

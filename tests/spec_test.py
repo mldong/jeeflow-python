@@ -746,3 +746,48 @@ async def test_snowflake_id_string_roundtrip():
     assert r2["code"] == 0, r2
     row = [x for x in r2["data"]["rows"] if x["name"] == "snow-flow"][0]
     assert row["id"] == str(snow), row
+
+
+@pytest.mark.asyncio
+async def test_highlight_node_progress():
+    """highLight nodeProgress 成员进度回显（issue 41）：顺序会签进行中/推进/完成"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "06-countersign-sequential.json"), encoding="utf-8") as f:
+        content = f.read()
+    r0 = await facade.flow("processDefine/deploy", {"content": content})
+    assert r0["code"] == 0, r0
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r0["data"]["processDefineId"], "operator": "user1"})
+    assert r1["code"] == 0, r1
+    instance_id = r1["data"]["processInstanceId"]
+
+    hl = await facade.flow("processInstance/highLight", {"id": instance_id})
+    assert hl["code"] == 0, hl
+    np = hl["data"]["nodeProgress"]
+    # 历史节点 apply：发起人 done
+    assert np["apply"]["members"][0]["id"] == "user1"
+    assert np["apply"]["members"][0]["done"] is True
+    # 顺序会签进行中：type=SEQUENTIAL、userA active、userB 无标记
+    assert np["task1"]["type"] == "SEQUENTIAL", np["task1"]
+    m = np["task1"]["members"]
+    assert m[0]["id"] == "userA" and m[0].get("active") is True, m
+    assert m[1]["id"] == "userB" and "done" not in m[1] and "active" not in m[1], m
+    # 推进会签：userA done → userB active
+    doing = await repo.find_doing_tasks(int(instance_id))
+    await repo.add_task_actor(doing[0].id, ["userA"])
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": doing[0].id, "operator": "userA", "submitType": 1})
+    assert r["code"] == 0, r
+    np2 = (await facade.flow("processInstance/highLight", {"id": instance_id}))["data"]["nodeProgress"]
+    m2 = np2["task1"]["members"]
+    assert m2[0].get("done") is True and m2[1].get("active") is True, m2
+    # 全部完成 → 全部 done
+    doing2 = await repo.find_doing_tasks(int(instance_id))
+    await repo.add_task_actor(doing2[0].id, ["userB"])
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": doing2[0].id, "operator": "userB", "submitType": 1})
+    assert r["code"] == 0, r
+    np3 = (await facade.flow("processInstance/highLight", {"id": instance_id}))["data"]["nodeProgress"]
+    m3 = np3["task1"]["members"]
+    assert m3[0].get("done") is True and m3[1].get("done") is True and "active" not in m3[1], m3

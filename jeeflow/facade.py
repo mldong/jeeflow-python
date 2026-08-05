@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import inspect
+import asyncio
 import json
 from datetime import datetime
 from typing import Any, Optional
@@ -650,16 +651,16 @@ class JeeflowFacade:
             props = (node or {}).get("properties", {}) or {}
             cs_type = props.get("countersignType")
             is_cs = cs_type is not None or str(props.get("performType", "")).strip().upper() in ("1", "ALL", "COUNTERSIGN")
-            # 姓名走 UserProvider SPI 解析（issue 41 补强）：未注入/查不到缺省空串
+            # 姓名走 UserProvider SPI 解析（issue 43/E15）：asyncio.gather 并行批量，查不到缺省空串
             name_map = {}
             if self._engine.user_prov is not None:
-                for uid in members:
-                    try:
-                        u = await self._engine.user_prov.get_user(uid)
-                        if u and u.realName:
-                            name_map[uid] = u.realName
-                    except Exception:
-                        pass  # 单用户失败不影响其余
+                us = await asyncio.gather(*[self._engine.user_prov.get_user(uid) for uid in members],
+                                          return_exceptions=True)
+                for uid, u in zip(members, us):
+                    if isinstance(u, Exception):
+                        continue  # 单用户失败不影响其余
+                    if u and u.realName:
+                        name_map[uid] = u.realName
             members_out = []
             for uid in members:
                 m = {"id": uid, "name": name_map.get(uid, "")}

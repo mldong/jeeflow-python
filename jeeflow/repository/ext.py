@@ -10,7 +10,7 @@ from typing import Any, Optional, Sequence
 
 from ..model import ProcessDesign, ProcessDesignHis, ProcessSurrogate
 from ..spi import IDGenerator, ProcessExtRepository, QueryCondition
-from .base import SqlAdapter, TsIDGenerator, convert_placeholder, _tx_conn_var
+from .base import SqlAdapter, TsIDGenerator, convert_placeholder, _tx_conn_var, _user_str
 
 
 class JdbcProcessExtRepository(ProcessExtRepository):

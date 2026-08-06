@@ -261,11 +261,17 @@ class JeeflowFacade:
         if not inst:
             raise ValueError("流程实例不存在")
         # 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：update_instance 级联落库）
+        # 注意：find_instance_by_id 不加载 tasks（空），必须按实例查 doing 任务废弃
         operator = str(args.get("operator", "user1"))
         now = datetime.now()
-        abandoned = inst.abandon_all_doing(now)
+        abandoned = []
+        for t in await self._repo.find_doing_tasks(instance_id):
+            t.abandon(now)
+            abandoned.append(t)
         inst.withdraw(now)  # issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
         inst.updateUser = operator
+        # 级联覆盖防护（issues/57 补正）：废弃副本同步回聚合（update_instance 级联覆盖防护）
+        inst.tasks = abandoned
         for t in abandoned:
             await self._repo.update_task(t)
         await self._repo.update_instance(inst)

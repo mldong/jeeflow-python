@@ -816,3 +816,45 @@ async def test_perform_type_string_compat():
     hl = await facade.flow("processInstance/highLight", {"id": r1["data"]["processInstanceId"]})
     assert hl["code"] == 0, hl
     assert hl["data"]["nodeProgress"]["task1"]["type"] == "PARALLEL", hl["data"]["nodeProgress"]
+
+
+@pytest.mark.asyncio
+async def test_e2e_feedback_regression():
+    """E2E 反馈回归（issues 53/52/56/50/54）：撤回状态 30 / performType 落库 / 抄送 / design page / upAndDown 批量"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    # 56：发起时抄送
+    r0 = await facade.flow("processDefine/deploy", {"content": content})
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r0["data"]["processDefineId"], "operator": "user1",
+                            "f_ccActors": "wangqiang,zhaomin"})
+    assert r1["code"] == 0, r1
+    cc_rows, cc_total = await repo.page_cc_instances(1, 10, "wangqiang")
+    assert cc_total >= 1, f"抄送应创建: {cc_total}"
+    # 53：撤回状态 30
+    wr = await facade.flow("processInstance/withdraw", {"id": r1["data"]["processInstanceId"], "operator": "user1"})
+    assert wr["code"] == 0, wr
+    after = await repo.find_instance_by_id(int(r1["data"]["processInstanceId"]))
+    assert after.state == InstanceState.WITHDRAW, f"撤回状态应=30: {after.state}"
+    # 52：会签 performType 落库
+    with open(os.path.join(FLOW_DIR, "05-countersign-parallel.json"), encoding="utf-8") as f:
+        cs_content = f.read()
+    r2 = await facade.flow("processDefine/deploy", {"content": cs_content})
+    r3 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r2["data"]["processDefineId"], "operator": "user1"})
+    cs_doing = await repo.find_doing_tasks(int(r3["data"]["processInstanceId"]))
+    cs = [t for t in cs_doing if t.taskName == "task1"]
+    assert len(cs) == 3 and all(t.performType == 1 for t in cs), f"会签任务 performType 应=1: {[t.performType for t in cs]}"
+    # 54：upAndDown 批量 {ids, opType}
+    r4 = await facade.flow("processDefine/upAndDown",
+                           {"ids": [r0["data"]["processDefineId"], r2["data"]["processDefineId"]], "opType": 0})
+    assert r4["code"] == 0, r4
+    d1 = await repo.find_define_by_id(int(r0["data"]["processDefineId"]))
+    assert d1.state == 0, f"批量停用应生效: {d1.state}"
+    # 50：design page id 字符串化
+    r5 = await facade.flow("processDesign/page", {"pageNum": 1, "pageSize": 10})
+    assert r5["code"] == 0, r5
+    if r5["data"]["rows"]:
+        assert isinstance(r5["data"]["rows"][0]["id"], str), f"design id 应为 string: {r5['data']['rows'][0]['id']}"

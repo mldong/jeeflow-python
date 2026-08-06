@@ -153,6 +153,11 @@ class ProcessInstance:
         self.state = InstanceState.DONE
         self.updateTime = now
 
+    def withdraw(self, now) -> None:
+        """撤回流程（issues/53 E25：withdraw 用 Withdraw(30)，与 reject 区分）"""
+        self.state = InstanceState.WITHDRAW
+        self.updateTime = now
+
     def reject(self, now) -> None:
         """驳回流程"""
         self.state = InstanceState.REJECT
@@ -172,12 +177,12 @@ class ProcessInstance:
         return not any(t.is_doing() for t in self.tasks)
 
     def create_task(self, task_id: int, task_name: str, display_name: str, actor: str,
-                    operator: str, form_key: str, now) -> "ProcessTask":
-        """创建任务（子实体工厂）"""
+                    operator: str, form_key: str, now, perform_type: int = 0) -> "ProcessTask":
+        """创建任务（子实体工厂）——perform_type：0 普通 / 1 会签（issues/52 E24 落库对齐 Java）"""
         task = ProcessTask(id=task_id, processInstanceId=self.id,
                            taskName=task_name, displayName=display_name,
                            taskState=TaskState.DOING, actorIds=[actor],
-                           formKey=form_key,
+                           formKey=form_key, performType=perform_type,
                            createTime=now, updateTime=now,
                            createUser=operator, updateUser=operator)
         self.tasks.append(task)

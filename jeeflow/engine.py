@@ -114,7 +114,7 @@ class EngineImpl(Engine):
                     if actors and lc + 1 < len(actors):
                         # 聚合根：创建串行会签下一步任务
                         nt = inst.create_task(self._next_id(), cur_node.id, cur_node.text.get("value", ""),
-                                              actors[lc + 1], operator, cur_node.properties.get("form", ""), now)
+                                              actors[lc + 1], operator, cur_node.properties.get("form", ""), now, 1)
                         nt.variables = {f"operatorList_{cur_node.id}": actors, f"loopCounter_{cur_node.id}": lc + 1,
                                         f"nrOfInstances_{cur_node.id}": len(actors)}
                         await self.repo.save_task(nt)
@@ -271,16 +271,16 @@ class EngineImpl(Engine):
         form = node.properties.get("form", "")
         if perform_type == 1 and ct:
             if ct == "PARALLEL":
-                for a in actors: await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now))
+                for a in actors: await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1))
             elif ct == "SEQUENTIAL":
-                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
+                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, 1)
                 nt.variables = {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self.repo.save_task(nt)
             else:
-                for a in actors: await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now))
+                for a in actors: await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1))
         else:
             # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
+            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, 1)
             if len(actors) > 1:
                 nt.actorIds = actors
             await self.repo.save_task(nt)

@@ -150,6 +150,17 @@ class JeeflowFacade:
         operator = str(args.get("operator", "user1"))
         flow_args = {k: v for k, v in args.items() if k not in ("processDefineId", "operator")}
         inst = await self._engine.start_process_instance_by_id(define_id, operator, flow_args)
+        # issues/56 E28：发起时抄送（f_ccActors）创建 cc 实例（对齐 Java enableCcActors 语义）
+        cc = flow_args.get("f_ccActors")
+        if cc is not None:
+            if isinstance(cc, str):
+                cc_list = [x.strip() for x in cc.split(",") if x.strip()]
+            elif isinstance(cc, (list, tuple)):
+                cc_list = [str(x) for x in cc]
+            else:
+                cc_list = []
+            if cc_list:
+                await self._repo.create_cc_instance(inst.id, operator, *cc_list)
         # startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
         doing = await self._repo.find_doing_tasks(inst.id)
         for task in doing:
@@ -224,10 +235,21 @@ class JeeflowFacade:
         return None
 
     async def _processDefine_upAndDown(self, args: dict) -> dict:
+        # issues/54 E26：兼容 {ids, opType} 批量与 {id, state} 单条（对齐 Java issues/28）
+        state = self._to_int(args.get("opType") if args.get("opType") is not None else args.get("state"))
+        if state is None:
+            raise ValueError("opType/state 缺失或非法")
+        ids = args.get("ids")
+        if ids:
+            for i in ids:
+                did = self._to_int(i)
+                if not did:
+                    raise ValueError("id 缺失或非法")
+                await self._repo.update_define_state(did, state)
+            return None
         define_id = self._to_int(args.get("id"))
-        state = self._to_int(args.get("state"))
-        if not define_id or state is None:
-            raise ValueError("id/state 缺失或非法")
+        if not define_id:
+            raise ValueError("id 缺失或非法")
         await self._repo.update_define_state(define_id, state)
         return None
 
@@ -242,7 +264,7 @@ class JeeflowFacade:
         operator = str(args.get("operator", "user1"))
         now = datetime.now()
         abandoned = inst.abandon_all_doing(now)
-        inst.reject(now)
+        inst.withdraw(now)  # issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
         inst.updateUser = operator
         for t in abandoned:
             await self._repo.update_task(t)
@@ -295,11 +317,18 @@ class JeeflowFacade:
     # ── 流程设计（需扩展仓储） ───────────────────────────────────────────────
 
     async def _processDesign_page(self, args: dict) -> dict:
+        # issues/50 E22：行转 dict（模型对象直接透传则出口 stringify 不生效，id 为数字）
         ext = self._ext_repo()
         rows, total = await ext.page_designs(self._to_int(args.get("pageNum")) or 1,
                                              self._to_int(args.get("pageSize")) or 10,
                                              conditions=self._parse_m_query(args))
-        return self._page_data(rows, total)
+        out = []
+        for d in rows:
+            out.append({"id": d.id, "name": d.name, "displayName": d.displayName, "type": d.type,
+                        "icon": d.icon, "isDeployed": d.isDeployed, "remark": d.remark,
+                        "createTime": self._fmt_time(d.createTime), "createUser": d.createUser,
+                        "updateTime": self._fmt_time(d.updateTime), "updateUser": d.updateUser})
+        return self._page_data(out, total)
 
     async def _processDesign_detail(self, args: dict) -> dict:
         ext = self._ext_repo()

@@ -12,6 +12,7 @@
 | [流程定义格式](./flow-definition.md) | LogicFlow JSON 结构、节点类型、加载 |
 | [SPI 实现指南](./spi-guide.md) | `ProcessRepository` / `UserProvider` 等 SPI |
 | [FastAPI 集成](./fastapi.md) | FastAPI 应用接入（路由/CORS/端点） |
+| [Web 框架接入](./web-frameworks.md) | **任意 Web 框架接入门面**：FastAPI/Django/Flask 转发层对照 |
 
 ## 相关
 

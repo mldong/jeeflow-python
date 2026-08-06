@@ -34,7 +34,7 @@ async def start_and_execute(request: Request):
     return {"code": 0, "msg": "成功", "data": None}
 ```
 
-端点清单与响应结构（code=0/msg、submitType 全枚举）见[文档站 REST API 指南](../../guides/03-api)。
+端点清单与响应结构（code=0/msg、submitType 全枚举）见[统一门面接口文档](../../spec/06-facade)。
 
 ## 启动
 

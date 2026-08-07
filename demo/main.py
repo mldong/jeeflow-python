@@ -12,6 +12,7 @@ from typing import Optional
 from datetime import datetime
 
 from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, JeeflowFacade
+from jeeflow.memory import MemoryExtRepository
 from jeeflow.model import InstanceState, TaskState, ProcessDefine, ProcessInstance, ProcessTask, UserInfo, parse_flow_model
 from jeeflow.spi import IDGenerator, ExpressionEvaluator
 
@@ -54,10 +55,11 @@ class SimpleExprEvaluator(ExpressionEvaluator):
         return False
 
 repo = MemoryRepository()
+ext_repo = MemoryExtRepository()  # 扩展仓储（内存实现）：流程设计/历史/委托
 idgen = SnowflakeIDGen()
 user_prov = SimpleUserProvider()
 engine = EngineImpl(repo, user_prov, idgen, SimpleExprEvaluator())
-facade = JeeflowFacade(engine, repo, None)  # demo 未接入扩展仓储
+facade = JeeflowFacade(engine, repo, ext_repo)
 
 def load_seed():
     """预加载流程定义（种子）——/api/reset 重置后复用"""
@@ -152,13 +154,17 @@ async def wf_flow(action: str, request: Request):
 
 @app.post("/api/reset")
 async def api_reset():
-    """一键重置演示数据（issues/11）：清空内存库（实例/任务/抄送/参与者）+ 重载种子流程定义"""
+    """一键重置演示数据（issues/11）：清空内存库（实例/任务/抄送/参与者 + 扩展仓储）+ 重载种子流程定义"""
     repo._defines.clear()
     repo._instances.clear()
     repo._tasks.clear()
     repo._actors.clear()
     repo._cc.clear()
     repo._seq = 1
+    ext_repo._designs.clear()
+    ext_repo._designHis.clear()
+    ext_repo._surrogates.clear()
+    ext_repo._seq = 1
     load_seed()
     return _ok()
 

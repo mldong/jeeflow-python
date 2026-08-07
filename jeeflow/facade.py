@@ -993,6 +993,9 @@ class JeeflowFacade:
                     raise ValueError("content 缺失")
                 return None
             content = json.dumps(copy, ensure_ascii=False)
+        if isinstance(content, (dict, list)):
+            # content 为对象（前端直接传 JSON 对象）：序列化为 JSON 字符串
+            return json.dumps(content, ensure_ascii=False)
         if isinstance(content, bytes):
             return content.decode("utf-8")
         return str(content)

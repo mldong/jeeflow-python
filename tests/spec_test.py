@@ -653,12 +653,15 @@ async def test_design_deploy_redeploy_is_deployed():
     assert r["code"] == 0, r
     define_id = r["data"]["processDefineId"]
     assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1
+    version_after_deploy = (await repo.find_define_by_id(int(define_id))).version
 
     # 重新部署 → 同一 defineId + is_deployed=1
     r = await facade.flow("processDesign/redeploy", {"id": design_id, "operator": "zhangsan"})
     assert r["code"] == 0, r
     assert r["data"]["processDefineId"] == define_id, r
     assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1
+    # issues/59：redeploy 是替换语义，version 必须保持
+    assert (await repo.find_define_by_id(int(define_id))).version == version_after_deploy
 
     # 设计稿内容变更（updateDefine，不同 content）→ 新快照 + is_deployed=0 + name 同步
     r = await facade.flow("processDesign/updateDefine", {"processDesignId": design_id,
@@ -680,6 +683,15 @@ async def test_design_deploy_redeploy_is_deployed():
     r = await facade.flow("processDesign/deploy", {"id": design_id, "operator": "zhangsan"})
     assert r["code"] == 0, r
     assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1
+
+    # issues/59 强回归：把定义 version 抬到 >0 后 redeploy 必须保持
+    define_id2 = int(r["data"]["processDefineId"])
+    def_v1 = await repo.find_define_by_id(define_id2)
+    def_v1.version = 5
+    await repo.update_define(def_v1)
+    r = await facade.flow("processDesign/redeploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    assert (await repo.find_define_by_id(define_id2)).version == 5
 
 
 @pytest.mark.asyncio

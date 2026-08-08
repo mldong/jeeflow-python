@@ -11,10 +11,11 @@ from fastapi.responses import JSONResponse
 from typing import Optional
 from datetime import datetime
 
-from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, JeeflowFacade
+from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, JeeflowFacade, \
+    EngineExtensions, HandlerRegistry, register_builtin_assignments
 from jeeflow.memory import MemoryExtRepository
 from jeeflow.model import InstanceState, TaskState, ProcessDefine, ProcessInstance, ProcessTask, UserInfo, parse_flow_model
-from jeeflow.spi import IDGenerator, ExpressionEvaluator
+from jeeflow.spi import IDGenerator, ExpressionEvaluator, OrgUserProvider
 
 # ─── Setup ───────────────────────────────────────────────────────────────────────
 
@@ -30,9 +31,53 @@ class SnowflakeIDGen(IDGenerator):
         self._seq = (self._seq + 1) & 0xFFF
         return (ts << 10) | self._seq
 
+# 四端（Java/Go/Python/Node）统一同一套 8 个具名用户，切换后端不再"换人"
+DEMO_USERS = {
+    "user1": ("张三", "工程师"),
+    "userA": ("孙倩", "工程师"),
+    "userB": ("周明", "工程师"),
+    "userC": ("吴婷", "工程师"),
+    "leader": ("李四", "组长"),
+    "manager": ("王五", "经理"),
+    "director": ("赵六", "总监"),
+    "boss": ("钱七", "总经理"),
+}
+
+def demo_user_map(uid: str) -> dict:
+    real_name, post_name = DEMO_USERS.get(uid, ("用户" + uid, "工程师"))
+    return {"userId": uid, "realName": real_name, "deptId": "D01", "deptName": "研发部",
+            "postId": "P01", "postName": post_name}
+
 class SimpleUserProvider:
     async def get_user(self, uid: str) -> Optional[UserInfo]:
-        return UserInfo(userId=uid, realName=uid, deptId="D01", deptName="部门", postId="P01", postName="岗位")
+        real_name, post_name = DEMO_USERS.get(uid, ("用户" + uid, "工程师"))
+        return UserInfo(userId=uid, realName=real_name, deptId="D01", deptName="研发部", postId="P01", postName=post_name)
+
+class DemoOrgUserProvider(OrgUserProvider):
+    """组织维度取人（部门领导/分管领导/角色），扁平演示组织结构"""
+    async def find_dept_leaders(self, dept_id: str) -> list:
+        return ["leader"]
+    async def find_dept_main_leaders(self, dept_id: str) -> list:
+        return ["manager"]
+    async def find_by_role(self, role_code: str) -> list:
+        return {"leader": ["leader"], "manager": ["manager"],
+                "director": ["director"], "boss": ["boss"]}.get(role_code, [])
+
+def demo_user_search(query: dict):
+    """在 8 个演示用户内分页检索（candidatePage 依赖）；m_* 条件值按关键字包含匹配"""
+    keywords = [str(v).strip().lower() for k, v in query.items()
+                if k.startswith("m_") and str(v).strip()]
+    all_rows = []
+    for uid, (real_name, _) in DEMO_USERS.items():
+        if not keywords or all(kw in uid.lower() or kw in real_name.lower() for kw in keywords):
+            all_rows.append(demo_user_map(uid))
+    try:
+        page_num = max(1, int(query.get("pageNum", 1)))
+        page_size = max(1, int(query.get("pageSize", 10)))
+    except (TypeError, ValueError):
+        page_num, page_size = 1, 10
+    start = min((page_num - 1) * page_size, len(all_rows))
+    return all_rows[start:start + page_size], len(all_rows)
 
 class SimpleExprEvaluator(ExpressionEvaluator):
     """简易 SpEL 表达式：支持 amount >/>=/</<=/== number"""
@@ -58,8 +103,13 @@ repo = MemoryRepository()
 ext_repo = MemoryExtRepository()  # 扩展仓储（内存实现）：流程设计/历史/委托
 idgen = SnowflakeIDGen()
 user_prov = SimpleUserProvider()
+org_prov = DemoOrgUserProvider()
 engine = EngineImpl(repo, user_prov, idgen, SimpleExprEvaluator())
-facade = JeeflowFacade(engine, repo, ext_repo)
+# 内置参与者 handler（部门领导/角色取人等，assignment-handler 流程依赖）
+_registry = HandlerRegistry()
+register_builtin_assignments(_registry, user_prov, org_prov)
+engine.set_extensions(EngineExtensions(registry=_registry))
+facade = JeeflowFacade(engine, repo, ext_repo, user_search=demo_user_search, org_prov=org_prov)
 
 def load_seed():
     """预加载流程定义（种子）——/api/reset 重置后复用"""
@@ -169,12 +219,19 @@ async def api_reset():
     return _ok()
 
 
+@app.get("/healthz")
+async def healthz():
+    """健康检查（四端对齐）"""
+    return {"status": "UP", "backend": "python"}
+
+
 @app.get("/api/stats")
 async def api_stats(userId: str = "user1"):
     tasks = [t for t in repo.all_tasks() if t.taskState == TaskState.DOING and userId in repo._actors.get(t.id, [])]
-    insts = [i for i in repo.all_instances() if i.createUser == userId]
+    insts = [i for i in repo.all_instances() if i.operator == userId]
     return _ok({"todoCount": len(tasks), "myInstanceCount": len(insts)})
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("demo.main:app", host="0.0.0.0", port=8100, reload=True)
+    # 端口可覆盖（PORT 环境变量）：本机 8100 被残留进程占用时可 PORT=8101 起
+    uvicorn.run("demo.main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8100")), reload=True)

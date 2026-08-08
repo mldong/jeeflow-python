@@ -364,7 +364,9 @@ class EngineImpl(Engine):
     async def _resolve_interceptors(self, inst) -> list:
         """定义级拦截器解析（issue 34，对齐 Java 模型级 postInterceptors）：
         流程定义顶层 postInterceptors 声明 → 按名从 interceptor_registry 取（未声明该流程不触发）；
-        未声明 → 回落引擎级列表（向后兼容现状）。结果按 defineId 缓存。"""
+        未声明 → 回落引擎级列表（向后兼容现状）。结果按 defineId 缓存。
+        issues/60：解析与校验分离——定义读取/JSON 解析失败回落引擎级（现状语义），
+        声明中存在未注册名时抛 ValueError（不静默跳过），且错误不写缓存保证持续报错。"""
         if not self.ext:
             return []
         define_id = getattr(inst, "defineId", None)
@@ -374,20 +376,24 @@ class EngineImpl(Engine):
         if cached is not None:
             return cached
         ic_list = list(self.ext.interceptors)
+        declared = None
         try:
             def_ = await self.repo.find_define_by_id(define_id)
             if def_ is not None:
                 content = def_.content
                 meta = json.loads(content) if isinstance(content, str) else json.loads(content.decode("utf-8"))
                 declared = str(meta.get("postInterceptors") or "").strip()
-                if declared:
-                    ic_list = []
-                    for name in declared.split(","):
-                        name = name.strip()
-                        if name and name in (self.ext.interceptor_registry or {}):
-                            ic_list.append(self.ext.interceptor_registry[name])
         except Exception:
             pass
+        if declared:
+            ic_list = []
+            for name in declared.split(","):
+                name = name.strip()
+                if not name:
+                    continue
+                if name not in (self.ext.interceptor_registry or {}):
+                    raise ValueError(f"postInterceptors 声明的拦截器未注册: {name}")
+                ic_list.append(self.ext.interceptor_registry[name])
         self._ic_cache[define_id] = ic_list
         return ic_list
 

@@ -18,6 +18,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, NamedTuple, Optional, Sequence
 
 from .extensions import FlowInterceptor
+from .metadata import HandlerMeta, HandlerRegistry
 from .model import ProcessDefine, ProcessInstance, TYPE_END, TYPE_TASK, TYPE_CUSTOM, InstanceState
 from .engine import KEY_SUBMIT_TYPE, KEY_DEPT_ID
 from .model import SubmitType
@@ -477,3 +478,18 @@ class PersistPostInterceptor(FlowInterceptor):
         data.setdefault("process_instance_id", instance.id)
         data.setdefault("apply_user_id", instance.operator)
         data.setdefault("apply_dept_id", instance.variables.get(KEY_DEPT_ID))
+
+
+# ─── 注册助手（issues/60）───────────────────────────────────────────────────────
+
+
+def register_persist_meta(registry: HandlerRegistry) -> None:
+    """将 PersistPostInterceptor 元数据注册进处理器注册中心（SPI 字典源），
+    集成方在实例组装处调用一次即可，保证"字典项 ⟺ 实例"同步（避免各端写死注册遗漏/名不一致）。"""
+    registry.register(HandlerMeta(
+        type="FlowInterceptor",
+        className="com.mldong.jeeflow.persist.interceptor.PersistPostInterceptor",
+        displayName="业务数据自动入库",
+        order=0,
+        group="post",
+    ))

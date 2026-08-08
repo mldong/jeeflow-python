@@ -9,8 +9,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jeeflow import EngineImpl, MemoryRepository, EngineExtensions
 from jeeflow.memory import MemoryExtRepository
+from jeeflow.metadata import HandlerRegistry
 from jeeflow.model import ProcessDefine, InstanceState, UserInfo
-from jeeflow.persist import JdbcDynamicTableWriter, PersistPostInterceptor
+from jeeflow.persist import JdbcDynamicTableWriter, PersistPostInterceptor, register_persist_meta
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 from jeeflow.engine import KEY_SUBMIT_TYPE
 
@@ -521,6 +522,41 @@ async def test_define_level_interceptor():
     await eng.start_process_instance_by_id(d2.id, "user2", {"f_title": "未声明流程"})
     assert conn.execute("SELECT COUNT(1) FROM biz_decl").fetchone()[0] == 1, "未声明拦截器的流程不应落库"
     conn.close()
+
+
+# ─── ⑱.1 issues/60：定义级声明未注册 → 显式报错（不静默跳过） ───────────────────
+
+@pytest.mark.asyncio
+async def test_declared_interceptor_missing_registry():
+    repo = MemoryRepository()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    eng.set_extensions(EngineExtensions(interceptors=[], interceptor_registry={}))
+    content = '''{"name": "ghost", "displayName": "幽灵拦截器", "type": "approval",
+      "relTableName": "biz_ghost", "persistMode": "SYNC", "postInterceptors": "com.xxx.GhostInterceptor",
+      "nodes": [{"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+                {"id": "finish", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}],
+      "edges": [{"id": "e0", "sourceNodeId": "start", "targetNodeId": "finish", "properties": {}}]}'''
+    d = ProcessDefine(name="ghost", displayName="幽灵拦截器", type="approval", state=1, version=1, content=content)
+    repo.add_define(d)
+    with pytest.raises(ValueError, match="未注册"):
+        await eng.start_process_instance_by_id(d.id, "user1", {"f_title": "幽灵流程"})
+
+
+# ─── ⑱.2 issues/60：注册助手 register_persist_meta（字典 1 项 / 全名 / 显示名 / post 组） ──
+
+def test_register_persist_meta():
+    reg = HandlerRegistry()
+    register_persist_meta(reg)
+    metas = reg.list_handlers("FlowInterceptor")
+    assert len(metas) == 1, f"注册后 FlowInterceptor 应为 1 项: {len(metas)}"
+    m = metas[0]
+    assert m.className == "com.mldong.jeeflow.persist.interceptor.PersistPostInterceptor"
+    assert m.displayName == "业务数据自动入库"
+    assert m.group == "post"
+    assert m.order == 0
+    # 二次注册追加（同名覆盖语义，与 Java 一致）
+    register_persist_meta(reg)
+    assert len(reg.list_handlers("FlowInterceptor")) == 2
 
 
 # ─── ⑲ issues/30/31：facade listByType/bizData/顶层 JSON ───────────────────────

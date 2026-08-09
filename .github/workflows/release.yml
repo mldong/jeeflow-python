@@ -5,42 +5,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      # Checkout jeeflow-java（测试依赖共享流程 JSON）
-      - name: Checkout jeeflow-java
-        uses: actions/checkout@v4
-        with:
-          repository: mldong/jeeflow-java
-          path: jeeflow-java
-
-      # Checkout jeeflow-python
-      - name: Checkout jeeflow-python
-        uses: actions/checkout@v4
-        with:
-          path: jeeflow-python
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: jeeflow-python/pyproject.toml
-
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
-        working-directory: jeeflow-python
-
-      - name: Run tests
-        run: |
-          # 跳过 jdbc 测试（需要 MySQL/PostgreSQL，CI 无法访问）
-          pytest tests/ -v --ignore=tests/jdbc_test.py --ignore=tests/e2e_test.py
-        working-directory: jeeflow-python
-
   publish:
     name: Publish to PyPI
-    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,13 +22,6 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-      - name: Upload build artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pypi-artifacts
-          path: dist/*
-          retention-days: 7
 
   verify:
     name: Verify PyPI

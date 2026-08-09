@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowInterceptor, EngineExtensions
+from jeeflow.engine import KEY_AUTO_GEN_TITLE
 from jeeflow.facade import JeeflowFacade
 from jeeflow.memory import MemoryExtRepository
 from jeeflow.model import ProcessDefine, ProcessTask, TaskState, InstanceState, UserInfo
@@ -70,6 +71,9 @@ async def test_01_simple_flow():
     eng, repo = setup()
     df = load_flow(repo, "01-simple.json")
     inst = await _start_and_execute(eng, repo, df.id, "applicant")
+    # issue 29：autoGenTitle 自动生成验证
+    assert KEY_AUTO_GEN_TITLE in inst.variables, f"autoGenTitle should be in instance variables: {inst.variables.keys()}"
+    assert inst.variables[KEY_AUTO_GEN_TITLE], "autoGenTitle should not be empty"
     doing = await repo.find_doing_tasks(inst.id)
     assert len(doing) == 1 and doing[0].taskName == "task1"
 

@@ -27,6 +27,8 @@ KEY_PROCESS_START_NEXT_NODE_OPERATOR = "f_nextNodeOperator"
 # v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
 KEY_AUTO_ID   = "flow.auto"
 KEY_ADMIN_ID  = "flow.admin"
+# issue 29：自动生成标题（对齐 boot3 FlowConst.AUTO_GEN_TITLE）
+KEY_AUTO_GEN_TITLE = "autoGenTitle"
 
 class Engine:
     """引擎接口"""
@@ -65,6 +67,7 @@ class EngineImpl(Engine):
         flow = parse_flow_model(json.loads(def_.content))
         vars_ = {**(args or {})}
         await self._add_user_info(operator, vars_)
+        self._add_auto_gen_title(def_.displayName, vars_)
         inst = ProcessInstance(id=self._next_id(), defineId=define_id, operator=operator,
                                variables=vars_, createTime=datetime.now(), updateTime=datetime.now(),
                                createUser=operator, updateUser=operator,
@@ -343,6 +346,12 @@ class EngineImpl(Engine):
         if u.deptName: vars_[KEY_DEPT_NAME] = u.deptName
         if u.postId: vars_[KEY_POST_ID] = u.postId
         if u.postName: vars_[KEY_POST_NAME] = u.postName
+
+    def _add_auto_gen_title(self, display_name: str, vars_: dict):
+        """issue 29：自动生成标题（对齐 boot3 FlowUtil.addAutoGenTitle）"""
+        real_name = vars_.get(KEY_REAL_NAME, "")
+        title = f"{real_name}的{display_name}-{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        vars_[KEY_AUTO_GEN_TITLE] = title
 
     def _next_id(self) -> int:
         if self.id_gen: return self.id_gen.next_id()

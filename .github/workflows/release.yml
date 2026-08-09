@@ -9,15 +9,32 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Checkout jeeflow-java（测试依赖共享流程 JSON）
+      - name: Checkout jeeflow-java
+        uses: actions/checkout@v4
+        with:
+          repository: mldong/jeeflow-java
+          path: jeeflow-java
+
+      # Checkout jeeflow-python
+      - name: Checkout jeeflow-python
+        uses: actions/checkout@v4
+        with:
+          path: jeeflow-python
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
+          cache-dependency-path: jeeflow-python/pyproject.toml
+
       - name: Install dependencies
         run: pip install -e ".[dev]"
+        working-directory: jeeflow-python
+
       - name: Run tests
         run: pytest tests/ -v
+        working-directory: jeeflow-python
 
   publish:
     name: Publish to PyPI

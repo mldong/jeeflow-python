@@ -27,7 +27,9 @@ jobs:
           cp -r jeeflow-java /tmp/demo-build/
           docker build -f /tmp/demo-build/jeeflow-python/Dockerfile.demo -t jeeflow-python-demo:latest /tmp/demo-build/
       - name: Export image
-        run: docker save jeeflow-python-demo:latest -o jeeflow-python-demo.tar
+        run: |
+          docker save jeeflow-python-demo:latest -o jeeflow-python-demo.tar
+          chmod 644 jeeflow-python-demo.tar
       - name: Upload to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -45,6 +47,8 @@ jobs:
           script: |
             cd /java_projects/jeeflow/demo
             docker load -i jeeflow-python-demo.tar
-            docker-compose up -d jeeflow-python-demo
+            # Stop and remove old container if exists
+            docker stop jeeflow-python-demo 2>/dev/null && docker rm jeeflow-python-demo 2>/dev/null || true
+            docker run -d --name jeeflow-python-demo --restart always -p 16082:8100 jeeflow-python-demo:latest
             rm -f jeeflow-python-demo.tar
-            echo "✅ Python demo deployed"
+            echo "✅ Python demo deployed (port 16082->8100)"

@@ -498,6 +498,11 @@ async def test_facade_view_endpoints():
     r = await facade.flow("processTask/detail", {"id": doing[0].id, "operator": "leader"})
     assert r["code"] == 0 and r["data"]["executable"] is True, r
     assert r["data"]["taskModel"] is not None, r
+    # issues/62：taskModel 补 form/ext（字段权限）
+    tm = r["data"]["taskModel"]
+    assert tm["form"] == "leave-form", tm
+    assert tm["ext"]["PERMISSION_f_leaveType"] == 1, tm
+    assert tm["ext"]["PERMISSION_days"] == 2, tm
 
     r = await facade.flow("processTask/latest", {"processInstanceId": instance_id})
     assert r["code"] == 0 and r["data"]["taskName"] == "task1", r

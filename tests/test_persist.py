@@ -1,5 +1,6 @@
 """persist 动态表写入 + 流程入库拦截器测试（issues/18，SQLite 内存库全链路）"""
 import os
+import re
 import sqlite3
 import sys
 
@@ -328,6 +329,8 @@ def test_missing_primary_key_generator():
 def _sync_define(repo: MemoryRepository, table: str) -> ProcessDefine:
     with open(os.path.join(FLOW_DIR, "01-simple.json"), "r", encoding="utf-8") as f:
         content = f.read()
+    # issues/62：共享 flow 自带 field（PERMISSION_*）→ 先移除，避免与下方注入重复键（json.loads 后者覆盖前者）
+    content = re.sub(r',\s*"field":\s*\{[^}]*\}', '', content, count=1)
     content = content.replace('"type": "approval"',
                               f'"type": "approval", "relTableName": "{table}", "persistMode": "SYNC"', 1)
     content = content.replace('"assignee": "leader"',

@@ -846,9 +846,13 @@ class JeeflowFacade:
                     flow = json.loads(def_.content)
                     for n in flow.get("nodes", []):
                         if n.get("id") == task.taskName:
+                            props = n.get("properties", {}) or {}
+                            # issues/62：taskModel 补 form/ext（节点字段权限，对齐 boot2）
                             vo["taskModel"] = {"name": n.get("id"),
                                                "displayName": (n.get("text") or {}).get("value", ""),
-                                               "type": n.get("type")}
+                                               "type": n.get("type"),
+                                               "form": props.get("form"),
+                                               "ext": props.get("field")}
                             break
                 except Exception:
                     pass

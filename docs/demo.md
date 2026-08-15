@@ -1,6 +1,6 @@
 # Python 演示站（Demo）
 
-> 演示站是运行在 :8100 的 FastAPI 应用（内存仓储 + 10 个示例流程），对接 jeeflow-ui 体验完整流程。SDK 集成（SPI）见 [引擎 API](./engine-api.md) / [SPI 实现指南](./spi-guide.md)。
+> 演示站是运行在 :8100 的 FastAPI 应用（内存仓储 + 14 个示例流程），对接 jeeflow-ui 体验完整流程。SDK 集成（SPI）见 [引擎 API](./engine-api.md) / [SPI 实现指南](./spi-guide.md)。
 
 ## 环境要求
 
@@ -15,7 +15,7 @@ python demo/main.py
 # → http://localhost:8100（uvicorn 热重载）
 ```
 
-> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 10 个示例流程。对接 jeeflow-ui（:5173）时右上角切到 `🐍 Python :8100`；接口规范见[统一门面接口文档](../../spec/06-facade)。
+> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 14 个示例流程。对接 jeeflow-ui（:5173）时右上角切到 `🐍 Python :8100`；接口规范见[统一门面接口文档](../../spec/06-facade)。
 
 > v1.5.0 起 `/wf/**` 为**单入口门面转发**（`JeeflowFacade.flow(action, body)`，URL 路径段即 action）——
 > 集成方 controller 一行转发即可复用全部流程能力，参数与返回结构不变。

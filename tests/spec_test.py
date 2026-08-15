@@ -879,3 +879,29 @@ async def test_e2e_feedback_regression():
     assert r5["code"] == 0, r5
     if r5["data"]["rows"]:
         assert isinstance(r5["data"]["rows"][0]["id"], str), f"design id 应为 string: {r5['data']['rows'][0]['id']}"
+
+
+@pytest.mark.asyncio
+async def test_page_envelope_five_keys():
+    """issues/64：门面分页必须五键 pageNum/pageSize/rows/recordCount/totalPage"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    r0 = await facade.flow("processDefine/deploy", {"content": content})
+    assert r0["code"] == 0, r0
+    r = await facade.flow("processDefine/page", {"pageNum": 1, "pageSize": 1})
+    assert r["code"] == 0, r
+    data = r["data"]
+    for k in ("pageNum", "pageSize", "rows", "recordCount", "totalPage"):
+        assert k in data, f"缺 {k}: {data}"
+    assert data["pageNum"] == 1
+    assert data["pageSize"] == 1
+    assert data["recordCount"] >= 1
+    assert data["totalPage"] == data["recordCount"]  # pageSize=1
+    eng0, repo0 = setup()
+    empty = await JeeflowFacade(eng0, repo0, MemoryExtRepository()).flow(
+        "processDefine/page", {"pageNum": 1, "pageSize": 10})
+    assert empty["code"] == 0, empty
+    assert empty["data"]["recordCount"] == 0
+    assert empty["data"]["totalPage"] == 0

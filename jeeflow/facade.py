@@ -77,7 +77,7 @@ class JeeflowFacade:
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
         rows, total = await self._repo.page_defines(page_num, page_size, self._parse_m_query(args))
-        return self._page_data([self._define_row_to_dict(r) for r in rows], total)
+        return self._page_data([self._define_row_to_dict(r) for r in rows], total, page_num, page_size)
 
     async def _processDefine_detail(self, args: dict) -> dict:
         """流程定义详情（v1.5.0 补齐）"""
@@ -100,7 +100,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         operator = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_instances(page_num, page_size, operator, self._parse_m_query(args))
-        return self._page_data([self._instance_row_to_dict(r) for r in rows], total)
+        return self._page_data([self._instance_row_to_dict(r) for r in rows], total, page_num, page_size)
 
     async def _processInstance_detail(self, args: dict) -> dict:
         """流程实例详情（含任务列表，v1.5.0 补齐）"""
@@ -285,7 +285,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         actor_id = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_todo_tasks(page_num, page_size, actor_id, self._parse_m_query(args))
-        return self._page_data([self._task_row_to_dict(r) for r in rows], total)
+        return self._page_data([self._task_row_to_dict(r) for r in rows], total, page_num, page_size)
 
     async def _processTask_doneList(self, args: dict) -> dict:
         """我的已办分页（operator 过滤，v1.5.0 补齐）"""
@@ -293,7 +293,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         operator = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_done_tasks(page_num, page_size, operator, self._parse_m_query(args))
-        return self._page_data([self._task_row_to_dict(r) for r in rows], total)
+        return self._page_data([self._task_row_to_dict(r) for r in rows], total, page_num, page_size)
 
     async def _processTask_execute(self, args: dict) -> dict:
         task_id = self._to_int(args.get("processTaskId"))
@@ -325,8 +325,9 @@ class JeeflowFacade:
     async def _processDesign_page(self, args: dict) -> dict:
         # issues/50 E22：行转 dict（模型对象直接透传则出口 stringify 不生效，id 为数字）
         ext = self._ext_repo()
-        rows, total = await ext.page_designs(self._to_int(args.get("pageNum")) or 1,
-                                             self._to_int(args.get("pageSize")) or 10,
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
+        rows, total = await ext.page_designs(page_num, page_size,
                                              conditions=self._parse_m_query(args))
         out = []
         for d in rows:
@@ -334,7 +335,7 @@ class JeeflowFacade:
                         "icon": d.icon, "isDeployed": d.isDeployed, "remark": d.remark,
                         "createTime": self._fmt_time(d.createTime), "createUser": d.createUser,
                         "updateTime": self._fmt_time(d.updateTime), "updateUser": d.updateUser})
-        return self._page_data(out, total)
+        return self._page_data(out, total, page_num, page_size)
 
     async def _processDesign_detail(self, args: dict) -> dict:
         ext = self._ext_repo()
@@ -584,12 +585,13 @@ class JeeflowFacade:
 
     async def _processSurrogate_page(self, args: dict) -> dict:
         ext = self._ext_repo()
-        rows, total = await ext.page_surrogates(self._to_int(args.get("pageNum")) or 1,
-                                                self._to_int(args.get("pageSize")) or 10,
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
+        rows, total = await ext.page_surrogates(page_num, page_size,
                                                 filters={"operator": str(args["operator"])}
                                                 if args.get("operator") else None,
                                                 conditions=self._parse_m_query(args))
-        return self._page_data(rows, total)
+        return self._page_data(rows, total, page_num, page_size)
 
     async def _processSurrogate_save(self, args: dict) -> dict:
         ext = self._ext_repo()
@@ -816,7 +818,7 @@ class JeeflowFacade:
         page_size = self._to_int(args.get("pageSize")) or 10
         actor_id = str(args.get("operator", "user1"))
         rows, total = await self._repo.page_cc_instances(page_num, page_size, actor_id, self._parse_m_query(args))
-        return self._page_data([self._cc_row_to_dict(r) for r in rows], total)
+        return self._page_data([self._cc_row_to_dict(r) for r in rows], total, page_num, page_size)
 
     async def _processTask_detail(self, args: dict) -> dict:
         task_id = self._to_int(args.get("id"))
@@ -873,6 +875,8 @@ class JeeflowFacade:
         return rows
 
     async def _processTask_candidatePage(self, args: dict) -> dict:
+        page_num = self._to_int(args.get("pageNum")) or 1
+        page_size = self._to_int(args.get("pageSize")) or 10
         task_id = self._to_int(args.get("processTaskId")) or self._to_int(args.get("id"))
         if not task_id:
             raise ValueError("processTaskId 缺失")
@@ -893,7 +897,7 @@ class JeeflowFacade:
                 pass
         if candidates:
             rows = [{"userId": c, "realName": c} for c in candidates]
-            return self._page_data(rows, len(rows))
+            return self._page_data(rows, len(rows), page_num, page_size)
         # 无模型候选 → 用户分页搜索（依赖 user_search 钩子）
         if self._user_search is None:
             raise ValueError("未配置 user_search（用户搜索钩子）")
@@ -901,7 +905,7 @@ class JeeflowFacade:
         if inspect.isawaitable(result):
             result = await result
         rows, total = result
-        return self._page_data(rows, total)
+        return self._page_data(rows, total, page_num, page_size)
 
     async def _next_task_candidates(self, flow: dict, task_name: str) -> list:
         result = []
@@ -1042,8 +1046,20 @@ class JeeflowFacade:
         return "".join(out)
 
     @staticmethod
-    def _page_data(rows, total: int) -> dict:
-        return {"rows": rows, "recordCount": total}
+    def _page_data(rows, total: int, page_num: int = 1, page_size: int = 10) -> dict:
+        # issues/64：对齐 mldong 分页五键（Java pageResult / Go pageData）
+        page_num = page_num or 1
+        page_size = page_size or 10
+        total_page = 0
+        if total > 0 and page_size > 0:
+            total_page = (total + page_size - 1) // page_size
+        return {
+            "pageNum": page_num,
+            "pageSize": page_size,
+            "recordCount": total,
+            "totalPage": total_page,
+            "rows": rows,
+        }
 
     @staticmethod
     def _ok(data) -> dict:

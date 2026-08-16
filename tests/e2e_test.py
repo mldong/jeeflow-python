@@ -297,6 +297,36 @@ async def main():
     check("⑤ 流程结束", inst16.state == InstanceState.DONE, f"state={inst16.state}")
     print()
 
+    # ═══ 12b. FormFieldAssigneeHandler f_ 前缀（issues/48）══════════════════════
+    print("[12b] FormFieldAssigneeHandler f_ 前缀（issues/48）")
+
+    reg12b = HandlerRegistry()
+    register_builtin_assignments(reg12b, TestUserProv(), TestOrgUserProv())
+    eng12b = EngineImpl(repo, TestUserProv(), TestIDGen(), TestExpr())
+    eng12b.set_extensions(EngineExtensions(registry=reg12b))
+
+    with open(os.path.join(FLOWS_DIR, "11-assignment-handler.json"), "r", encoding="utf-8") as f:
+        raw12b = json.loads(f.read())
+    d12b = ProcessDefine(name="afp-test", displayName="afp-test",
+                         type="test", state=1, content=json.dumps(raw12b, ensure_ascii=False))
+    repo.add_define(d12b)
+
+    # ① f_ 前缀变量（前端表单提交格式）
+    inst12b = await eng12b.start_process_instance_by_id(d12b.id, "user1", {"f_task1": "userA,userB"})
+    doing12b = await repo.find_doing_tasks(inst12b.id)
+    check("① f_ 前缀取人", len(doing12b) == 1 and doing12b[0].taskName == "task1"
+          and sorted(doing12b[0].actorIds) == ["userA", "userB"],
+          f"actors={[t.actorIds for t in doing12b]}")
+    await repo.add_task_actor(doing12b[0].id, doing12b[0].actorIds)
+    await eng12b.execute_process_task(doing12b[0].id, "userA")
+
+    # ② f_ 前缀优先于裸名
+    inst12b2 = await eng12b.start_process_instance_by_id(d12b.id, "user1", {"f_task1": "userX", "task1": "userY"})
+    doing12b2 = await repo.find_doing_tasks(inst12b2.id)
+    check("② f_ 优先于裸名", len(doing12b2) == 1 and doing12b2[0].actorIds == ["userX"],
+          f"actors={[t.actorIds for t in doing12b2]}")
+    print()
+
     # ═══ 13. candidatePage 双源候选（issues/16 GlobalCandidateHandler 语义）═════════
     print("[13] candidatePage 双源候选（issues/16）")
 

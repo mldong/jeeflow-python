@@ -37,7 +37,7 @@ class OperatorAssignmentHandler(IAssignmentHandler):
 
 
 class FormFieldAssigneeHandler(IAssignmentHandler):
-    """按表单字段值分配参与者：精确匹配 node.id → vars 字段；_数字 后缀去后缀再匹配。
+    """按表单字段值分配参与者：f_ 前缀优先 → 裸名回落 → _数字 后缀去后缀再匹配。
 
     字段值支持逗号分隔字符串 / list。
     """
@@ -51,6 +51,9 @@ class FormFieldAssigneeHandler(IAssignmentHandler):
         return self._collect(value)
 
     def _find_field_value(self, variables: dict, field_name: str):
+        """issues/48：f_ 前缀优先 → 裸名回落 → 编号后缀去后缀匹配裸名"""
+        if "f_" + field_name in variables:
+            return variables["f_" + field_name]
         if field_name in variables:
             return variables[field_name]
         m = _NUMBER_SUFFIX_PATTERN.match(field_name)

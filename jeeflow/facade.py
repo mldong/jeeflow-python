@@ -591,32 +591,90 @@ class JeeflowFacade:
                                                 filters={"operator": str(args["operator"])}
                                                 if args.get("operator") else None,
                                                 conditions=self._parse_m_query(args))
-        return self._page_data(rows, total, page_num, page_size)
+        return self._page_data([self._surrogate_row_to_dict(s) for s in rows],
+                               total, page_num, page_size)
 
     async def _processSurrogate_save(self, args: dict) -> dict:
         ext = self._ext_repo()
         operator = str(args.get("operator", "user1"))
         surrogate_id = self._to_int(args.get("id"))
         if not surrogate_id:
-            surrogate = ProcessSurrogate(operator=operator,  # 授权人 = 操作人
-                                         surrogate=str(args.get("surrogate", "")),
-                                         processName=str(args.get("processName", "")),
-                                         enabled=self._to_int(args.get("enabled")) or 1,
+            surrogate = ProcessSurrogate(operator=operator,  # 授权人 = 操作人（新建必有）
                                          createUser=operator, updateUser=operator)
+            self._apply_surrogate_fields(surrogate, args, operator)
             await ext.save_surrogate(surrogate)
         else:
             surrogate = await ext.find_surrogate_by_id(surrogate_id)
             if not surrogate:
                 raise ValueError("委托记录不存在")
-            if args.get("surrogate") is not None:
-                surrogate.surrogate = str(args["surrogate"])
-            if args.get("processName") is not None:
-                surrogate.processName = str(args["processName"])
-            if args.get("enabled") is not None:
-                surrogate.enabled = self._to_int(args["enabled"])
-            surrogate.updateUser = operator
+            self._apply_surrogate_fields(surrogate, args, operator)
             await ext.update_surrogate(surrogate)
         return {"id": surrogate.id}
+
+    async def _processSurrogate_update(self, args: dict) -> dict:
+        """委托更新（issues/77）：按 id 全字段更新，id 不存在/缺失报错"""
+        ext = self._ext_repo()
+        surrogate_id = self._to_int(args.get("id"))
+        if not surrogate_id:
+            raise ValueError("id 缺失或非法")
+        surrogate = await ext.find_surrogate_by_id(surrogate_id)
+        if not surrogate:
+            raise ValueError("委托记录不存在")
+        operator = str(args.get("operator", "user1"))
+        self._apply_surrogate_fields(surrogate, args, operator)
+        await ext.update_surrogate(surrogate)
+        return {"id": surrogate.id}
+
+    async def _processSurrogate_detail(self, args: dict) -> dict:
+        """委托详情（issues/77）：按 id 查单条，返回行结构（时间格式化）"""
+        surrogate_id = self._to_int(args.get("id"))
+        if not surrogate_id:
+            raise ValueError("id 缺失或非法")
+        surrogate = await self._ext_repo().find_surrogate_by_id(surrogate_id)
+        if not surrogate:
+            raise ValueError("委托记录不存在")
+        return self._surrogate_row_to_dict(surrogate)
+
+    @staticmethod
+    def _apply_surrogate_fields(s, args: dict, operator: str):
+        """委托写入公共字段。授权人（operator）仅在显式传入时覆盖，避免 update
+        时清空原授权人（前端编辑表单不带 operator；集成层注入时 operator=授权人，覆盖无害）"""
+        s.processName = str(args.get("processName", ""))
+        if "operator" in args:
+            s.operator = str(args.get("operator"))
+        s.surrogate = str(args.get("surrogate", ""))
+        s.startTime = JeeflowFacade._parse_surrogate_time(args.get("startTime"))
+        s.endTime = JeeflowFacade._parse_surrogate_time(args.get("endTime"))
+        enabled = JeeflowFacade._to_int(args.get("enabled"))
+        s.enabled = 1 if enabled is None else enabled  # 显式 0 不得被 or 1 吞掉（对齐 Java/Go toIntDef）
+        s.updateUser = operator
+
+    @staticmethod
+    def _parse_surrogate_time(v):
+        """解析委托时间入参：兼容 yyyy-MM-dd HH:mm:ss（前端 RangePicker/SPEC 契约）
+        与 ISO T（issues/77）；无法解析返回 None"""
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v
+        s = str(v).strip()
+        if not s:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _surrogate_row_to_dict(self, s) -> dict:
+        """委托行：时间格式化（issues/77，对齐 Java surrogateRowToMap / SPEC）"""
+        return {"id": s.id, "processName": s.processName, "operator": s.operator,
+                "surrogate": s.surrogate,
+                "startTime": self._fmt_time(s.startTime), "endTime": self._fmt_time(s.endTime),
+                "enabled": s.enabled,
+                "createTime": self._fmt_time(s.createTime), "createUser": s.createUser,
+                "updateTime": self._fmt_time(s.updateTime), "updateUser": s.updateUser}
 
     async def _processSurrogate_remove(self, args: dict) -> dict:
         surrogate_id = self._to_int(args.get("id"))

@@ -454,6 +454,56 @@ async def test_facade_design_and_surrogate():
 
 
 @pytest.mark.asyncio
+async def test_facade_surrogate_detail_and_update():
+    """委托编辑链路（issues/77）：save（前端空格格式时间窗）→ detail 回显 →
+    update 改字段 → detail 再回显 + 负向 id 不存在"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    r = await facade.flow("processSurrogate/save",
+                          {"operator": "zhangsan", "surrogate": "lisi", "processName": "leave",
+                           "startTime": "2026-08-01 00:00:00", "endTime": "2026-08-31 23:59:59",
+                           "enabled": 1})
+    assert r["code"] == 0, r
+    surrogate_id = r["data"]["id"]
+
+    # detail 回显：行结构齐全 + 时间格式化
+    r = await facade.flow("processSurrogate/detail", {"id": surrogate_id})
+    assert r["code"] == 0, r
+    d = r["data"]
+    assert d["processName"] == "leave" and d["operator"] == "zhangsan" and d["surrogate"] == "lisi", d
+    assert d["startTime"] == "2026-08-01 00:00:00" and d["endTime"] == "2026-08-31 23:59:59", d
+
+    # update：改代理人/时间窗/启用状态（不带 operator，授权人应保留）
+    r = await facade.flow("processSurrogate/update",
+                          {"id": surrogate_id, "surrogate": "wangwu", "processName": "leave",
+                           "startTime": "2026-09-01 00:00:00", "endTime": "2026-09-30 23:59:59",
+                           "enabled": 0})
+    assert r["code"] == 0, r
+    assert r["data"]["id"] == surrogate_id, r
+
+    # detail 再回显：变更生效 + 授权人未被清空
+    r = await facade.flow("processSurrogate/detail", {"id": surrogate_id})
+    assert r["code"] == 0, r
+    d = r["data"]
+    assert d["surrogate"] == "wangwu" and d["operator"] == "zhangsan" and d["enabled"] == 0, d
+    assert d["startTime"] == "2026-09-01 00:00:00" and d["endTime"] == "2026-09-30 23:59:59", d
+
+    # 仓储侧同步（update 真的写了）
+    s = await facade._ext.find_surrogate_by_id(int(surrogate_id))
+    assert s is not None and s.surrogate == "wangwu" and s.enabled == 0, s
+
+    # 负向：id 不存在
+    r = await facade.flow("processSurrogate/detail", {"id": 99999})
+    assert r["code"] == 99999999, r
+    r = await facade.flow("processSurrogate/update", {"id": 99999, "surrogate": "wangwu"})
+    assert r["code"] == 99999999, r
+    # 负向：update 缺 id
+    r = await facade.flow("processSurrogate/update", {"surrogate": "wangwu"})
+    assert r["code"] == 99999999, r
+
+
+@pytest.mark.asyncio
 async def test_facade_errors():
     """门面错误路径：未知 action / 缺扩展仓储"""
     eng, repo = setup()

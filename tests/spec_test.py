@@ -867,6 +867,43 @@ async def test_highlight_node_progress():
 
 
 @pytest.mark.asyncio
+async def test_facade_task_detail_perform_type_numeric():
+    """taskDetail performType/taskType 出口数字契约（issues/78）：
+    普通 0 / 会签 1，与 Java 修复后五语言一致（出口必须是数字，非枚举 name）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    # 普通流程：task1 performType=0 / taskType=0
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    assert r["code"] == 0, r
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": r["data"]["processDefineId"], "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    doing = await repo.find_doing_tasks(int(r["data"]["processInstanceId"]))
+    assert doing, "应有进行中任务"
+    d = await facade.flow("processTask/detail", {"id": doing[0].id, "operator": "leader"})
+    assert d["code"] == 0, d
+    assert d["data"]["performType"] == 0, f"普通任务 performType 应=0: {d['data']['performType']}"
+    assert d["data"]["taskType"] == 0, f"普通任务 taskType 应=0: {d['data']['taskType']}"
+
+    # 会签流程：task1 performType=1
+    with open(os.path.join(FLOW_DIR, "06-countersign-sequential.json"), encoding="utf-8") as f:
+        cs_content = f.read()
+    r2 = await facade.flow("processDefine/deploy", {"content": cs_content})
+    assert r2["code"] == 0, r2
+    r3 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r2["data"]["processDefineId"], "operator": "user1"})
+    assert r3["code"] == 0, r3
+    cs_doing = await repo.find_doing_tasks(int(r3["data"]["processInstanceId"]))
+    assert cs_doing, "会签应有进行中任务"
+    cs = await facade.flow("processTask/detail", {"id": cs_doing[0].id, "operator": "userA"})
+    assert cs["code"] == 0, cs
+    assert cs["data"]["performType"] == 1, f"会签任务 performType 应=1（非 'COUNTERSIGN'）: {cs['data']['performType']}"
+
+
+@pytest.mark.asyncio
 async def test_perform_type_string_compat():
     """performType 字符串兼容（issue 42）：'ALL' 面板格式会签行为与数字 1 一致"""
     eng, repo = setup()

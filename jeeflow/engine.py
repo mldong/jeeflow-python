@@ -83,34 +83,21 @@ class EngineImpl(Engine):
     # ─── Execute ──────────────────────────────────────────────────────────────
 
     async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
-        task, inst = await self._load_and_check(task_id, operator)
-        # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）——
-        # 被拒值无法经流程变量落到下游节点写入，上游只读声明不可被绕过
-        def_ = await self.repo.find_define_by_id(inst.defineId)
-        flow = parse_flow_model(json.loads(def_.content))
-        args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
-        vars_ = {**inst.variables, **task.variables, **args}
-        await self._add_user_info(operator, vars_)
+        task, inst, flow, vars_ = await self._prepare_execute_task(task_id, operator, args)
         now = datetime.now()
-        # 聚合根：完成任务（子实体状态转换 + 实例变量合并）
-        inst.complete_task(task, operator, vars_, now)
-        await self.repo.update_task(task)
-        # v1.0.1：update_instance 级联持久化依赖聚合内任务副本为最新状态，
-        # complete_task 改的是外部任务对象，需同步回聚合根
-        _sync_task_to_aggregate(inst, task)
-        await self._fire_event(ProcessEvent(EventType.TASK_COMPLETE, inst.id, task.id, task.taskName, operator))
-
-        def_ = await self.repo.find_define_by_id(inst.defineId)
-        inst.variables = vars_
-        await self.repo.update_instance(inst)
-
         cur_node = _find_node(flow, task.taskName)
         if cur_node:
             # 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
             # _create_task 不再触发（引擎语义修正），此处为完成任务节点的唯一触发点
             await self._fire_post(cur_node, inst)
             ct = cur_node.properties.get("countersignType", "")
-            if ct == "SEQUENTIAL":
+            # issues/79：会签一票否决（对齐 Java CountersignHandler / PHP setMerged(true)）——
+            # submitType=20 COUNTERSIGN_DISAGREE 时跳过会签"未完成即停留"门控，提前流转后续节点
+            try:
+                cs_veto = ct != "" and int(vars_.get(KEY_SUBMIT_TYPE, -1)) == int(SubmitType.COUNTERSIGN_DISAGREE)
+            except (ValueError, TypeError):
+                cs_veto = False
+            if ct == "SEQUENTIAL" and not cs_veto:
                 doing = await self.repo.find_doing_tasks(inst.id)
                 if not doing:
                     actors, lc = _get_cs_state(vars_, cur_node.id)
@@ -124,7 +111,7 @@ class EngineImpl(Engine):
                         return await self.repo.find_instance_by_id(inst.id)
                 else:
                     return await self.repo.find_instance_by_id(inst.id)
-            if ct in ("PARALLEL",) or ct.startswith("RATIO"):
+            if (ct in ("PARALLEL",) or ct.startswith("RATIO")) and not cs_veto:
                 doing = await self.repo.find_doing_tasks(inst.id)
                 if doing: return await self.repo.find_instance_by_id(inst.id)
 
@@ -137,64 +124,163 @@ class EngineImpl(Engine):
     # ─── Reject ───────────────────────────────────────────────────────────────
 
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
-        task, inst = await self._load_and_check(task_id, operator)
-        now = datetime.now()
-        # 聚合根：废弃所有进行中任务
-        for t in inst.abandon_all_doing(now):
-            await self.repo.update_task(t)
-        # 子实体：完成任务
-        task.finish(operator, task.variables, now)
-        await self.repo.update_task(task)
-        # v1.0.1：同步回聚合根，避免 update_instance 级联把任务写回旧状态
-        _sync_task_to_aggregate(inst, task)
-        # 聚合根：驳回
-        inst.reject(now)
+        _, inst, _, _ = await self._prepare_execute_task(task_id, operator, args)
+        # 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
+        inst.reject(datetime.now())
         await self.repo.update_instance(inst)
         await self._fire_event(ProcessEvent(EventType.PROCESS_REJECT, inst.id, task_id, operator=operator))
-        return inst
+        return await self.repo.find_instance_by_id(inst.id)
 
-    # ─── Jump ────────────────────────────────────────────────────────────────
+    # ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）──
 
     async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None,
                                      target_task_name: str = None) -> ProcessInstance:
-        task, inst = await self._load_and_check(task_id, operator)
-        now = datetime.now()
-        # 聚合根：废弃所有进行中任务
-        for t in inst.abandon_all_doing(now):
-            await self.repo.update_task(t)
-        # 子实体：完成任务
-        task.finish(operator, task.variables, now)
-        await self.repo.update_task(task)
-        if target_task_name:
-            def_ = await self.repo.find_define_by_id(inst.defineId)
-            flow = parse_flow_model(json.loads(def_.content))
+        task, inst, flow, vars_ = await self._prepare_execute_task(task_id, operator, args)
+        if not target_task_name:
+            # issues/79：ROLLBACK 对齐 Java rejectTask——退回上一任务节点（首条输入边 source），
+            # 新任务 actor=当前任务完成人（退回操作人）；无上一任务节点则不产生新待办
+            prev_name = self._previous_task_name(flow, task.taskName)
+            if prev_name:
+                prev = _find_node(flow, prev_name)
+                if prev:
+                    actors = self._rollback_actors(prev, inst, operator, task)
+                    await self._create_task_with_actors(prev, inst, operator, vars_, actors)
+        else:
+            # issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
             target = _find_node(flow, target_task_name)
-            if target: await self._execute_node(flow, inst, target, operator, inst.variables)
-        return inst
+            if target is None:
+                raise ValueError(f"根据节点名称[{target_task_name}]无法找到节点模型")
+            # 对齐 Java isFirstTaskName：跳首任务节点（start 直接后继）assignee 强制为发起人
+            if target.type == TYPE_TASK and self._is_first_task_node(flow, target):
+                target.properties["assignee"] = inst.operator
+            await self._execute_node(flow, inst, target, operator, vars_)
+        return await self.repo.find_instance_by_id(inst.id)
 
     # ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）───────
 
     async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str,
                                                    args: dict[str, Any] = None) -> ProcessInstance:
-        task, inst = await self._load_and_check(task_id, operator)
-        now = datetime.now()
-        # 聚合根：废弃所有进行中任务
-        for t in inst.abandon_all_doing(now):
-            await self.repo.update_task(t)
-        # 子实体：完成任务
-        task.finish(operator, task.variables, now)
-        await self.repo.update_task(task)
+        _, inst, flow, vars_ = await self._prepare_execute_task(task_id, operator, args)
         # 找到第一个任务节点，强制参与者为发起人，重新执行
-        def_ = await self.repo.find_define_by_id(inst.defineId)
-        flow = parse_flow_model(json.loads(def_.content))
         start_node = _find_by_type(flow, TYPE_START)
         if start_node:
             for node in _follow_edges(flow, start_node.id):
                 if node.type in (TYPE_TASK, TYPE_CUSTOM):
                     node.properties["assignee"] = inst.operator
-                    await self._execute_node(flow, inst, node, operator, inst.variables)
+                    await self._execute_node(flow, inst, node, operator, vars_)
                     break
-        return inst
+        return await self.repo.find_instance_by_id(inst.id)
+
+    # ─── Execute 公共序言（对齐 Java prepareExecution）────────────────────────
+
+    async def _prepare_execute_task(self, task_id: int, operator: str, args: dict[str, Any]):
+        """执行公共序言（对齐 Java prepareExecution）：权限校验 → f_ 字段权限过滤 →
+        完成任务（子实体状态转换 + 实例变量合并，经 update_instance 级联落库）→
+        返回流程模型 + 合并后执行变量。Java jump 路径不废弃其余 DOING 任务
+        （会签兄弟任务不受影响），此处保持一致。"""
+        task, inst = await self._load_and_check(task_id, operator)
+        # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
+        def_ = await self.repo.find_define_by_id(inst.defineId)
+        flow = parse_flow_model(json.loads(def_.content))
+        args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
+        vars_ = {**inst.variables, **task.variables, **args}
+        await self._add_user_info(operator, vars_)
+        now = datetime.now()
+        # 聚合根：完成任务（子实体状态转换 + 实例变量合并）
+        inst.complete_task(task, operator, vars_, now)
+        await self.repo.update_task(task)
+        # v1.0.1：update_instance 级联持久化依赖聚合内任务副本为最新状态，
+        # complete_task 改的是外部任务对象，需同步回聚合根
+        _sync_task_to_aggregate(inst, task)
+        await self._fire_event(ProcessEvent(EventType.TASK_COMPLETE, inst.id, task.id, task.taskName, operator))
+        inst.variables = vars_
+        await self.repo.update_instance(inst)
+        return task, inst, flow, vars_
+
+    def _previous_task_name(self, flow: FlowModel, task_name: str) -> str:
+        """当前任务节点的首条输入边 source（issues/79 对齐 Java getPreviousTaskName）"""
+        node = _find_node(flow, task_name)
+        if node is None:
+            return ""
+        for edge in flow.edges:
+            if edge.targetNodeId == node.id:
+                src = _find_node(flow, edge.sourceNodeId)
+                if src is not None and src.type in (TYPE_TASK, TYPE_CUSTOM):
+                    return src.id
+        return ""
+
+    def _is_first_task_node(self, flow: FlowModel, node: FlowNode) -> bool:
+        """是否 start 直接后继任务节点（issues/79 对齐 Java FlowUtil.isFirstTaskName）"""
+        start = _find_by_type(flow, TYPE_START)
+        if start is None:
+            return False
+        return any(e.sourceNodeId == start.id and e.targetNodeId == node.id for e in flow.edges)
+
+    def _rollback_actors(self, node: FlowNode, inst: ProcessInstance, operator: str, task: ProcessTask) -> list[str]:
+        """ROLLBACK 新任务参与者：优先当前任务完成人（退回操作人，
+        对齐 Java rejectTask singletonList(currentTask.getActorId())），
+        其次按目标节点 assignee 解析"""
+        if task.actorId:
+            return [task.actorId]
+        return self._sync_resolve_actors(node, inst, operator) or [operator]
+
+    def _sync_resolve_actors(self, node: FlowNode, inst: ProcessInstance, operator: str) -> list[str]:
+        """_resolve_actors 同步子集（ROLLBACK 场景：无 ext 注册表/处理器回调，
+        仅 tf_nextNodeOperator / assignee token 解析，对齐 Java rejectTask 语义）"""
+        next_op = inst.variables.get(KEY_NEXT_NODE_OPERATOR)
+        if next_op:
+            if isinstance(next_op, str):
+                return [a.strip() for a in next_op.split(",") if a.strip()]
+            if isinstance(next_op, (list, tuple)):
+                return [str(a) for a in next_op]
+            return [str(next_op)]
+        assignee = node.properties.get("assignee", "")
+        if assignee:
+            actors = []
+            for a in assignee.split(","):
+                token = a.strip()
+                if not token: continue
+                if "applicant" in token:
+                    token = token.replace("applicant", inst.operator)
+                if token in inst.variables:
+                    val = inst.variables[token]
+                    if isinstance(val, (list, tuple)):
+                        actors.extend(str(x) for x in val)
+                    else:
+                        actors.append(str(val))
+                else:
+                    actors.append(token)
+            return actors
+        return []
+
+    async def _create_task_with_actors(self, node: FlowNode, inst: ProcessInstance, operator: str,
+                                        vars_: dict, actors: list[str]):
+        """以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）"""
+        if not actors: return
+        ct = node.properties.get("countersignType", "")
+        _pt = node.properties.get("performType", 0)
+        try:
+            perform_type = int(_pt)
+        except (ValueError, TypeError):
+            perform_type = 1 if str(_pt).strip().upper() in ("ALL", "COUNTERSIGN") else 0
+        now = datetime.now()
+        form = node.properties.get("form", "")
+        if perform_type == 1 and ct:
+            if ct in ("PARALLEL", ""):
+                for a in actors:
+                    await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1))
+            elif ct == "SEQUENTIAL":
+                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, 1)
+                nt.variables = {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
+                await self.repo.save_task(nt)
+            else:
+                for a in actors:
+                    await self.repo.save_task(inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1))
+        else:
+            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
+            if len(actors) > 1:
+                nt.actorIds = actors
+            await self.repo.save_task(nt)
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 

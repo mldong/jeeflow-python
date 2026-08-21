@@ -992,3 +992,160 @@ async def test_page_envelope_five_keys():
     assert empty["code"] == 0, empty
     assert empty["data"]["recordCount"] == 0
     assert empty["data"]["totalPage"] == 0
+
+
+# ═══ execute submitType 2/3/4/5/6/20 门面行为（issues/79，前端按钮全量暴露路径）═══
+
+async def _start_multi_task_at(facade, repo, name: str) -> int:
+    """02-multi-task：发起（apply 自动完成）→ 推进到名为 name 的任务节点"""
+    with open(os.path.join(FLOW_DIR, "02-multi-task.json"), encoding="utf-8") as f:
+        r0 = await facade.flow("processDefine/deploy", {"content": f.read()})
+    assert r0["code"] == 0, r0
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r0["data"]["processDefineId"], "operator": "zhangsan"})
+    assert r1["code"] == 0, r1
+    instance_id = int(r1["data"]["processInstanceId"])
+    order = ["task1", "task2", "task3"]
+    actor = ["leader", "manager", "boss"]
+    target = order.index(name)
+    for i in range(target):
+        doing = await repo.find_doing_tasks(instance_id)
+        tid = next((t.id for t in doing if t.taskName == order[i]), None)
+        assert tid, f"应推进到 {order[i]}"
+        await repo.add_task_actor(tid, [actor[i]])
+        r = await facade.flow("processTask/execute",
+                              {"processTaskId": tid, "operator": actor[i], "submitType": 1})
+        assert r["code"] == 0, r
+    return instance_id
+
+
+async def _doing_task_id(repo, instance_id: int, name: str):
+    for t in await repo.find_doing_tasks(instance_id):
+        if t.taskName == name:
+            return t.id
+    return None
+
+
+@pytest.mark.asyncio
+async def test_facade_execute_submit_type_behavior():
+    """issues/79：submitType 3/4/5/6 + 负向（对齐 Java 参考实现断言）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    # ── submitType=3 ROLLBACK：task2 退回上一步 → task1 新待办（actor=退回操作人），实例保持 DOING(10)
+    rb = await _start_multi_task_at(facade, repo, "task2")
+    t2 = await _doing_task_id(repo, rb, "task2")
+    await repo.add_task_actor(t2, ["manager"])
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": t2, "operator": "manager", "submitType": 3})
+    assert r["code"] == 0, r
+    rb_task1 = await _doing_task_id(repo, rb, "task1")
+    assert rb_task1, "ROLLBACK 应在 task1 产生新待办"
+    assert "manager" in await repo.find_task_actors(rb_task1), "退回任务 actor 应为退回操作人 manager"
+    assert (await repo.find_instance_by_id(rb)).state == InstanceState.DOING
+
+    # ── submitType=4 JUMP：task3 跳转 apply（首任务节点 = start 直接后继，assignee 强制发起人）
+    jp = await _start_multi_task_at(facade, repo, "task3")
+    t3 = await _doing_task_id(repo, jp, "task3")
+    await repo.add_task_actor(t3, ["boss"])
+    jl = await facade.flow("processTask/jumpAbleTaskNameList", {"processInstanceId": jp})
+    assert jl["code"] == 0, jl
+    jump_values = [m["value"] for m in jl["data"]]
+    assert "task1" in jump_values and "apply" in jump_values, jump_values
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": t3, "operator": "boss", "submitType": 4, "taskName": "apply"})
+    assert r["code"] == 0, r
+    jp_apply = await _doing_task_id(repo, jp, "apply")
+    assert jp_apply, "JUMP 应在 apply（首任务节点）产生新待办"
+    assert await repo.find_task_actors(jp_apply) == ["zhangsan"], "跳首任务节点 assignee 强制为发起人"
+    assert (await repo.find_instance_by_id(jp)).state == InstanceState.DOING
+
+    # ── 负向：JUMP taskName 不存在 → 99999999 + 「无法找到节点模型」
+    jn = await _start_multi_task_at(facade, repo, "task2")
+    t2n = await _doing_task_id(repo, jn, "task2")
+    await repo.add_task_actor(t2n, ["manager"])
+    jr = await facade.flow("processTask/execute",
+                           {"processTaskId": t2n, "operator": "manager", "submitType": 4, "taskName": "no-such-node"})
+    assert jr["code"] == 99999999, jr
+    assert "无法找到节点模型" in str(jr["msg"]), jr["msg"]
+
+    # ── submitType=5 RE_APPLY：task1 重新提交（前端 detail 抽屉场景，含 f_ 表单 + tf_nextNodeOperator）
+    ra = await _start_multi_task_at(facade, repo, "task1")
+    t1r = await _doing_task_id(repo, ra, "task1")
+    await repo.add_task_actor(t1r, ["leader"])
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": t1r, "operator": "leader", "submitType": 5,
+                           "tf_nextNodeOperator": "manager", "f_leaveType": "annual"})
+    assert r["code"] == 0, r
+    doing_after = await repo.find_doing_tasks(ra)
+    assert len(doing_after) == 1 and doing_after[0].taskName == "task2", doing_after
+    assert await repo.find_task_actors(doing_after[0].id) == ["manager"], "tf_nextNodeOperator 应覆盖 task2 处理人"
+    inst_ra = await repo.find_instance_by_id(ra)
+    assert inst_ra.variables.get("f_leaveType") == "annual", "f_ 表单字段应落实例变量"
+    assert inst_ra.state == InstanceState.DOING
+
+    # ── submitType=6 ROLLBACK_TO_OPERATOR：task3 退回发起人 → apply 重执行、actor=发起人 zhangsan
+    ro = await _start_multi_task_at(facade, repo, "task3")
+    t3o = await _doing_task_id(repo, ro, "task3")
+    await repo.add_task_actor(t3o, ["boss"])
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": t3o, "operator": "boss", "submitType": 6})
+    assert r["code"] == 0, r
+    ro_apply = await _doing_task_id(repo, ro, "apply")
+    assert ro_apply, "ROLLBACK_TO_OPERATOR 应重执行首个任务节点 apply"
+    assert await repo.find_task_actors(ro_apply) == ["zhangsan"], "退回发起人 assignee 强制为发起人"
+    assert (await repo.find_instance_by_id(ro)).state == InstanceState.DOING
+
+    # ── 负向：非处理人执行被拒（NOT_ALLOWED_EXECUTE）
+    na = await _start_multi_task_at(facade, repo, "task1")
+    t1n = await _doing_task_id(repo, na, "task1")
+    nr = await facade.flow("processTask/execute",
+                           {"processTaskId": t1n, "operator": "hacker", "submitType": 1})
+    assert nr["code"] == 99999999, nr
+    assert "not allowed" in str(nr["msg"]), nr["msg"]
+
+
+@pytest.mark.asyncio
+async def test_facade_execute_reject():
+    """issues/79：submitType=2 REJECT 门面参数路径（对齐 Java/Go/PHP）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    inst_id = await _start_multi_task_at(facade, repo, "task1")
+    t1 = await _doing_task_id(repo, inst_id, "task1")
+    await repo.add_task_actor(t1, ["leader"])
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": t1, "operator": "leader", "submitType": 2})
+    assert r["code"] == 0, r
+    assert (await repo.find_instance_by_id(inst_id)).state == InstanceState.REJECT
+    assert len(await repo.find_doing_tasks(inst_id)) == 0, "REJECT 后应无 DOING 任务"
+
+
+@pytest.mark.asyncio
+async def test_facade_execute_countersign_disagree():
+    """issues/79：submitType=20 会签一票否决（对齐 Java CountersignHandler / PHP setMerged）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    # 06-countersign-sequential：apply 自动完成 → task1 串行会签 userA（userB 未开始）
+    with open(os.path.join(FLOW_DIR, "06-countersign-sequential.json"), encoding="utf-8") as f:
+        r0 = await facade.flow("processDefine/deploy", {"content": f.read()})
+    assert r0["code"] == 0, r0
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r0["data"]["processDefineId"], "operator": "user1"})
+    assert r1["code"] == 0, r1
+    instance_id = int(r1["data"]["processInstanceId"])
+    task_a = await _doing_task_id(repo, instance_id, "task1")
+    assert task_a, "会签节点应有 userA 的 DOING 任务"
+    await repo.add_task_actor(task_a, ["userA"])
+    # submitType=20：门面自动注入 countersignDisagreeFlag=1 → 引擎一票否决
+    # （会签节点提前流转 end）；flag 落任务/实例变量
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": task_a, "operator": "userA", "submitType": 20})
+    assert r["code"] == 0, r
+    inst = await repo.find_instance_by_id(instance_id)
+    # 一票否决效果：会签节点被提前流转 end（若否决未生效，串行会签将停在 DOING 等 userB）
+    assert inst.state == InstanceState.DONE, f"会签否决后实例应完成 FINISHED(20): {inst.state}"
+    assert int(inst.variables.get("countersignDisagreeFlag")) == 1, "countersignDisagreeFlag=1 应落实例变量"
+    done_a = await repo.find_task_by_id(task_a)
+    assert done_a.taskState == TaskState.DONE, "否决任务应已完成"
+    assert int(done_a.variables.get("countersignDisagreeFlag")) == 1, "countersignDisagreeFlag=1 应落任务变量"
+    assert done_a.actorId == "userA", "否决人应记录为实际操作人 userA"

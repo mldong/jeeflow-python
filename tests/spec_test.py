@@ -750,11 +750,16 @@ async def test_m_query_params():
     assert len(r["data"]["rows"]) == 0, r
 
     # 设计列表：无别名 m_LIKE_name（process-design 页）
+    # 82-9：save 带 remark/icon，page 行应回显（设计页回显字段，对齐 Java/Go）
     await facade.flow("processDesign/save",
-                      {"name": "leave", "displayName": "请假流程", "content": c1, "operator": "zhangsan"})
+                      {"name": "leave", "displayName": "请假流程", "content": c1, "operator": "zhangsan",
+                       "icon": "icon-echo", "remark": "回显验证备注"})
     r = await facade.flow("processDesign/page", {"m_LIKE_name": "leave"})
     assert r["code"] == 0, r
     assert len(r["data"]["rows"]) == 1, r
+    row = r["data"]["rows"][0]
+    assert row["remark"] == "回显验证备注", f"designPage remark 应回显保存值: {row.get('remark')}"
+    assert row["icon"] == "icon-echo", f"designPage icon 应回显保存值: {row.get('icon')}"
 
 
 @pytest.mark.asyncio

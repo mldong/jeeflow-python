@@ -10,7 +10,8 @@ from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowI
 from jeeflow.engine import KEY_AUTO_GEN_TITLE
 from jeeflow.facade import JeeflowFacade
 from jeeflow.memory import MemoryExtRepository
-from jeeflow.model import ProcessDefine, ProcessTask, TaskState, InstanceState, UserInfo
+from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessTask,
+                           TaskState, InstanceState, UserInfo)
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 
 FLOW_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
@@ -827,6 +828,42 @@ async def test_snowflake_id_string_roundtrip():
     assert r2["code"] == 0, r2
     row = [x for x in r2["data"]["rows"] if x["name"] == "snow-flow"][0]
     assert row["id"] == str(snow), row
+
+
+@pytest.mark.asyncio
+async def test_design_detail_his_ids_stringified():
+    """issues/76：processDesign/detail 嵌套 his 列表 id 字符串化——dataclass
+    列表曾绕过出口 _stringify_ids（asdict 前不认），his[].id / processDesignId
+    以 19 位 int 外泄（奇数尾被 float64 四舍五入 off-by-one）。"""
+    eng, repo = setup()
+    ext = MemoryExtRepository()
+    facade = JeeflowFacade(eng, repo, ext)
+
+    snow = 17769128440810003  # 19 位，>2^53，奇数尾
+    await ext.save_design(ProcessDesign(id=snow, name="his-flow", displayName="历史流程",
+                                        type="approval", isDeployed=0))
+    # 两条 his：id 各不相同且都是雪花量级（第二条 +1 验证逐条精确）
+    await ext.save_design_his(ProcessDesignHis(id=snow, processDesignId=snow,
+                                               content='{"v":2}', createUser="t"))
+    await ext.save_design_his(ProcessDesignHis(id=snow - 1, processDesignId=snow,
+                                               content='{"v":1}', createUser="t"))
+
+    r = await facade.flow("processDesign/detail", {"id": str(snow)})
+    assert r["code"] == 0, r
+    d = r["data"]
+    # 主 id 字符串（既有契约，回归锚点）
+    assert d["id"] == str(snow) and isinstance(d["id"], str), d
+    # his 列表必须已是普通 dict（asdict 后），且 id 键为精确字符串
+    his = d["his"]
+    assert len(his) == 2, d
+    for h in his:
+        assert isinstance(h, dict), f"his 项应为 dict（dataclass 已被出口 hook 转换）: {type(h)}"
+        assert isinstance(h["id"], str), f"his[].id 应为字符串: {h!r}"
+        assert isinstance(h["processDesignId"], str), f"his[].processDesignId 应为字符串: {h!r}"
+    ids = [h["id"] for h in his]
+    # 逐条精确十进制（顺序非契约点）——若 float64 舍入改写奇数尾，字符串值会不同
+    assert sorted(ids) == [str(snow - 1), str(snow)], ids
+    assert all(h["processDesignId"] == str(snow) for h in his)
 
 
 @pytest.mark.asyncio

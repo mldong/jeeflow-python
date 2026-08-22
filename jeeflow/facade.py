@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import asyncio
 import json
@@ -1264,7 +1265,11 @@ def _is_id_key(k: str) -> bool:
 def _stringify_ids(v):
     """出口 id 统一 string 化（issues/38 E9，对齐 Node 全程 string / Java 全局
     ToStringSerializer）——递归处理 dict/list；id 类字段的 int 值转 str，
-    None 保持 None（parentId 无值不出 'None'），字符串直通。"""
+    None 保持 None（parentId 无值不出 'None'），字符串直通。
+
+    dataclass 分支（issues/76）：dataclass 实例 asdict 后递归，收口
+    "嵌套 dataclass 列表整表外泄 int id" 的泄漏面（his 列表），
+    对齐 Go stringifyIDs 处理 reflect.Struct（issues/58）。"""
     if isinstance(v, dict):
         return {k: (_stringify_ids(val) if not _is_id_key(k) else
                     (None if val is None else
@@ -1272,4 +1277,6 @@ def _stringify_ids(v):
                 for k, val in v.items()}
     if isinstance(v, (list, tuple)):
         return [_stringify_ids(x) for x in v]
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        return _stringify_ids(dataclasses.asdict(v))
     return v

@@ -651,3 +651,18 @@ async def test_facade_listByType_and_topLevelJson():
     assert r["code"] == 0, r
     assert r["data"]["tableName"] == "biz_top"
     assert r["data"]["title"] == "业务数据"
+
+    # ── issues/81：listByType items 必含 processDefineState（前端发起按钮硬依赖）──
+    # 场景 A：deploy 后定义 state=1 → 可发起
+    r = await facade.flow("processDesign/listByType", {})
+    assert r["code"] == 0, r
+    item_a = next(x for x in r["data"]["approval"] if x["name"] == "simple")
+    assert str(item_a["processDefineId"]) == str(define_id), item_a
+    assert item_a["processDefineState"] == 1, f"启用定义 processDefineState 应为 1: {item_a}"
+    # 场景 B：upAndDown 禁用 → 定义 state=0 → 前端置灰
+    r = await facade.flow("processDefine/upAndDown", {"id": define_id, "opType": 0})
+    assert r["code"] == 0, r
+    r = await facade.flow("processDesign/listByType", {})
+    assert r["code"] == 0, r
+    item_b = next(x for x in r["data"]["approval"] if x["name"] == "simple")
+    assert item_b["processDefineState"] == 0, f"禁用定义 processDefineState 应为 0: {item_b}"

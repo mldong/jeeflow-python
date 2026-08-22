@@ -887,6 +887,11 @@ class JeeflowFacade:
         if not task:
             raise ValueError("任务不存在")
         actors = await self._repo.find_task_actors(task_id)
+        # issues/82-5：任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底 record.ext?.isFirstTaskNode）
+        # 首个任务节点且 DOING → true，与 instance detail 的 activeTaskList 行语义一致
+        t_ext = dict(task.variables or {})
+        doing = task.taskState == TaskState.DOING
+        t_ext["isFirstTaskNode"] = False
         vo = {
             "id": task.id, "processInstanceId": task.processInstanceId,
             "taskName": task.taskName, "displayName": task.displayName,
@@ -895,6 +900,7 @@ class JeeflowFacade:
             "taskState": int(task.taskState) if task.taskState is not None else None,
             "operator": task.actorId, "formKey": task.formKey,
             "taskActorIdList": actors, "executable": task.is_allowed(operator),
+            "ext": t_ext,
         }
         # taskModel：流程定义中对应节点
         inst = await self._repo.find_instance_by_id(task.processInstanceId)
@@ -902,6 +908,8 @@ class JeeflowFacade:
             def_ = await self._repo.find_define_by_id(inst.defineId)
             if def_:
                 vo["jsonObject"] = self._parse_graph(def_.content)  # issues/05
+                t_ext["isFirstTaskNode"] = doing and task.taskName == self._first_task_node_id(
+                    self._parse_graph(def_.content))
                 try:
                     flow = json.loads(def_.content)
                     for n in flow.get("nodes", []):

@@ -672,6 +672,16 @@ async def test_m_query_params():
     assert r["code"] == 0, r
     assert len(r["data"]["rows"]) == 0, r
 
+    # issues/82-6：实例列表按编码搜 m_pd_LIKE_name（别名 pd → pd.name）
+    r = await facade.flow("processInstance/page",
+                          {"operator": "zhangsan", "m_pd_LIKE_name": "simple"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 1, r
+    r = await facade.flow("processInstance/page",
+                          {"operator": "zhangsan", "m_pd_LIKE_name": "zzz"})
+    assert r["code"] == 0, r
+    assert len(r["data"]["rows"]) == 0, r
+
     # 任务列表：m_t_LIKE_displayName（别名 t → t.display_name）
     r = await facade.flow("processTask/todoList",
                           {"operator": "leader", "m_t_LIKE_displayName": "审批"})
@@ -992,6 +1002,146 @@ async def test_page_envelope_five_keys():
     assert empty["code"] == 0, empty
     assert empty["data"]["recordCount"] == 0
     assert empty["data"]["totalPage"] == 0
+
+
+# ═══ 82-1 时间格式 + 82-3 列表行 instanceExt 容器（对齐 Node spec it 19）═══
+
+TIME_RE = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
+
+
+@pytest.mark.asyncio
+async def test_list_row_time_format_and_instance_ext():
+    """issues/82-1：列表行时间 yyyy-MM-dd HH:mm:ss（无 T，Python 此前完全缺）
+    issues/82-3：列表行 instanceExt / ext 容器（待办/已办/我发起/抄送）"""
+    import re
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    r0 = await facade.flow("processDefine/deploy", {"content": content})
+    assert r0["code"] == 0, r0
+    r1 = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": r0["data"]["processDefineId"], "operator": "zhangsan"})
+    assert r1["code"] == 0, r1
+    instance_id = int(r1["data"]["processInstanceId"])
+
+    # todoList：ext + instanceExt + version + 时间格式
+    r2 = await facade.flow("processTask/todoList", {"operator": "leader"})
+    assert r2["code"] == 0, r2
+    assert len(r2["data"]["rows"]) > 0, r2
+    row = r2["data"]["rows"][0]
+    assert isinstance(row.get("ext"), dict), row
+    assert isinstance(row.get("instanceExt"), dict), row
+    assert row.get("version") is not None, row
+    assert re.match(TIME_RE, row["createTime"]), f"createTime 应 yyyy-MM-dd HH:mm:ss（无 T）: {row['createTime']}"
+    assert "T" not in row["createTime"], row["createTime"]
+
+    # 完成任务 → doneList：finishTime 同样格式化
+    doing = await repo.find_doing_tasks(instance_id)
+    assert len(doing) == 1 and doing[0].taskName == "task1", doing
+    r_exec = await facade.flow("processTask/execute",
+                               {"processTaskId": doing[0].id, "operator": "leader", "submitType": 1})
+    assert r_exec["code"] == 0, r_exec
+    r3 = await facade.flow("processTask/doneList", {"operator": "leader"})
+    assert r3["code"] == 0, r3
+    assert len(r3["data"]["rows"]) > 0, r3
+    drow = r3["data"]["rows"][0]
+    assert isinstance(drow.get("ext"), dict), drow
+    assert isinstance(drow.get("instanceExt"), dict), drow
+    assert drow.get("version") is not None, drow
+    assert re.match(TIME_RE, drow["finishTime"]), f"finishTime 应 yyyy-MM-dd HH:mm:ss: {drow['finishTime']}"
+    assert re.match(TIME_RE, drow["createTime"]), f"createTime 应 yyyy-MM-dd HH:mm:ss: {drow['createTime']}"
+
+    # instancePage：ext（实例变量对象，对齐 Java/Go 契约：实例行无 instanceExt 键）+ 时间格式
+    r4 = await facade.flow("processInstance/page", {"operator": "zhangsan"})
+    assert r4["code"] == 0, r4
+    assert len(r4["data"]["rows"]) > 0, r4
+    irow = r4["data"]["rows"][0]
+    assert isinstance(irow.get("ext"), dict), irow
+    assert irow.get("displayName"), irow
+    assert irow.get("version") is not None, irow
+    assert re.match(TIME_RE, irow["createTime"]), f"实例行时间应 yyyy-MM-dd HH:mm:ss: {irow['createTime']}"
+
+    # ccList：ext + 时间格式
+    r5 = await facade.flow("processInstance/createCCInstance",
+                           {"processInstanceId": instance_id, "operator": "zhangsan", "actorIds": ["lisi"]})
+    assert r5["code"] == 0, r5
+    r6 = await facade.flow("processInstance/ccList", {"operator": "lisi"})
+    assert r6["code"] == 0, r6
+    assert len(r6["data"]["rows"]) > 0, r6
+    crow = r6["data"]["rows"][0]
+    assert isinstance(crow.get("ext"), dict), crow
+    assert re.match(TIME_RE, crow["createTime"]), f"抄送行时间应 yyyy-MM-dd HH:mm:ss: {crow['createTime']}"
+
+
+# ═══ 82-5 task detail 任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底）═══
+
+@pytest.mark.asyncio
+async def test_task_detail_ext_is_first_task_node():
+    """issues/82-5：task detail 补任务级 ext.isFirstTaskNode（对齐 Java 1912456）
+    场景 1：startAndExecute 自动完成 apply → 剩 task1（DOING，非首节点）→ False
+    场景 2：直接启动（不自动完成 apply）→ apply 为首任务节点且 DOING → True"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+    r0 = await facade.flow("processDefine/deploy", {"content": content})
+    assert r0["code"] == 0, r0
+    define_id = int(r0["data"]["processDefineId"])
+
+    # 场景 1：startAndExecute → task1 DOING 非首节点
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": define_id, "operator": "zhangsan"})
+    assert r1["code"] == 0, r1
+    instance_id = int(r1["data"]["processInstanceId"])
+    task1_id = await _doing_task_id(repo, instance_id, "task1")
+    assert task1_id, "应有 task1 进行中任务"
+    r = await facade.flow("processTask/detail", {"id": task1_id, "operator": "leader"})
+    assert r["code"] == 0, r
+    ext = r["data"]["ext"]
+    assert isinstance(ext, dict), r["data"]
+    assert ext["isFirstTaskNode"] is False, ext
+
+    # 场景 2：直接启动（不走 startAndExecute 的自动完成）→ apply 为首任务节点且 DOING
+    eng2, repo2 = setup()
+    facade2 = JeeflowFacade(eng2, repo2, MemoryExtRepository())
+    df = ProcessDefine(name="simple", displayName="简单流程", type="approval", state=1)
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        df.content = f.read()
+    repo2.add_define(df)
+    inst2 = await eng2.start_process_instance_by_id(df.id, "zhangsan", None)
+    apply_id = await _doing_task_id(repo2, inst2.id, "apply")
+    assert apply_id, "apply 应为进行中任务"
+    r = await facade2.flow("processTask/detail", {"id": apply_id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    ext2 = r["data"]["ext"]
+    assert isinstance(ext2, dict), r["data"]
+    assert ext2["isFirstTaskNode"] is True, ext2
+
+
+# ═══ 按 id 查"记录不存在"负向（对齐 PHP 6 处模板 / Java 1912456）═══
+
+@pytest.mark.asyncio
+async def test_detail_by_id_not_found():
+    """issues/82 负向：define/instance/design/task 按 id 查不存在 → 99999999 + 明确 msg"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    r = await facade.flow("processDefine/detail", {"id": 999999999999999999})
+    assert r["code"] == 99999999, r
+    assert "流程定义不存在" in r["msg"], r
+
+    r = await facade.flow("processInstance/detail", {"id": 999999999999999999})
+    assert r["code"] == 99999999, r
+    assert "流程实例不存在" in r["msg"], r
+
+    r = await facade.flow("processDesign/detail", {"id": 999999999999999999})
+    assert r["code"] == 99999999, r
+    assert "流程设计不存在" in r["msg"], r
+
+    r = await facade.flow("processTask/detail", {"id": 999999999999999999, "operator": "leader"})
+    assert r["code"] == 99999999, r
+    assert "任务不存在" in r["msg"], r
 
 
 # ═══ execute submitType 2/3/4/5/6/20 门面行为（issues/79，前端按钮全量暴露路径）═══

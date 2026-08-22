@@ -301,10 +301,11 @@ def _match_conditions(conditions, fields: dict) -> bool:
             if not (v <= expect):
                 return False
         elif op == "IN":
-            if expect not in v:
+            # IN 值应为列表；标量列判断"列值在列表内"（对齐 Java/Go：列表才过滤，否则放行）
+            if isinstance(expect, (list, tuple)) and str(v) not in [str(x) for x in expect]:
                 return False
         elif op == "NIN":
-            if expect in v:
+            if isinstance(expect, (list, tuple)) and str(v) in [str(x) for x in expect]:
                 return False
     return True
 
@@ -361,7 +362,7 @@ class MemoryExtRepository(ProcessExtRepository):
         now = datetime.now()
         s.createTime = s.createTime or now
         s.updateTime = s.updateTime or now
-        s.enabled = s.enabled or 1
+        # 显式 enabled=0 是合法值（停用委托）；缺省由门面处理（对齐 Java/Go，issues/82-7）
         self._surrogates[s.id] = deepcopy(s)
 
     async def update_surrogate(self, s: ProcessSurrogate):
@@ -454,7 +455,7 @@ class MemoryExtRepository(ProcessExtRepository):
         now = datetime.now()
         s.createTime = s.createTime or now
         s.updateTime = s.updateTime or now
-        s.enabled = s.enabled or 1
+        # 显式 enabled=0 是合法值（停用委托）；缺省由门面处理（对齐 Java/Go，issues/82-7）
         self._surrogates[s.id] = deepcopy(s)
 
     async def update_surrogate(self, s: ProcessSurrogate):

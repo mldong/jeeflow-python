@@ -22,7 +22,7 @@ from jeeflow.repository import JdbcRepository, TsIDGenerator, MySqlAdapter, Post
 from jeeflow.repository.ext import JdbcProcessExtRepository
 from jeeflow.model import ProcessDesign, ProcessDesignHis, ProcessSurrogate
 from jeeflow.model import ProcessDefine, InstanceState, TaskState, UserInfo
-from jeeflow.spi import IDGenerator
+from jeeflow.spi import IDGenerator, QueryCondition
 
 DB = sys.argv[1] if len(sys.argv) > 1 else "mysql"
 
@@ -384,6 +384,31 @@ async def main():
         check("委托分页", stotal == 1 and len(srows) == 1, f"total={stotal}")
         await ext_repo.remove_surrogate(s_all.id)
         check("remove_surrogate", await ext_repo.find_surrogate_by_id(s_all.id) is None)
+
+        # 委托分页 m_ 条件（issues/82-7，JDBC 路径）：m_IN_processName / m_EQ_enabled
+        op = "pyext-cond-op"
+        cond_ids = []
+        for pname, en in (("leave", 1), ("overtime", 1), ("sick", 0)):
+            sc = ProcessSurrogate(operator=op, surrogate="c" + pname, processName=pname,
+                                  enabled=en, createUser="t", updateUser="t")
+            await ext_repo.save_surrogate(sc)
+            cond_ids.append(sc.id)
+        check("委托分页无条件=3", (await ext_repo.page_surrogates(filters={"operator": op}))[1] == 3)
+        _, in_total = await ext_repo.page_surrogates(filters={"operator": op},
+            conditions=[QueryCondition(column="t.process_name", operator="IN", value=["leave", "overtime"])])
+        check("m_IN_processName 命中2", in_total == 2, f"total={in_total}")
+        _, eq_total = await ext_repo.page_surrogates(filters={"operator": op},
+            conditions=[QueryCondition(column="t.enabled", operator="EQ", value=1)])
+        check("m_EQ_enabled=1 命中2", eq_total == 2, f"total={eq_total}")
+        _, combo_total = await ext_repo.page_surrogates(filters={"operator": op},
+            conditions=[QueryCondition(column="t.process_name", operator="IN", value=["sick", "overtime"]),
+                        QueryCondition(column="t.enabled", operator="EQ", value=1)])
+        check("m_IN+m_EQ 组合命中1", combo_total == 1, f"total={combo_total}")
+        _, none_total = await ext_repo.page_surrogates(filters={"operator": op},
+            conditions=[QueryCondition(column="t.process_name", operator="IN", value=["none1", "none2"])])
+        check("m_IN 全不命中=0", none_total == 0, f"total={none_total}")
+        for cid in cond_ids:
+            await ext_repo.remove_surrogate(cid)
 
         # ── ⑩.5 page_cc_instances（v1.3.0 ccList 分页）──
         await repo.create_cc_instance(inst.id, "zhangsan", "lisi", "wangwu")

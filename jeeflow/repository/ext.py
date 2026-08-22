@@ -179,8 +179,7 @@ class JdbcProcessExtRepository(ProcessExtRepository):
             s.createTime = now
         if not s.updateTime:
             s.updateTime = now
-        if not s.enabled:
-            s.enabled = 1
+        # 显式 enabled=0 是合法值（停用委托）；缺省由门面处理（对齐 Java/Go，issues/82-7）
         async with self._conn() as conn:
             await conn.execute(self._sql(
                 "INSERT INTO wf_process_surrogate (id, process_name, operator, surrogate, start_time,"
@@ -214,6 +213,12 @@ class JdbcProcessExtRepository(ProcessExtRepository):
                 count_sql += f" AND t.{col} = ?"
                 args.append(val)
                 args2.append(val)
+        # m_ 条件（issues/82-7 委托分页，对齐 page_designs）：LIKE/EQ/IN 等走白名单
+        cond_sql, cond_args = self._build_ext_where(conditions or [], _SURROGATE_WHITELIST)
+        sql += cond_sql
+        count_sql += cond_sql
+        args.extend(cond_args)
+        args2.extend(cond_args)
         async with self._conn() as conn:
             row = await conn.fetchone(self._sql(count_sql), args2)
             total = int(row[0]) if row else 0

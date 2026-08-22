@@ -505,6 +505,62 @@ async def test_facade_surrogate_detail_and_update():
 
 
 @pytest.mark.asyncio
+async def test_facade_surrogate_page_in_and_eq_conditions():
+    """委托分页 m_ 条件（issues/82-7，五语言基准测试）：m_IN_processName / m_EQ_enabled。
+    显式 enabled=0 不得被仓储吞掉（Go/Python 旧 bug：or 1 / truthy 默认把停用变启用）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    # 3 条委托：leave(启用) / overtime(启用) / sick(停用)
+    r = await facade.flow("processSurrogate/save",
+                          {"operator": "zhangsan", "surrogate": "lisi",
+                           "processName": "leave", "enabled": 1})
+    assert r["code"] == 0, r
+    r = await facade.flow("processSurrogate/save",
+                          {"operator": "zhangsan", "surrogate": "wangwu",
+                           "processName": "overtime", "enabled": 1})
+    assert r["code"] == 0, r
+    r = await facade.flow("processSurrogate/save",
+                          {"operator": "zhangsan", "surrogate": "zhaoliu",
+                           "processName": "sick", "enabled": 0})
+    assert r["code"] == 0, r
+
+    # 无过滤：3 条
+    r = await facade.flow("processSurrogate/page", {"operator": "zhangsan"})
+    assert r["code"] == 0 and r["data"]["recordCount"] == 3, r
+
+    # m_IN_processName：IN 列表命中 2 条
+    r = await facade.flow("processSurrogate/page",
+                          {"operator": "zhangsan", "m_IN_processName": ["leave", "overtime"]})
+    assert r["code"] == 0, r
+    d = r["data"]
+    assert d["recordCount"] == 2, d
+    names = [row["processName"] for row in d["rows"]]
+    assert "leave" in names and "overtime" in names, names
+
+    # m_EQ_enabled：启用过滤命中 2 条（依赖 enabled=0 未被吞）
+    r = await facade.flow("processSurrogate/page",
+                          {"operator": "zhangsan", "m_EQ_enabled": 1})
+    assert r["code"] == 0 and r["data"]["recordCount"] == 2, r
+
+    # m_IN + m_EQ 组合：sick/overtime 中仅启用 → 1 条（overtime）
+    r = await facade.flow("processSurrogate/page",
+                          {"operator": "zhangsan",
+                           "m_IN_processName": ["sick", "overtime"], "m_EQ_enabled": 1})
+    assert r["code"] == 0, r
+    d = r["data"]
+    assert d["recordCount"] == 1 and d["rows"][0]["processName"] == "overtime", d
+
+    # 负向：IN 全不命中 / EQ 无匹配 → 0 条
+    r = await facade.flow("processSurrogate/page",
+                          {"operator": "zhangsan", "m_IN_processName": ["none1", "none2"]})
+    assert r["code"] == 0 and r["data"]["recordCount"] == 0, r
+    r = await facade.flow("processSurrogate/page",
+                          {"operator": "zhangsan", "m_EQ_enabled": 2})
+    assert r["code"] == 0 and r["data"]["recordCount"] == 0, r
+
+
+@pytest.mark.asyncio
 async def test_facade_errors():
     """门面错误路径：未知 action / 缺扩展仓储"""
     eng, repo = setup()

@@ -954,7 +954,8 @@ class JeeflowFacade:
             except Exception:
                 pass
         if candidates:
-            rows = [{"userId": c, "realName": c} for c in candidates]
+            # issues/80：行键对齐前端 UserSelect（valueField='id'）——补 id 键，保留 userId 兼容旧消费方
+            rows = [{"id": c, "userId": c, "realName": c} for c in candidates]
             return self._page_data(rows, len(rows), page_num, page_size)
         # 无模型候选 → 用户分页搜索（依赖 user_search 钩子）
         if self._user_search is None:

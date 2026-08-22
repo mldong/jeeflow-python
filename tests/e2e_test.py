@@ -356,9 +356,17 @@ async def main():
     check("candidatePage 命中双源候选", r13["code"] == 0 and r13["data"]["recordCount"] == 4,
           f"r={r13}")
     if r13["code"] == 0:
-        userIds13 = sorted(x["userId"] for x in r13["data"]["rows"])
+        rows13 = r13["data"]["rows"]
+        userIds13 = sorted(x["userId"] for x in rows13)
         check("候选 = candidateUsers(userA/userB) + candidateGroups(finA/finB)",
               userIds13 == ["finA", "finB", "userA", "userB"], f"candidates={userIds13}")
+        # issues/80：行键契约 {id, realName}（对齐前端 UserSelect valueField='id'）
+        bad13 = [x for x in rows13 if not x.get("id") or "realName" not in x]
+        check("行键含 id+realName", not bad13, f"bad={bad13}")
+        mis13 = [x for x in rows13 if x.get("userId") and x["id"] != x["userId"]]
+        check("id 与 userId 一一对齐（行键归一）", not mis13, f"mis={mis13}")
+        check("id 列表含 userA", "userA" in [x["id"] for x in rows13],
+              f"ids={[x['id'] for x in rows13]}")
     print()
 
     # ═══ 14. startAndExecute 预指派人（f_nextNodeOperator，对齐 boot3）═══════════════

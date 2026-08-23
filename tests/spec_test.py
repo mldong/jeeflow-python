@@ -1458,12 +1458,22 @@ async def test_facade_execute_reject():
     assert len(await repo.find_doing_tasks(inst_id)) == 0, "REJECT 后应无 DOING 任务"
 
 
+async def _doing_task_id_by_actor(repo, instance_id: int, name: str, actor: str):
+    """会签场景：同节点多个 DOING 任务（每 actor 一个），按 actor 定位"""
+    for t in await repo.find_doing_tasks(instance_id):
+        if t.taskName != name:
+            continue
+        if actor in (t.actorIds or []):
+            return t.id
+    return None
+
+
 @pytest.mark.asyncio
-async def test_facade_execute_countersign_disagree():
-    """issues/79：submitType=20 会签一票否决（对齐 Java CountersignHandler / PHP setMerged）"""
+async def test_facade_execute_countersign_disagree_soft():
+    """issues/91：未配 ONE_VOTE_VETO 时 submitType=20 为软拒绝（06 串行推进到下一成员）"""
     eng, repo = setup()
     facade = JeeflowFacade(eng, repo, MemoryExtRepository())
-    # 06-countersign-sequential：apply 自动完成 → task1 串行会签 userA（userB 未开始）
+    # 06-countersign-sequential：apply 自动完成 → task1 串行会签（逐人创建，先 userA）
     with open(os.path.join(FLOW_DIR, "06-countersign-sequential.json"), encoding="utf-8") as f:
         r0 = await facade.flow("processDefine/deploy", {"content": f.read()})
     assert r0["code"] == 0, r0
@@ -1471,19 +1481,88 @@ async def test_facade_execute_countersign_disagree():
                            {"processDefineId": r0["data"]["processDefineId"], "operator": "user1"})
     assert r1["code"] == 0, r1
     instance_id = int(r1["data"]["processInstanceId"])
-    task_a = await _doing_task_id(repo, instance_id, "task1")
+    task_a = await _doing_task_id_by_actor(repo, instance_id, "task1", "userA")
     assert task_a, "会签节点应有 userA 的 DOING 任务"
     await repo.add_task_actor(task_a, ["userA"])
-    # submitType=20：门面自动注入 countersignDisagreeFlag=1 → 引擎一票否决
-    # （会签节点提前流转 end）；flag 落任务/实例变量
+    # submitType=20（未配 ONE_VOTE_VETO → 软拒绝）：flag 记录，流程不阻断，串行推进到下一成员
     r = await facade.flow("processTask/execute",
                           {"processTaskId": task_a, "operator": "userA", "submitType": 20})
     assert r["code"] == 0, r
     inst = await repo.find_instance_by_id(instance_id)
-    # 一票否决效果：会签节点被提前流转 end（若否决未生效，串行会签将停在 DOING 等 userB）
-    assert inst.state == InstanceState.DONE, f"会签否决后实例应完成 FINISHED(20): {inst.state}"
+    assert inst.state == InstanceState.DOING, f"软拒绝后实例应保持 DOING(10)，继续等 userB: {inst.state}"
+    assert int(inst.variables.get("countersignDisagreeFlag")) == 1, "countersignDisagreeFlag=1 应落实例变量"
+    done_a = await repo.find_task_by_id(task_a)
+    assert done_a.taskState == TaskState.DONE, "软拒绝任务应正常完成"
+    assert int(done_a.variables.get("countersignDisagreeFlag")) == 1, "countersignDisagreeFlag=1 应落任务变量"
+    assert done_a.actorId == "userA", "否决人应记录为实际操作人 userA"
+    # 软拒绝推进串行会签到下一成员：userB 任务应被创建且 DOING
+    assert await _doing_task_id_by_actor(repo, instance_id, "task1", "userB"), \
+        "软拒绝后串行会签应推进到 userB（DOING）"
+
+
+@pytest.mark.asyncio
+async def test_facade_execute_countersign_one_vote_veto():
+    """issues/91：13（并行 + ONE_VOTE_VETO）→ 任一成员 submitType=20 一票否决
+    → 会签节点立即推进 end（实例 DONE），其余 DOING 会签任务废弃(ABANDONED 99)"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "13-countersign-one-vote-veto.json"), encoding="utf-8") as f:
+        r0 = await facade.flow("processDefine/deploy", {"content": f.read()})
+    assert r0["code"] == 0, r0
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r0["data"]["processDefineId"], "operator": "user1"})
+    assert r1["code"] == 0, r1
+    instance_id = int(r1["data"]["processInstanceId"])
+    # 并行会签全员预创建：userA/userB/userC 三个 DOING 任务
+    task_a = await _doing_task_id_by_actor(repo, instance_id, "task1", "userA")
+    task_b = await _doing_task_id_by_actor(repo, instance_id, "task1", "userB")
+    task_c = await _doing_task_id_by_actor(repo, instance_id, "task1", "userC")
+    assert task_a and task_b and task_c, "并行会签应预创建 userA/userB/userC 三个 DOING 任务"
+    await repo.add_task_actor(task_a, ["userA"])
+    # userA 会签不同意（已配 ONE_VOTE_VETO → 一票否决）
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": task_a, "operator": "userA", "submitType": 20})
+    assert r["code"] == 0, r
+    inst = await repo.find_instance_by_id(instance_id)
+    assert inst.state == InstanceState.DONE, f"一票否决后会签节点应立即推进 end（实例 DONE 20）: {inst.state}"
     assert int(inst.variables.get("countersignDisagreeFlag")) == 1, "countersignDisagreeFlag=1 应落实例变量"
     done_a = await repo.find_task_by_id(task_a)
     assert done_a.taskState == TaskState.DONE, "否决任务应已完成"
-    assert int(done_a.variables.get("countersignDisagreeFlag")) == 1, "countersignDisagreeFlag=1 应落任务变量"
     assert done_a.actorId == "userA", "否决人应记录为实际操作人 userA"
+    # 否决应废弃其余成员（ABANDONED 99）
+    for tid in (task_b, task_c):
+        tk = await repo.find_task_by_id(tid)
+        assert tk and tk.taskState == TaskState.ABANDONED, f"否决应废弃其余成员任务为 ABANDONED(99): id={tid}"
+    assert len(await repo.find_doing_tasks(instance_id)) == 0, "否决后应无 DOING 任务"
+
+
+@pytest.mark.asyncio
+async def test_facade_execute_countersign_disagree_parallel_soft():
+    """issues/91：05 并行（未配 ONE_VOTE_VETO）submitType=20 软拒绝
+    ——否决者任务完成、flag 记录、流程不阻断，其余成员仍 DOING"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "05-countersign-parallel.json"), encoding="utf-8") as f:
+        r0 = await facade.flow("processDefine/deploy", {"content": f.read()})
+    assert r0["code"] == 0, r0
+    r1 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": r0["data"]["processDefineId"], "operator": "user1"})
+    assert r1["code"] == 0, r1
+    instance_id = int(r1["data"]["processInstanceId"])
+    task_a = await _doing_task_id_by_actor(repo, instance_id, "task1", "userA")
+    task_b = await _doing_task_id_by_actor(repo, instance_id, "task1", "userB")
+    task_c = await _doing_task_id_by_actor(repo, instance_id, "task1", "userC")
+    assert task_a and task_b and task_c, "并行会签应预创建 userA/userB/userC 三个 DOING 任务"
+    await repo.add_task_actor(task_a, ["userA"])
+    # userA 会签不同意（未配 ONE_VOTE_VETO → 软拒绝）
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": task_a, "operator": "userA", "submitType": 20})
+    assert r["code"] == 0, r
+    inst = await repo.find_instance_by_id(instance_id)
+    assert inst.state == InstanceState.DOING, f"并行软拒绝后实例应保持 DOING(10)，等 userB/userC: {inst.state}"
+    assert int(inst.variables.get("countersignDisagreeFlag")) == 1, "countersignDisagreeFlag=1 应落实例变量"
+    done_a = await repo.find_task_by_id(task_a)
+    assert done_a.taskState == TaskState.DONE, "软拒绝任务应正常完成"
+    for tid in (task_b, task_c):
+        tk = await repo.find_task_by_id(tid)
+        assert tk and tk.taskState == TaskState.DOING, f"软拒绝不应废弃其余成员，应保持 DOING: id={tid}"

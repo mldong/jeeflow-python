@@ -91,10 +91,14 @@ class EngineImpl(Engine):
             # _create_task 不再触发（引擎语义修正），此处为完成任务节点的唯一触发点
             await self._fire_post(cur_node, inst)
             ct = cur_node.properties.get("countersignType", "")
-            # issues/79：会签一票否决（对齐 Java CountersignHandler / PHP setMerged(true)）——
-            # submitType=20 COUNTERSIGN_DISAGREE 时跳过会签"未完成即停留"门控，提前流转后续节点
+            cs_cond = str(cur_node.properties.get("countersignCompletionCondition", "") or "").strip()
+            # issues/91：会签一票否决仅当节点配置 ONE_VOTE_VETO（忽略大小写）时生效，
+            # submitType=20 才跳过会签"未完成即停留"门控提前流转；否则为软拒绝——
+            # 否决者任务正常完成、countersignDisagreeFlag=1 已记录为变量（供下游参考），
+            # 流程不阻断（对齐 mldong 内置引擎 / Java CountersignHandler）
             try:
-                cs_veto = ct != "" and int(vars_.get(KEY_SUBMIT_TYPE, -1)) == int(SubmitType.COUNTERSIGN_DISAGREE)
+                cs_veto = ct != "" and cs_cond.upper() == "ONE_VOTE_VETO" and \
+                    int(vars_.get(KEY_SUBMIT_TYPE, -1)) == int(SubmitType.COUNTERSIGN_DISAGREE)
             except (ValueError, TypeError):
                 cs_veto = False
             if ct == "SEQUENTIAL" and not cs_veto:
@@ -114,6 +118,17 @@ class EngineImpl(Engine):
             if (ct in ("PARALLEL",) or ct.startswith("RATIO")) and not cs_veto:
                 doing = await self.repo.find_doing_tasks(inst.id)
                 if doing: return await self.repo.find_instance_by_id(inst.id)
+
+            # issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
+            # 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
+            # SEQUENTIAL 逐人创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余成员
+            # （刚完成者已 DONE 不会误伤）。逐条持久化并回写聚合副本（E25：防 update_instance 级联回写旧状态）
+            if ct:
+                remaining = await self.repo.find_doing_tasks(inst.id, [cur_node.id])
+                for t in remaining:
+                    t.abandon(now)
+                    await self.repo.update_task(t)
+                    _sync_task_to_aggregate(inst, t)
 
             for node in _follow_edges(flow, cur_node.id):
                 # 统一走 _execute_node：结束节点也经节点执行链（拦截器/事件完整触发），

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import pytest
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -452,6 +453,52 @@ async def test_facade_design_and_surrogate():
 
     r = await facade.flow("processSurrogate/remove", {"id": surrogate_id})
     assert r["code"] == 0, r
+
+
+@pytest.mark.asyncio
+async def test_facade_surrogate_effective_window_and_enabled():
+    """委托生效判断（issues/82-12，对齐 Java 基准）：时间窗 startTime/endTime +
+    enabled 过滤。5 条委托各对应一个时间态：在窗/未到/已过/无窗(enabled=0)/无窗(enabled=1)，
+    每条查询只命中其中一条（processName 精确区分）→ 不依赖仓储返回顺序。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    op = "winop"
+
+    async def save(sur, pn, start=None, end=None, enabled=1):
+        args = {"operator": op, "surrogate": sur, "processName": pn, "enabled": enabled}
+        if start:
+            args["startTime"] = start
+        if end:
+            args["endTime"] = end
+        r = await facade.flow("processSurrogate/save", args)
+        assert r["code"] == 0, r
+
+    # A 在窗（2026-08-01 ~ 08-31）
+    await save("sA", "winA", "2026-08-01 00:00:00", "2026-08-31 23:59:59")
+    # B 未到（2026-09-01 起）
+    await save("sB", "winB", "2026-09-01 00:00:00")
+    # C 已过（07-31 止）
+    await save("sC", "winC", end="2026-07-31 23:59:59")
+    # D 无窗但停用（enabled=0）
+    await save("sD", "winD", enabled=0)
+    # E 无窗且启用（enabled=1）
+    await save("sE", "winE")
+
+    at = datetime(2026, 8, 15, 12, 0, 0)
+    hit = await facade._ext.get_surrogate(op, "winA", at)
+    assert hit is not None and hit.surrogate == "sA", "在窗委托应生效"
+    assert await facade._ext.get_surrogate(op, "winB", at) is None, "未到窗委托不应生效"
+    assert await facade._ext.get_surrogate(op, "winC", at) is None, "已过窗委托不应生效"
+    assert await facade._ext.get_surrogate(op, "winD", at) is None, "enabled=0 不应生效"
+    hit = await facade._ext.get_surrogate(op, "winE", at)
+    assert hit is not None and hit.surrogate == "sE", "无窗启用委托应生效（NULL=不限）"
+    assert await facade._ext.get_surrogate(op, "winZ", at) is None, "无匹配流程应返回 None"
+
+    # 换时间验证窗口边界随时间变化：B 在 9 月生效、A 在 9 月失效
+    at_sep = datetime(2026, 9, 15, 12, 0, 0)
+    hit = await facade._ext.get_surrogate(op, "winB", at_sep)
+    assert hit is not None and hit.surrogate == "sB", "9 月：B 进入窗口应生效"
+    assert await facade._ext.get_surrogate(op, "winA", at_sep) is None, "9 月：A 已出窗口不应生效"
 
 
 @pytest.mark.asyncio

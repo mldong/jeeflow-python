@@ -1289,6 +1289,26 @@ async def test_detail_by_id_not_found():
     assert "任务不存在" in r["msg"], r
 
 
+@pytest.mark.asyncio
+async def test_create_cc_instance_empty_actors():
+    """issues/82 负向：抄送空 actors 报错（对齐 Java/Go/PHP 基准）。
+    createCCInstance 空/缺失 actorIds → 99999999 + msg 含 'actorIds 缺失'。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    # 空 actorIds list
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": 123, "operator": "user1", "actorIds": []})
+    assert r["code"] == 99999999, r
+    assert "actorIds 缺失" in r["msg"], r
+
+    # 负向边界：actorIds 键完全缺失同样报错
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": 123, "operator": "user1"})
+    assert r["code"] == 99999999, r
+    assert "actorIds 缺失" in r["msg"], r
+
+
 # ═══ execute submitType 2/3/4/5/6/20 门面行为（issues/79，前端按钮全量暴露路径）═══
 
 async def _start_multi_task_at(facade, repo, name: str) -> int:

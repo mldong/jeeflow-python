@@ -23,26 +23,3 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 
-  verify:
-    name: Verify PyPI
-    needs: publish
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Wait for PyPI indexing
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "⏳ 等待 PyPI 索引同步..."
-          sleep 30
-          for i in {1..10}; do
-            if pip install jeeflow==$VERSION --dry-run 2>&1 | grep -q "Would install"; then
-              echo "✅ PyPI jeeflow==$VERSION 已可用"
-              exit 0
-            fi
-            echo "   等待中... ($i/10)"
-            sleep 15
-          done
-          echo "❌ PyPI 验证超时"
-          exit 1

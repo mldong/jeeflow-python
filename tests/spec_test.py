@@ -1309,6 +1309,29 @@ async def test_create_cc_instance_empty_actors():
     assert "actorIds 缺失" in r["msg"], r
 
 
+@pytest.mark.asyncio
+async def test_snowflake_id_precision_guard():
+    """issues/82 负向（对齐 Go TestSnowflakeIDPrecision / Node toId / Java toLong / issues/38 E9）：
+    雪花 id 精度守卫。浮点型 id 超 2^53（json 解析 / 调用方 float 已丢精度）→ 显性报错，
+    不 int() 静默截断；字符串雪花 id → 精确解析（无该定义 → 报 'define not found' 含原始 id）。
+    注：Python json 整数本为任意精度 int 精确，故此路径仅在显式传 float 时触发（防御性对齐五语言）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    # ① 浮点雪花 id（> 2^53，精度已丢）→ 显性报错
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": 2084320543834124288.0, "operator": "user1"})
+    assert r["code"] == 99999999, r
+    assert "超出 float64 精确范围" in r["msg"], r
+
+    # ② 字符串雪花 id → 精确解析（无该定义 → define not found 含原始完整 id，且不崩溃）
+    SNOW = "2084320543834124290"
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": SNOW, "operator": "user1"})
+    assert r["code"] == 99999999, r
+    assert SNOW in r["msg"], f"字符串应精确解析（消息应含原始雪花 id）: {r['msg']}"
+
+
 # ═══ execute submitType 2/3/4/5/6/20 门面行为（issues/79，前端按钮全量暴露路径）═══
 
 async def _start_multi_task_at(facade, repo, name: str) -> int:

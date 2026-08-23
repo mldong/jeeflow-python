@@ -1080,6 +1080,11 @@ class JeeflowFacade:
     def _to_int(v) -> Optional[int]:
         if v is None:
             return None
+        # issues/82 负向（对齐 Go TestSnowflakeIDPrecision / Node toId / Java toLong / issues/38 E9）：
+        # 浮点型 id 超 2^53 说明精度已丢（json 解析 / 调用方 float 产物），必须显性报错，
+        # 不能 int() 静默截断成错误 id。Python int 本任意精度不受限，仅 float 会丢精度。
+        if isinstance(v, float) and abs(v) > 2 ** 53:
+            raise ValueError(f"id {v} 超出 float64 精确范围（2^53），请以字符串传递")
         try:
             return int(v)
         except (TypeError, ValueError):

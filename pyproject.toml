@@ -2,6 +2,8 @@
 name = "jeeflow"
 version = "1.8.20"
 description = "Lightweight async workflow engine - Python implementation"
+license = { text = "Apache-2.0" }
+authors = [{ name = "mldong" }]
 requires-python = ">=3.10"
 
 # 核心零依赖。JDBC 仓储按数据库选装（pip install jeeflow[mysql] / jeeflow[postgres]）；

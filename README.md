@@ -2,8 +2,8 @@
 
 轻量级异步工作流引擎 — Python 实现，对齐 [jeeflow SPEC](https://jeeflow-doc.mldong.com/spec/)。
 
-> **v1.1.0**：新增管理扩展（流程设计/历史/委托 + `ProcessExtRepository`）与统一门面
-> `JeeflowFacade.flow(action, dict)`；assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行对齐 boot2/boot3。
+统一门面 `JeeflowFacade.flow(action, dict)`；支持管理扩展（流程设计/历史/委托）、
+assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行。
 
 ## 快速开始
 
@@ -101,21 +101,13 @@ pytest tests/ -v
 # 10 passed
 ```
 
-## 与其他语言版本对比
+## 多语言联邦
 
-| 特性 | Java | Go | Node.js | Python |
-|------|------|-----|---------|--------|
-| 引擎核心 | ✅ | ✅ | ✅ | ✅ |
-| 拦截器 | ✅ | ✅ | ✅ | ✅ |
-| 事件监听 | ✅ | ✅ | ✅ | ✅ |
-| HandlerRegistry | ✅ | ✅ | ✅ | ✅ |
-| 会签 | ✅ | ✅ | ✅ | ✅ |
-| 决策表达式 | ✅ | ✅ | ✅ | ✅ |
-| Fork/Join | ✅ | ✅ | ✅ | ✅ |
-| 驳回/跳转 | ✅ | ✅ | ✅ | ✅ |
-| Demo + 前端 | ✅ | ✅ | ✅ | ✅ |
-| SPEC 合规测试 | ✅ | ✅ | ✅ | ✅ |
+与 Java / Go / Node / PHP / Rust 等实现共享同一套契约与流程 JSON，详见 [jeeflow-doc](https://jeeflow-doc.mldong.com)。
 
-## 许可
+## License
 
-Apache 2.0
+Copyright © 2025-2026 mldong
+
+Licensed under the Apache License, Version 2.0.
+See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).

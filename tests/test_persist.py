@@ -16,8 +16,8 @@ from jeeflow.persist import JdbcDynamicTableWriter, PersistPostInterceptor, regi
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 from jeeflow.engine import KEY_SUBMIT_TYPE
 
-FLOW_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
-                        "jeeflow-core", "src", "test", "resources", "flows")
+import flows_resolver
+FLOW_DIR = flows_resolver.dir()
 
 # ─── Test Stubs（与 spec_test 同构） ─────────────────────────────────────────────
 
@@ -625,10 +625,7 @@ async def test_facade_listByType_and_topLevelJson():
     assert groups["approval"][0]["jsonObject"] is not None
 
     # 真实流程（01-simple + relTableName 注入）供 bizData 测试
-    import os as _os
-    flow_dir = _os.path.join(_os.path.dirname(__file__), "..", "..", "jeeflow-java",
-                             "jeeflow-core", "src", "test", "resources", "flows")
-    simple = open(_os.path.join(flow_dir, "01-simple.json"), encoding="utf-8").read()
+    simple = open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8").read()
     simple = simple.replace('"type": "approval"', '"type": "approval", "relTableName": "biz_top"', 1)
     r = await facade.flow("processDesign/updateDefine", {
         "processDesignId": 2, "operator": "user1", "content": simple})

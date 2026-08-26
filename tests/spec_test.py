@@ -15,8 +15,8 @@ from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, Proce
                            TaskState, InstanceState, UserInfo)
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 
-FLOW_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
-                        "jeeflow-core", "src", "test", "resources", "flows")
+import flows_resolver
+FLOW_DIR = flows_resolver.dir()
 
 
 # ─── Test Stubs ──────────────────────────────────────────────────────────────────

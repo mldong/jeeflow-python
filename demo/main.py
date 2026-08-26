@@ -16,11 +16,12 @@ from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, Jeefl
 from jeeflow.memory import MemoryExtRepository
 from jeeflow.model import InstanceState, TaskState, ProcessDefine, ProcessInstance, ProcessTask, UserInfo, parse_flow_model
 from jeeflow.spi import IDGenerator, ExpressionEvaluator, OrgUserProvider
+import flows_resolver
 
 # ─── Setup ───────────────────────────────────────────────────────────────────────
 
-FLOWS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
-                         "jeeflow-core", "src", "test", "resources", "flows")
+# 流程定义：只读本仓 flows/（flows_resolver 已在维护者机器上把 Java 源精确镜像进来）
+FLOWS_DIR = flows_resolver.dir()
 
 class SnowflakeIDGen(IDGenerator):
     """简化雪花 ID"""

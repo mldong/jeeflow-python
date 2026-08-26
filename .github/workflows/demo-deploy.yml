@@ -9,23 +9,12 @@ jobs:
     name: Build & Deploy Python demo
     runs-on: ubuntu-latest
     steps:
-      # Python demo 依赖共享流程 JSON，需 checkout jeeflow-java
-      - name: Checkout jeeflow-java
-        uses: actions/checkout@v4
-        with:
-          repository: mldong/jeeflow-java
-          path: jeeflow-java
-      - name: Checkout jeeflow-python
-        uses: actions/checkout@v4
-        with:
-          path: jeeflow-python
+      # 流程定义用本仓 flows/ 副本（已入库），无需 checkout jeeflow-java
+      - uses: actions/checkout@v4
       - name: Build Docker image
         run: |
-          # Dockerfile.demo 期望构建上下文包含 jeeflow-java/ 和 python 源码
-          mkdir -p /tmp/demo-build
-          cp -r jeeflow-python /tmp/demo-build/
-          cp -r jeeflow-java /tmp/demo-build/
-          docker build -f /tmp/demo-build/jeeflow-python/Dockerfile.demo -t jeeflow-python-demo:latest /tmp/demo-build/
+          # Dockerfile.demo 构建上下文 = 本仓根（jeeflow/ + demo/ + flows/ + flows_resolver.py）
+          docker build -f Dockerfile.demo -t jeeflow-python-demo:latest .
       - name: Export image
         run: |
           docker save jeeflow-python-demo:latest -o jeeflow-python-demo.tar

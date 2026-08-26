@@ -6,11 +6,12 @@ WORKDIR /app
 RUN pip install --no-cache-dir fastapi uvicorn aiomysql
 
 # 复制引擎源码
-COPY jeeflow-python/jeeflow/ /app/jeeflow/
+COPY jeeflow/ /app/jeeflow/
 # 复制 demo
-COPY jeeflow-python/demo/ /app/demo/
-# 复制共享 flows（demo/main.py 的 FLOWS_DIR = __file__/../../jeeflow-java/...，即容器根目录）
-COPY jeeflow-java/jeeflow-core/src/test/resources/flows /jeeflow-java/jeeflow-core/src/test/resources/flows
+COPY demo/ /app/demo/
+# 流程定义用本仓 flows/ 副本（已入库，demo/main.py 走 flows_resolver；用户单仓即可构建）
+COPY flows /app/flows
+COPY flows_resolver.py /app/flows_resolver.py
 
 EXPOSE 8100
 ENV PORT=8100

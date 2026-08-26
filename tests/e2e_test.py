@@ -6,8 +6,8 @@ from jeeflow import EngineImpl, MemoryRepository, EngineExtensions, FlowIntercep
 from jeeflow.model import ProcessDefine, TaskState, InstanceState, UserInfo
 from jeeflow.spi import IDGenerator, ExpressionEvaluator
 
-FLOWS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
-                         "jeeflow-core", "src", "test", "resources", "flows")
+import flows_resolver
+FLOWS_DIR = flows_resolver.dir()
 
 passed = 0; failed = 0
 

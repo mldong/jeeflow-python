@@ -40,8 +40,8 @@ else:
                db="jeeflow", charset="utf8mb4", autocommit=True, maxsize=5)
     DEFINE_ID = 900002
 
-FLOWS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "jeeflow-java",
-                         "jeeflow-core", "src", "test", "resources", "flows")
+import flows_resolver
+FLOWS_DIR = flows_resolver.dir()
 # 建表 SQL 各语言自带（维护者改 jeeflow-java 仓 resources 后用 scripts/sync-schema.sh 分发）
 SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "schema")
 

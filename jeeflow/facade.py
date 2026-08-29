@@ -229,10 +229,9 @@ class JeeflowFacade:
         return None
 
     async def _processDefine_remove(self, args: dict) -> dict:
-        define_id = self._to_int(args.get("id"))
-        if not define_id:
-            raise ValueError("id 缺失或非法")
-        await self._repo.remove_define(define_id)
+        # issues/95：前端删除统一发 {ids}（此前 Python 唯一没做批量兼容的语言）
+        for define_id in self._id_list(args):
+            await self._repo.remove_define(define_id)
         return None
 
     async def _processDefine_upAndDown(self, args: dict) -> dict:
@@ -240,18 +239,8 @@ class JeeflowFacade:
         state = self._to_int(args.get("opType") if args.get("opType") is not None else args.get("state"))
         if state is None:
             raise ValueError("opType/state 缺失或非法")
-        ids = args.get("ids")
-        if ids:
-            for i in ids:
-                did = self._to_int(i)
-                if not did:
-                    raise ValueError("id 缺失或非法")
-                await self._repo.update_define_state(did, state)
-            return None
-        define_id = self._to_int(args.get("id"))
-        if not define_id:
-            raise ValueError("id 缺失或非法")
-        await self._repo.update_define_state(define_id, state)
+        for define_id in self._id_list(args):
+            await self._repo.update_define_state(define_id, state)
         return None
 
     async def _processInstance_withdraw(self, args: dict) -> dict:
@@ -509,15 +498,9 @@ class JeeflowFacade:
 
     async def _processDesign_remove(self, args: dict) -> dict:
         # issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
-        ids = args.get("ids")
-        if isinstance(ids, (list, tuple)):
-            for i in ids:
-                await self._ext_repo().remove_design(self._to_int(i))
-        else:
-            design_id = self._to_int(args.get("id"))
-            if not design_id:
-                raise ValueError("id 缺失或非法")
-            await self._ext_repo().remove_design(design_id)
+        ext = self._ext_repo()
+        for design_id in self._id_list(args):
+            await ext.remove_design(design_id)
         return None
 
     async def _processDesign_listByType(self, args: dict) -> dict:
@@ -678,10 +661,10 @@ class JeeflowFacade:
                 "updateTime": self._fmt_time(s.updateTime), "updateUser": s.updateUser}
 
     async def _processSurrogate_remove(self, args: dict) -> dict:
-        surrogate_id = self._to_int(args.get("id"))
-        if not surrogate_id:
-            raise ValueError("id 缺失或非法")
-        await self._ext_repo().remove_surrogate(surrogate_id)
+        # issues/95：前端「我的委托」行内/批量删除统一发 {ids}，与 define/design remove 同惯例
+        ext = self._ext_repo()
+        for surrogate_id in self._id_list(args):
+            await ext.remove_surrogate(surrogate_id)
         return None
 
     # ── 视图端点（v1.2.0） ──────────────────────────────────────────────────
@@ -1089,6 +1072,25 @@ class JeeflowFacade:
             return int(v)
         except (TypeError, ValueError):
             return None
+
+    def _id_list(self, args: dict) -> list:
+        """删除/启停类 action 的批量主键：mldong IdsParam 惯例下 {ids} 数组优先，兼容单
+        {id}；两者皆缺失、空数组或含非法值一律报错（issues/95，对齐 Java idListArgs）。"""
+        ids = args.get("ids")
+        if isinstance(ids, (list, tuple)):
+            out = []
+            for v in ids:
+                i = self._to_int(v)
+                if not i:
+                    raise ValueError("id 缺失或非法")
+                out.append(i)
+            if not out:
+                raise ValueError("id 缺失或非法")
+            return out
+        single = self._to_int(args.get("id"))
+        if not single:
+            raise ValueError("id 缺失或非法")
+        return [single]
 
     def _parse_m_query(self, args: dict) -> list:
         """m_ 前缀查询参数解析（issues/05-5，对齐 Java JeeflowQueryParser）：

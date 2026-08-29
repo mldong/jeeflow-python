@@ -552,6 +552,59 @@ async def test_facade_surrogate_detail_and_update():
 
 
 @pytest.mark.asyncio
+async def test_facade_surrogate_remove_batch_ids():
+    """委托删除（issues/95）：前端「我的委托」行内与批量删除统一发 {ids}（行内 = 长度 1
+    的数组），此前六语言门面只读单数 {id} → 该页删除整体不可用；单 {id} 保留兼容
+    （移动端 workflow.uts 发这个）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    async def save(op, agent, name):
+        r = await facade.flow("processSurrogate/save",
+                              {"operator": op, "surrogate": agent, "processName": name})
+        assert r["code"] == 0, r
+        return int(r["data"]["id"])
+
+    a = await save("zhangsan", "lisiA", "leaveA")
+    b = await save("zhangsan", "lisiB", "leaveB")
+    r = await facade.flow("processSurrogate/remove", {"ids": [a, b]})
+    assert r["code"] == 0, r
+    assert await facade._ext.find_surrogate_by_id(a) is None
+    assert await facade._ext.find_surrogate_by_id(b) is None
+
+    # 行内删除：前端同样走 {ids}，长度 1
+    c = await save("lisiC", "lisiD", "leaveC")
+    r = await facade.flow("processSurrogate/remove", {"ids": [c]})
+    assert r["code"] == 0, r
+    assert await facade._ext.find_surrogate_by_id(c) is None
+
+    # 单 {id} 兼容形态回归
+    d = await save("zhangsan", "lisiE", "leaveD")
+    r = await facade.flow("processSurrogate/remove", {"id": d})
+    assert r["code"] == 0, r
+    assert await facade._ext.find_surrogate_by_id(d) is None
+
+
+@pytest.mark.asyncio
+async def test_facade_remove_empty_ids_rejected():
+    """{ids}/{id} 缺失或空数组一律报错，禁止静默成功（issues/95 §5②，六语言统一口径）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    cases = [
+        ("processSurrogate/remove", {"ids": []}),
+        ("processSurrogate/remove", {"surrogate": "lisi"}),
+        ("processSurrogate/remove", {"ids": [123, None]}),
+        ("processDefine/remove", {"ids": []}),
+        ("processDesign/remove", {"ids": []}),
+        ("processDefine/upAndDown", {"ids": [], "opType": 0}),
+    ]
+    for action, args in cases:
+        r = await facade.flow(action, args)
+        assert r["code"] == 99999999, (action, args, r)
+        assert "id 缺失或非法" in r["msg"], (action, args, r)
+
+
+@pytest.mark.asyncio
 async def test_facade_surrogate_page_in_and_eq_conditions():
     """委托分页 m_ 条件（issues/82-7，五语言基准测试）：m_IN_processName / m_EQ_enabled。
     显式 enabled=0 不得被仓储吞掉（Go/Python 旧 bug：or 1 / truthy 默认把停用变启用）。"""

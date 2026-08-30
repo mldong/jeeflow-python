@@ -1619,3 +1619,253 @@ async def test_facade_execute_countersign_disagree_parallel_soft():
     for tid in (task_b, task_c):
         tk = await repo.find_task_by_id(tid)
         assert tk and tk.taskState == TaskState.DOING, f"软拒绝不应废弃其余成员，应保持 DOING: id={tid}"
+
+
+# ─── issues/96 §4B：门面「入口批量参数形态」矩阵（4 action × 4 态）──────────────────
+#
+# 补测理由（issues/96 §1）：既有套件对 remove/启停一律发单数 {id}，引擎就算完全不认
+# 前端真实载荷 {ids} 也照样全绿——issues/95 六语言全绿仍漏检的根因。本矩阵把入参形态
+# 本身钉成断言，四态固定为：
+#   态1 {ids:[a,b]} 两个真实 id → 成功且事后回查两条都取不到（前端真实载荷）
+#   态2 {id:c}                → 旧形态仍生效（防修 bad；移动端 workflow.uts 发这个）
+#   态3 {ids:[]}              → 必须报错，禁止静默成功（含 {ids:[], id:真id} —— ids 优先，
+#                                不得回落到单条，否则空数组静默又回来了）
+#   态4 {ids:[""]} / 含 None   → 必须报错，且整批不生效（校验前置，不许半途删一半）
+#                                另配 {ids:[非法,真id], id:真id} 一格：纯 {ids:[]} 在"只读 id"
+#                                的旧实现下也会因回落而报错（恒真），带上 id 才测得出 ids 分支
+#                                —— 实测旧实现该格回 code=0 并静默删掉真记录。
+# Python 额外前科：_processDefine_remove 当年连批量都没有（issues/95 §6），故 define 方向
+# （remove + upAndDown）两格单独落实。
+
+
+@pytest.mark.asyncio
+async def test_facade_surrogate_remove_ids_form_matrix():
+    """矩阵①processSurrogate/remove（issues/95 本体 / issues/96 §4B）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    async def save(agent, name):
+        r = await facade.flow("processSurrogate/save",
+                              {"operator": "zhangsan", "surrogate": agent, "processName": name,
+                               "startTime": "2026-08-01 00:00:00", "endTime": "2026-08-31 23:59:59",
+                               "enabled": 1})
+        assert r["code"] == 0, r
+        return int(r["data"]["id"])
+
+    async def gone(sid):
+        """事后回查：门面 detail 与仓储两条通道都取不到"""
+        r = await facade.flow("processSurrogate/detail", {"id": sid})
+        assert r["code"] == 99999999, (sid, r)
+        assert await facade._ext.find_surrogate_by_id(sid) is None, sid
+
+    # 态1：{ids} 批量（vben5 process-surrogate/index.vue 勾选删除的真实载荷）
+    a = await save("lisiA", "mxLeaveA")
+    b = await save("lisiB", "mxLeaveB")
+    r = await facade.flow("processSurrogate/remove", {"ids": [a, b]})
+    assert r["code"] == 0, r
+    await gone(a)
+    await gone(b)
+
+    # 态2：单数 {id} 旧形态回归保护
+    c = await save("lisiC", "mxLeaveC")
+    r = await facade.flow("processSurrogate/remove", {"id": c})
+    assert r["code"] == 0, r
+    await gone(c)
+
+    # 态3：空数组报错，且带合法 id 也不得回落
+    d = await save("lisiD", "mxLeaveD")
+    for args in ({"ids": []}, {"ids": [], "id": d}):
+        r = await facade.flow("processSurrogate/remove", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await facade._ext.find_surrogate_by_id(d) is not None, f"空 ids 报错不得动数据: {d}"
+
+    # 态4：空串 / 含 None → 报错且整批不生效（带 id 回落格同样必须报错）
+    e = await save("lisiE", "mxLeaveE")
+    for args in ({"ids": [""]}, {"ids": [e, None]}, {"ids": [e, ""]}, {"ids": [e, None], "id": e}):
+        r = await facade.flow("processSurrogate/remove", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await facade._ext.find_surrogate_by_id(e) is not None, f"含非法值应整批拒绝: {e}"
+    # 同一批换成合法 ids 仍可删除（证明上一步只是没收到 id，不是该记录删不掉）
+    assert (await facade.flow("processSurrogate/remove", {"ids": [e]}))["code"] == 0
+    await gone(e)
+
+
+@pytest.mark.asyncio
+async def test_facade_design_remove_ids_form_matrix():
+    """矩阵②processDesign/remove（issues/28 已下沉批量，但零入口用例）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+
+    async def save(name):
+        r = await facade.flow("processDesign/save",
+                              {"name": name, "displayName": f"矩阵{name}", "content": content,
+                               "operator": "zhangsan"})
+        assert r["code"] == 0, r
+        return int(r["data"]["id"])
+
+    async def gone(design_id):
+        r = await facade.flow("processDesign/detail", {"id": design_id})
+        assert r["code"] == 99999999, (design_id, r)
+        assert await facade._ext.find_design_by_id(design_id) is None, design_id
+
+    # 态1
+    a = await save("mxDesignA")
+    b = await save("mxDesignB")
+    r = await facade.flow("processDesign/remove", {"ids": [a, b]})
+    assert r["code"] == 0, r
+    await gone(a)
+    await gone(b)
+
+    # 态2
+    c = await save("mxDesignC")
+    r = await facade.flow("processDesign/remove", {"id": c})
+    assert r["code"] == 0, r
+    await gone(c)
+
+    # 态3
+    d = await save("mxDesignD")
+    for args in ({"ids": []}, {"ids": [], "id": d}):
+        r = await facade.flow("processDesign/remove", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await facade._ext.find_design_by_id(d) is not None, f"空 ids 报错不得动数据: {d}"
+
+    # 态4：空串 / 含 None → 报错且整批不生效（带 id 回落格同样必须报错）
+    e = await save("mxDesignE")
+    for args in ({"ids": [""]}, {"ids": [e, None]}, {"ids": [e, ""]}, {"ids": [e, None], "id": e}):
+        r = await facade.flow("processDesign/remove", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await facade._ext.find_design_by_id(e) is not None, f"含非法值应整批拒绝: {e}"
+    assert (await facade.flow("processDesign/remove", {"ids": [e]}))["code"] == 0
+    await gone(e)
+
+
+@pytest.mark.asyncio
+async def test_facade_define_remove_ids_form_matrix():
+    """矩阵③processDefine/remove —— Python 独有漏项（issues/95 §6：五语言有批量、
+    Python 连分支都没有），故单独成格。构造沿用同文件方式：deploy 同名流程两次
+    → 两条真实 define（version 0/1），再 getLastByName 复核整个 name 已空。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+
+    async def deploy():
+        r = await facade.flow("processDefine/deploy", {"content": content})
+        assert r["code"] == 0, r
+        return int(r["data"]["processDefineId"])
+
+    async def gone(define_id):
+        r = await facade.flow("processDefine/detail", {"id": define_id})
+        assert r["code"] == 99999999, (define_id, r)
+        assert await repo.find_define_by_id(define_id) is None, define_id
+
+    # 态1：同名两条版本一次删掉
+    a = await deploy()
+    b = await deploy()
+    assert a != b, f"两次 deploy 应生成两条定义: {a}, {b}"
+    r = await facade.flow("processDefine/remove", {"ids": [a, b]})
+    assert r["code"] == 0, r
+    await gone(a)
+    await gone(b)
+    # 名称维度复核：simple 已无任何定义
+    r = await facade.flow("processDefine/getLastByName", {"processDefineName": "simple"})
+    assert r["code"] == 99999999, r
+
+    # 态2
+    c = await deploy()
+    r = await facade.flow("processDefine/remove", {"id": c})
+    assert r["code"] == 0, r
+    await gone(c)
+
+    # 态3
+    d = await deploy()
+    for args in ({"ids": []}, {"ids": [], "id": d}):
+        r = await facade.flow("processDefine/remove", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await repo.find_define_by_id(d) is not None, f"空 ids 报错不得动数据: {d}"
+
+    # 态4：空串 / 含 None → 报错且整批不生效（带 id 回落格同样必须报错）
+    for args in ({"ids": [""]}, {"ids": [d, None]}, {"ids": [d, ""]}, {"ids": [d, None], "id": d}):
+        r = await facade.flow("processDefine/remove", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await repo.find_define_by_id(d) is not None, f"含非法值应整批拒绝: {d}"
+    assert (await facade.flow("processDefine/remove", {"ids": [d]}))["code"] == 0
+    await gone(d)
+
+
+@pytest.mark.asyncio
+async def test_facade_define_up_and_down_ids_form_matrix():
+    """矩阵④processDefine/upAndDown（issues/54 E26 批量 + issues/95 收敛进 _id_list）。
+    ⚠️ 关键坑：本 action 除 ids 外还要求 opType/state——不带就先撞 `opType/state 缺失或非法`，
+    "空 ids 报错"就成了恒真断言。故每一态都带合法 opType，并另加一格专钉 state 校验本身。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        simple_content = f.read()
+    with open(os.path.join(FLOW_DIR, "02-multi-task.json"), encoding="utf-8") as f:
+        multi_content = f.read()
+
+    async def deploy(content):
+        r = await facade.flow("processDefine/deploy", {"content": content})
+        assert r["code"] == 0, r
+        return int(r["data"]["processDefineId"])
+
+    async def state_of(define_id):
+        d = await repo.find_define_by_id(define_id)
+        assert d is not None, define_id
+        return d.state
+
+    DISABLE, ENABLE = 0, 1
+
+    # 态1：{ids} 批量停用 → 两条 state 都变 0（用两个不同 name，getLastByName 各自唯一命中）
+    a = await deploy(simple_content)     # name=simple
+    b = await deploy(multi_content)      # name=multi-task
+    assert await state_of(a) == ENABLE and await state_of(b) == ENABLE, "部署后应为启用态"
+    r = await facade.flow("processDefine/upAndDown", {"ids": [a, b], "opType": DISABLE})
+    assert r["code"] == 0, r
+    assert await state_of(a) == DISABLE and await state_of(b) == DISABLE, "批量停用应对两条都生效"
+    for name in ("simple", "multi-task"):
+        row = await facade.flow("processDefine/getLastByName", {"processDefineName": name})
+        assert row["code"] == 0 and row["data"]["state"] == DISABLE, (name, row)
+
+    # 态2：单数 {id} + state（旧形态，test_facade_deploy_version 同款）→ 只作用这一条
+    r = await facade.flow("processDefine/upAndDown", {"id": a, "state": ENABLE})
+    assert r["code"] == 0, r
+    assert await state_of(a) == ENABLE, "单 {id} 旧形态应仍生效"
+    assert await state_of(b) == DISABLE, f"单条操作不得波及其他定义: {b}"
+
+    # 态3：空数组报错（带合法 opType 才测得到 ids）；且 ids 优先不得回落到 id
+    for args in ({"ids": [], "opType": ENABLE}, {"ids": [], "opType": ENABLE, "id": a}):
+        r = await facade.flow("processDefine/upAndDown", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await state_of(a) == ENABLE and await state_of(b) == DISABLE, "空 ids 报错不得动数据"
+
+    # 态4：空串 / 含 None → 报错且整批不生效（带 id 回落格同样必须报错；opType 全程合法）
+    for args in ({"ids": [""], "opType": DISABLE},
+                 {"ids": [b, None], "opType": DISABLE},
+                 {"ids": [b, ""], "opType": DISABLE},
+                 {"ids": [b, None], "opType": DISABLE, "id": b}):
+        r = await facade.flow("processDefine/upAndDown", args)
+        assert r["code"] == 99999999, (args, r)
+        assert "id 缺失或非法" in r["msg"], (args, r)
+    assert await state_of(b) == DISABLE, f"含非法值应整批拒绝: {b}"
+    # 同一批换成合法 ids 仍可生效（证明上一步是没收到 id，不是这条改不动）
+    assert (await facade.flow("processDefine/upAndDown", {"ids": [b], "opType": ENABLE}))["code"] == 0
+    assert await state_of(b) == ENABLE
+
+    # 另一格：state/opType 自身缺失的报错文案不被 ids 断言掩盖（先撞 state 校验）
+    r = await facade.flow("processDefine/upAndDown", {"ids": [a, b]})
+    assert r["code"] == 99999999, r
+    assert "opType/state 缺失或非法" in r["msg"], r
+    r = await facade.flow("processDefine/upAndDown", {"ids": [], })
+    assert r["code"] == 99999999, r
+    assert "opType/state 缺失或非法" in r["msg"], r

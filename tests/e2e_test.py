@@ -103,6 +103,35 @@ async def main():
     check("完成", inst.state == InstanceState.DONE, f"state={inst.state}")
     print()
 
+    # ═══ 2b. issues/97 发起人 u_realName 稳定性（对齐 Java：execute 不覆盖实例 u_*）════
+    print("[2b] issues/97 实例 u_realName 恒为发起人（操作人 u_* 只在任务行 ext）")
+    inst97 = await _start_and_execute(eng, repo, 2, "alice")
+    check("start: 实例 u_realName=发起人 alice", inst97.variables.get("u_realName") == "alice",
+          f"got={inst97.variables.get('u_realName')}")
+    doing = await repo.find_doing_tasks(inst97.id)
+    await repo.add_task_actor(doing[0].id, ["bob"])
+    done_task_id = doing[0].id
+    inst97 = await eng.execute_process_task(done_task_id, "bob")
+    # 核心：实例 u_realName 不被操作人 bob 覆盖
+    check("execute 后实例 u_realName 仍=alice", inst97.variables.get("u_realName") == "alice",
+          f"got={inst97.variables.get('u_realName')}")
+    check("execute 后实例 u_userId 仍=alice", inst97.variables.get("u_userId") == "alice",
+          f"got={inst97.variables.get('u_userId')}")
+    # autoGenTitle 前缀（发起人）与实例 u_realName 一致
+    title97 = str(inst97.variables.get("autoGenTitle", ""))
+    check("autoGenTitle 前缀=发起人", title97.startswith("alice的"), f"got={title97}")
+    # 任务行 ext（facade 操作人来源）保留操作人 bob 的 u_*
+    done_task = await repo.find_task_by_id(done_task_id)
+    check("任务行 u_realName=操作人 bob", done_task.variables.get("u_realName") == "bob",
+          f"got={done_task.variables.get('u_realName')}")
+    # 深层节点再办一次（userB 办 task2），实例 u_realName 仍为 alice
+    doing = await repo.find_doing_tasks(inst97.id)
+    await repo.add_task_actor(doing[0].id, ["userB"])
+    inst97 = await eng.execute_process_task(doing[0].id, "userB")
+    check("深层节点后实例 u_realName 仍=alice", inst97.variables.get("u_realName") == "alice",
+          f"got={inst97.variables.get('u_realName')}")
+    print()
+
     # ═══ 3. 决策（高金额→task2） ═════════════════════════════════════════════════════
     print("[3] 决策表达式（amount=3000 → 经理审批 task2）")
     inst = await _start_and_execute(eng, repo, 3, "applicant", {"amount": 3000})

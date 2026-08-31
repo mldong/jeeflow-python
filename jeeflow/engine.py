@@ -198,7 +198,10 @@ class EngineImpl(Engine):
         def_ = await self.repo.find_define_by_id(inst.defineId)
         flow = parse_flow_model(json.loads(def_.content))
         args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
-        vars_ = {**inst.variables, **task.variables, **args}
+        # issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
+        # 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
+        base_vars = inst.variables
+        vars_ = {**base_vars, **task.variables, **args}
         await self._add_user_info(operator, vars_)
         now = datetime.now()
         # 聚合根：完成任务（子实体状态转换 + 实例变量合并）
@@ -208,7 +211,8 @@ class EngineImpl(Engine):
         # complete_task 改的是外部任务对象，需同步回聚合根
         _sync_task_to_aggregate(inst, task)
         await self._fire_event(ProcessEvent(EventType.TASK_COMPLETE, inst.id, task.id, task.taskName, operator))
-        inst.variables = vars_
+        # issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
+        inst.variables = _merge_exec_into_instance(base_vars, vars_)
         await self.repo.update_instance(inst)
         return task, inst, flow, vars_
 
@@ -330,7 +334,8 @@ class EngineImpl(Engine):
                     inst.reject(datetime.now())
                 else:
                     inst.finish(datetime.now())
-                inst.variables = vars_
+                # issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 _prepare_execute_task 一致）
+                inst.variables = _merge_exec_into_instance(inst.variables, vars_)
                 await self.repo.update_instance(inst)
                 await self._fire_event(ProcessEvent(EventType.PROCESS_FINISH, inst.id, operator=operator))
         finally:
@@ -531,6 +536,18 @@ def _sync_task_to_aggregate(inst: ProcessInstance, task: ProcessTask):
         if t.id == task.id:
             inst.tasks[i] = task
             return
+
+def _merge_exec_into_instance(base: dict, exec_vars: dict) -> dict:
+    """实例变量写回合并（issues/97 对齐 Java）：以 base（start 注入的发起人 u_*）为底，
+    并入执行上下文中**非 u_*** 键（f_ 表单字段 / submitType 等流转数据）。
+    add_user_info 生成的操作人 u_* 只属于当次执行上下文与任务行 ext，不整体写回实例——
+    实例 u_realName 语义是「发起人」（与 autoGenTitle 一致），不随审批节点漂移。"""
+    out = dict(base)
+    for k, v in exec_vars.items():
+        if k.startswith("u_"):
+            continue
+        out[k] = v
+    return out
 
 def _get_cs_state(vars_: dict, node_id: str):
     actors = vars_.get(f"operatorList_{node_id}")

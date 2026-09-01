@@ -255,6 +255,48 @@ async def main():
     check("事件包含 START/FINISH", "PROCESS_START" in events and "PROCESS_FINISH" in events)
     print()
 
+    # ═══ 10b. TASK_CREATE 事件（对齐 Java CreateTaskHandler / Rust engine.rs）═══════════
+    # 任务落库**之后**逐个 fire，事件带 taskId/taskName/operator，监听器可按 taskId 反查任务 actor。
+    # 独立 repo + engine（避免与主 repo 的 id 序列冲突污染后续用例）。
+    print("[10b] TASK_CREATE 事件（落库后 fire / 会签逐任务）")
+    creates = []
+    repo10b = MemoryRepository()
+    def10b = {}
+    for fname, key in (("01-simple.json", "simple"), ("05-countersign-parallel.json", "par")):
+        with open(os.path.join(FLOWS_DIR, fname), "r", encoding="utf-8") as f:
+            _raw = json.loads(f.read())
+        _d = ProcessDefine(name=_raw.get("name", key), displayName=_raw.get("displayName", key),
+                           type=_raw.get("type", ""), state=1, content=json.dumps(_raw, ensure_ascii=False))
+        repo10b.add_define(_d)
+        def10b[key] = _d.id
+    eng2b = EngineImpl(repo10b, TestUserProv(), TestIDGen(), TestExpr())
+    eng2b.set_extensions(EngineExtensions(
+        event_listener=lambda evt: creates.append(evt) if evt.type.value == "TASK_CREATE" else None,
+    ))
+    # ① 普通任务：01-simple startAndExecute → apply 完成 → task1 创建（共 2 个）
+    inst = await _start_and_execute(eng2b, repo10b, def10b["simple"], "applicant")
+    check("普通流程 2 个 TASK_CREATE（apply+task1）", len(creates) == 2, str([c.taskId for c in creates]))
+    for c in creates:
+        t = await repo10b.find_task_by_id(c.taskId)
+        check(f"TASK_CREATE taskId={c.taskId} 落库后可反查", t is not None,
+              f"actor={t.actorIds if t else None}")
+        check(f"TASK_CREATE 字段齐全（instanceId/taskName/operator）",
+              c.instanceId == inst.id and c.taskName != "" and c.operator != "",
+              f"evt={c}")
+    creates.clear()
+    # ② 并行会签：userA/userB/userC 三人逐任务 fire（apply + 3 会签 = 4）
+    inst2 = await _start_and_execute(eng2b, repo10b, def10b["par"], "applicant")
+    check("并行会签 4 个 TASK_CREATE（apply+3会签）", len(creates) == 4,
+          str([c.taskId for c in creates]))
+    seen = set()
+    for c in creates[1:]:
+        t = await repo10b.find_task_by_id(c.taskId)
+        check(f"会签 TASK_CREATE taskId={c.taskId} 落库后可反查", t is not None,
+              f"actor={t.actorIds if t else None}")
+        seen.add(c.taskId)
+    check("会签 TaskID 互不相同（逐任务 fire）", len(seen) == 3, str(seen))
+    print()
+
     # ═══ 11. 统计 ════════════════════════════════════════════════════════════════════
     print("[11] 统计 & 详情")
     all_insts = repo.all_instances()

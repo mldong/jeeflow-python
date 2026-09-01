@@ -288,10 +288,19 @@ async def test_10_interceptor_and_events():
 
     assert pre_called[0], "pre_handle not called"
     assert post_called[0], "post_handle not called"
-    assert len(events) == 4, f"expected 4 events (start+apply+task1+finish), got {len(events)}: {events}"
-    assert "PROCESS_START" in events
-    assert "TASK_COMPLETE" in events  # at least once
-    assert "PROCESS_FINISH" in events
+    # issues/100：任务落库后 fire TASK_CREATE（对齐 Java CreateTaskHandler，含 apply 节点任务）。
+    # 完整序列：start → [apply 任务 TASK_CREATE, apply 自动完成 TASK_COMPLETE]
+    #         → [task1 TASK_CREATE, task1 完成 TASK_COMPLETE] → PROCESS_FINISH
+    assert events == [
+        "PROCESS_START",
+        "TASK_CREATE",
+        "TASK_COMPLETE",
+        "TASK_CREATE",
+        "TASK_COMPLETE",
+        "PROCESS_FINISH",
+    ], f"unexpected event sequence, got {events}"
+    assert events.count("TASK_CREATE") == 2  # apply 节点任务 + task1 各一次
+    assert events.count("TASK_COMPLETE") == 2
 
 
 @pytest.mark.asyncio

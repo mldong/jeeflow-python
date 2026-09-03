@@ -1947,6 +1947,22 @@ async def test_cc_create_event_no_listener_pure_incremental():
 
 # ═══ issues/103 统计三 action 测试 ═══
 
+@pytest.mark.asyncio
+async def test_event_listener_exception_isolated():
+    """issues/104 P2：单监听器异常不影响引擎主流程（异常不外溢）"""
+    eng, repo = setup()
+
+    async def on_event(evt: ProcessEvent):
+        raise RuntimeError("boom")
+
+    eng.set_extensions(EngineExtensions(event_listener=on_event))
+    df = load_flow(repo, "01-simple.json")
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": df.id, "operator": "applicant"})
+    assert r["code"] == 0, "监听器异常不应影响发起主流程"
+
+
 def _stats_setup():
     """stats 测试专用 setup：返回 (eng, repo, facade)"""
     eng, repo = setup()

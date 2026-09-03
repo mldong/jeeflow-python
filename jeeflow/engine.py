@@ -1,4 +1,5 @@
 """引擎核心——对标 Java EngineImpl"""
+import logging
 import json, time, random
 from datetime import datetime
 from typing import Any, Optional
@@ -536,9 +537,14 @@ class EngineImpl(Engine):
 
     async def _fire_event(self, evt: ProcessEvent):
         if self.ext and self.ext.event_listener:
-            result = self.ext.event_listener(evt)
-            if hasattr(result, '__await__'):
-                await result
+            # 兜底语义（issues/104 P2 统一口径）：监听器异常只记录不传播——不得影响引擎主流程
+            # （对齐 PHP per-listener catch；Python 为单回调形态，无"后续监听器"概念）
+            try:
+                result = self.ext.event_listener(evt)
+                if hasattr(result, '__await__'):
+                    await result
+            except Exception:  # noqa: BLE001 —— 引擎侧兜底，异常不外溢
+                logging.exception("[jeeflow] process event listener error: type=%s", evt.type)
 
 # ─── Pure Functions ─────────────────────────────────────────────────────────────
 

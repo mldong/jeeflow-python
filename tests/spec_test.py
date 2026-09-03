@@ -2038,13 +2038,17 @@ async def test_stats_overview_with_data():
     assert r["code"] == 0, r
     d = r["data"]
     assert d["total"] == 4
+    # todayNew：种子 ct1/ct2 为 now-2h/now-1h 相对时间，跨午夜运行时部分落昨日 → 动态算
+    _now = datetime.now()
+    _today_cnt = sum(1 for inst in repo._instances.values()
+                     if getattr(inst.createTime, "date", None)
+                     and inst.createTime.date() == _now.date())
     assert d["inProgress"] == 1   # state=10
     assert d["completed"] == 2    # state=20 (inst 100, 103)
     assert d["rejected"] == 1     # state=45
     assert d["withdrawn"] == 0
     assert d["suspended"] == 0
-    assert d["todayNew"] == 2     # inst 100/101 created today; 102=yesterday, 103=2d ago
-    assert isinstance(d["todayNew"], int) and d["todayNew"] >= 0
+    assert d["todayNew"] == _today_cnt, f"todayNew={d['todayNew']} expect={_today_cnt}"  # E：不过滤 state
     assert d["pendingTaskCount"] == 1  # task 2 is DOING
     assert d["overdueTaskCount"] == 1  # task 2 expire < now
 
@@ -2071,7 +2075,9 @@ async def test_stats_trend_empty_db():
         "end": "2026-09-03 00:00:00",
     })
     assert r["code"] == 0, r
-    series = r["data"]["series"]
+    # A：data 本体为裸数组（无 {granularity, series} 包装）
+    series = r["data"]
+    assert isinstance(series, list)
     assert len(series) == 3  # 3 days
     for s in series:
         assert s["started"] == 0
@@ -2094,9 +2100,8 @@ async def test_stats_trend_day_granularity():
         "end": f"{today_str} 23:59:59",
     })
     assert r["code"] == 0, r
-    data = r["data"]
-    assert data["granularity"] == "day"
-    series = data["series"]
+    series = r["data"]
+    assert isinstance(series, list)
     assert len(series) >= 3  # at least 3 days
 
     # 桶格式验证
@@ -2121,8 +2126,8 @@ async def test_stats_trend_all_granularities():
             "end": "2026-09-03 23:59:59",
         })
         assert r["code"] == 0, f"{gran}: {r}"
-        series = r["data"]["series"]
-        assert len(series) > 0, f"{gran} should have buckets"
+        series = r["data"]
+        assert isinstance(series, list) and len(series) > 0, f"{gran} should have buckets"
         # 每个桶都有 bucket/started/finished 三字段
         for s in series:
             assert "bucket" in s and "started" in s and "finished" in s
@@ -2141,6 +2146,18 @@ async def test_stats_trend_invalid_granularity():
 
 
 @pytest.mark.asyncio
+async def test_stats_trend_missing_required_params():
+    """issues/103 C 自证：缺 start / 缺 end → code!=0，不静默回退不限时间"""
+    eng, repo, facade = _stats_setup()
+    r1 = await facade.flow("processInstance/stats/trend",
+                           {"granularity": "day", "end": "2026-09-03 00:00:00"})
+    assert r1["code"] != 0, "missing start should fail"
+    r2 = await facade.flow("processInstance/stats/trend",
+                           {"granularity": "day", "start": "2026-09-01 00:00:00"})
+    assert r2["code"] != 0, "missing end should fail"
+
+
+@pytest.mark.asyncio
 async def test_stats_group_empty_db():
     """issues/103 空库 group：所有维度返回空数组"""
     eng, repo, facade = _stats_setup()
@@ -2148,7 +2165,9 @@ async def test_stats_group_empty_db():
                 "node", "stuckNode", "stuckApprover", "durationBucket"):
         r = await facade.flow("processInstance/stats/group", {"dimension": dim})
         assert r["code"] == 0, f"{dim}: {r}"
-        rows = r["data"]["rows"]
+        # A：data 本体为裸数组（无 {dimension, rows} 包装）
+        rows = r["data"]
+        assert isinstance(rows, list), f"{dim} data should be a bare array"
         if dim == "durationBucket":
             assert len(rows) == 4  # 固定 4 桶
             assert [row["key"] for row in rows] == ["sameDay", "1to3d", "3to7d", "over7d"]
@@ -2165,7 +2184,7 @@ async def test_stats_group_state_dimension():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "state"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     state_map = {row["key"]: row["count"] for row in rows}
     assert state_map.get("20") == 2  # DONE
     assert state_map.get("10") == 1  # DOING
@@ -2182,7 +2201,7 @@ async def test_stats_group_define_dimension():
     d = _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "define"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     assert len(rows) == 1
     row = rows[0]
     assert row["key"] == "stats-flow"
@@ -2199,7 +2218,7 @@ async def test_stats_group_category_dimension():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "category"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     assert len(rows) == 1
     assert rows[0]["key"] == "oa"
     assert rows[0]["count"] == 4
@@ -2212,7 +2231,7 @@ async def test_stats_group_approver_dimension():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "approver"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     op_map = {row["key"]: row["count"] for row in rows}
     assert op_map.get("bob") == 1
     assert op_map.get("gina") == 1
@@ -2225,7 +2244,7 @@ async def test_stats_group_applicant_dimension():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "applicant"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     op_map = {row["key"]: row["count"] for row in rows}
     assert op_map.get("alice") == 2  # inst 100, 102
     assert op_map.get("charlie") == 1
@@ -2239,7 +2258,7 @@ async def test_stats_group_node_dimension():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "node"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     node_map = {row["key"]: row for row in rows}
     assert "审批节点A" in node_map
     assert node_map["审批节点A"]["count"] == 1
@@ -2256,7 +2275,7 @@ async def test_stats_group_stuck_node_dimension():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "stuckNode"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     assert len(rows) == 1
     assert rows[0]["key"] == "审批节点B"
     assert rows[0]["count"] == 1
@@ -2269,7 +2288,7 @@ async def test_stats_group_stuck_approver_dimension():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "stuckApprover"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     actor_counts = {row["key"]: row["count"] for row in rows}
     assert actor_counts.get("dave") == 1
     assert actor_counts.get("eve") == 1
@@ -2282,7 +2301,7 @@ async def test_stats_group_duration_bucket():
     _seed_stats(repo)
     r = await facade.flow("processInstance/stats/group", {"dimension": "durationBucket"})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     assert len(rows) == 4
     keys = [row["key"] for row in rows]
     assert keys == ["sameDay", "1to3d", "3to7d", "over7d"]
@@ -2311,8 +2330,26 @@ async def test_stats_group_limit():
     r = await facade.flow("processInstance/stats/group",
                           {"dimension": "state", "limit": 2})
     assert r["code"] == 0, r
-    rows = r["data"]["rows"]
+    rows = r["data"]  # A：裸数组
     assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_stats_overview_state_in_respected():
+    """issues/103 B 自证：stateIn 生效；E：todayNew 不受 stateIn 影响"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/overview", {"stateIn": [10]})
+    assert r["code"] == 0, r
+    d = r["data"]
+    assert d["total"] == 1   # 仅 inst 101（DOING）
+    assert d["inProgress"] == 1
+    assert d["completed"] == 0
+    _now = datetime.now()
+    _today_cnt = sum(1 for inst in repo._instances.values()
+                     if getattr(inst.createTime, "date", None)
+                     and inst.createTime.date() == _now.date())
+    assert d["todayNew"] == _today_cnt, "todayNew ignores stateIn (E)"
 
 
 @pytest.mark.asyncio

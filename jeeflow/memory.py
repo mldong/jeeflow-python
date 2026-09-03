@@ -234,14 +234,15 @@ class MemoryRepository(ProcessRepository):
                     continue
         return None
 
-    async def query_instances_for_stats(self, state_in: list[int], order_by: str = "create_time",
+    async def query_instances_for_stats(self, state_in: list[int] | None, order_by: str = "create_time",
                                         start=None, end=None) -> list:
         sd = self._to_dt(start)
         ed = self._to_dt(end)
         rows = []
         for inst in self._instances.values():
             sv = int(inst.state)
-            if sv not in state_in:
+            # state_in 空 = 无 state 过滤（对齐内置线：仅 overview 六计数用 stateIn）
+            if state_in and sv not in state_in:
                 continue
             ct = self._to_dt(inst.createTime)
             if sd and ct and ct < sd:

@@ -1221,8 +1221,9 @@ class JeeflowFacade:
         now = datetime.now()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=1)
+        # E：todayNew 恒按服务器当日、不过滤 state / 不受 stateIn 影响（对齐内置线 countTodayNew）
         today_insts = await self._repo.query_instances_for_stats(
-            self._DEFAULT_STATE_IN, "create_time", today_start, today_end)
+            None, "create_time", today_start, today_end)
         today_new = len(today_insts)
 
         pending, overdue = await self._repo.stats_pending_and_overdue_count()
@@ -1248,8 +1249,12 @@ class JeeflowFacade:
             raise ValueError(f"不支持的 granularity: {granularity}")
         start = self._parse_surrogate_time(args.get("start"))
         end = self._parse_surrogate_time(args.get("end"))
+        # C：start/end 必填（对齐内置线 20010012 缺参语义），不静默回退不限时间
+        if start is None or end is None:
+            raise ValueError("trend 缺少必填参数：start/end/granularity")
 
-        insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+        # 实例侧无 state 过滤（对齐内置线 countInstanceStartedByBucket）
+        insts = await self._repo.query_instances_for_stats(None, "create_time", start, end)
         done_tasks = await self._repo.query_tasks_for_stats(int(TaskState.DONE), start, end)
 
         buckets = _stats_enumerate_buckets(start, end, granularity)
@@ -1270,7 +1275,8 @@ class JeeflowFacade:
         for b in buckets:
             series.append({"bucket": b, "started": started_map.get(b, 0),
                            "finished": finished_map.get(b, 0)})
-        return {"granularity": granularity, "series": series}
+        # A：data 本体为裸数组（去掉 {granularity, series} 包装，对齐契约 spec 06 §4.2 / 内置线）
+        return series
 
     async def _processInstance_stats_group(self, args: dict) -> dict:
         dimension = str(args.get("dimension", ""))
@@ -1286,7 +1292,7 @@ class JeeflowFacade:
                      "avgDurationSeconds": r.get("avgDurationSeconds")} for r in raw]
 
         elif dimension == "state":
-            insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+            insts = await self._repo.query_instances_for_stats(None, "create_time", start, end)  # 无 state 过滤（对齐内置线：仅 overview 用 stateIn）
             grouped: dict[str, int] = {}
             for r in insts:
                 k = str(r.state)
@@ -1295,7 +1301,7 @@ class JeeflowFacade:
             rows = [{"key": k, "label": None, "count": c, "avgDurationSeconds": None} for k, c in entries]
 
         elif dimension == "category":
-            insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+            insts = await self._repo.query_instances_for_stats(None, "create_time", start, end)  # 无 state 过滤（对齐内置线：仅 overview 用 stateIn）
             define_types: dict[int, str] = {}
             for r in insts:
                 if r.defineId not in define_types:
@@ -1319,7 +1325,7 @@ class JeeflowFacade:
             rows = [{"key": k, "label": None, "count": c, "avgDurationSeconds": None} for k, c in entries3]
 
         elif dimension == "applicant":
-            insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+            insts = await self._repo.query_instances_for_stats(None, "create_time", start, end)  # 无 state 过滤（对齐内置线：仅 overview 用 stateIn）
             grouped4: dict[str, int] = {}
             for r in insts:
                 if not r.operator:
@@ -1381,7 +1387,8 @@ class JeeflowFacade:
         else:
             rows = []
 
-        return {"dimension": dimension, "rows": rows}
+        # A：data 本体为裸数组（去掉 {dimension, rows} 包装，对齐契约 spec 06 §4.2 / 内置线）
+        return rows
 
     # ═══ 行输出转换（issues/05-2 字段契约 + 05-3 时间格式）═══
 

@@ -570,14 +570,16 @@ class JdbcRepository(ProcessRepository):
 
     # ── 统计查询（v1.8.25，issues/103） ──
 
-    async def query_instances_for_stats(self, state_in: list[int], order_by: str = "create_time",
+    async def query_instances_for_stats(self, state_in: Optional[list[int]], order_by: str = "create_time",
                                         start: Optional[datetime] = None,
                                         end: Optional[datetime] = None) -> list[InstanceStatsRow]:
-        if not state_in:
-            return []
-        ph = repeat_ph(len(state_in))
-        sql = f"SELECT process_define_id, state, operator, create_time FROM wf_process_instance WHERE state IN ({ph})"
-        args: list = list(state_in)
+        # state_in 空 = 无 state 过滤（对齐内置线：仅 overview 六计数用 stateIn）
+        sql = "SELECT process_define_id, state, operator, create_time FROM wf_process_instance WHERE 1=1"
+        args: list = []
+        if state_in:
+            ph = repeat_ph(len(state_in))
+            sql += f" AND state IN ({ph})"
+            args.extend(state_in)
         if start:
             sql += " AND create_time >= ?"; args.append(start)
         if end:
@@ -646,12 +648,15 @@ class JdbcRepository(ProcessRepository):
     async def stats_define_group(self, start: Optional[datetime] = None,
                                  end: Optional[datetime] = None,
                                  limit: int = 10) -> list[dict]:
-        sql = ("SELECT i.process_define_id, pd.name, pd.display_name, COUNT(*) AS cnt, "
-               "AVG(ts.max_finish - i.create_time) AS avg_dur "
+        # 对齐内置线 mapper：count 全实例（无 state 过滤）、inner join define、
+        # avg 仅对 state=20 且有 finish 的实例聚合（MAX(task.finish_time) - create_time）
+        sql = ("SELECT pd.name, pd.display_name, COUNT(*) AS cnt, "
+               "ROUND(AVG(CASE WHEN i.state = 20 AND ts.max_finish IS NOT NULL "
+               "THEN TIMESTAMPDIFF(SECOND, i.create_time, ts.max_finish) END)) AS avg_dur "
                "FROM wf_process_instance i "
-               "LEFT JOIN wf_process_define pd ON i.process_define_id = pd.id "
+               "JOIN wf_process_define pd ON i.process_define_id = pd.id "
                "LEFT JOIN (SELECT process_instance_id, MAX(finish_time) AS max_finish "
-               "FROM wf_process_task WHERE task_state = 20 GROUP BY process_instance_id) ts "
+               "FROM wf_process_task GROUP BY process_instance_id) ts "
                "ON i.id = ts.process_instance_id WHERE 1=1")
         args: list = []
         if start:
@@ -662,7 +667,7 @@ class JdbcRepository(ProcessRepository):
         args.append(limit)
         async with self._conn() as conn:
             rows = await conn.fetchall(self._sql(sql), tuple(args))
-        return [{"key": str(r[0]), "label": r[2] or r[1], "count": int(r[3]),
+        return [{"key": r[1], "label": r[2], "count": int(r[3]),
                  "avgDurationSeconds": int(r[4]) if r[4] is not None else None} for r in rows]
 
     async def stats_stuck_node_group(self, limit: int = 10) -> list[dict]:

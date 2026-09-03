@@ -1878,3 +1878,68 @@ async def test_facade_define_up_and_down_ids_form_matrix():
     r = await facade.flow("processDefine/upAndDown", {"ids": [], })
     assert r["code"] == 99999999, r
     assert "opType/state 缺失或非法" in r["msg"], r
+
+
+# ─── Test 102: CC_CREATE 抄送知会事件（issues/102，对齐 Java/Go/Node/PHP）────────────
+
+@pytest.mark.asyncio
+async def test_cc_create_event_per_actor():
+    """issues/102：CC 实例落库后逐抄送人 fire CC_CREATE，ccActorId 直传事件体——
+    发起路径（f_ccActors）与手动 createCCInstance 路径同语义（在 start 事务内 fire）"""
+    eng, repo = setup()
+    df = load_flow(repo, "01-simple.json")
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+
+    cc_events = []
+    async def on_event(evt: ProcessEvent):
+        if evt.type == EventType.CC_CREATE:
+            cc_events.append(evt)
+
+    eng.set_extensions(EngineExtensions(event_listener=on_event))
+
+    # ① 发起路径：f_ccActors="alice,bob" → 逐抄送人 2 个事件，事件体携带实例 id 与抄送人 id
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": df.id, "operator": "applicant",
+                           "f_ccActors": "alice,bob"})
+    assert r["code"] == 0, r
+    inst_id = int(r["data"]["processInstanceId"])
+    assert [e.ccActorId for e in cc_events] == ["alice", "bob"], \
+        f"CC_CREATE 应逐抄送人 fire，实际 {[e.ccActorId for e in cc_events]}"
+    assert all(e.instanceId == inst_id for e in cc_events), \
+        f"CC_CREATE instanceId 应为发起实例，实际 {[(e.instanceId,) for e in cc_events]}"
+
+    # ② 手动路径：createCCInstance → 再 1 个事件，同字段语义
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": inst_id, "operator": "applicant",
+                           "actorIds": ["carol"]})
+    assert r["code"] == 0, r
+    assert [e.ccActorId for e in cc_events] == ["alice", "bob", "carol"], \
+        f"手动 CC 应再 fire 1 个，实际 {[e.ccActorId for e in cc_events]}"
+    assert cc_events[-1].instanceId == inst_id
+
+
+@pytest.mark.asyncio
+async def test_cc_create_event_no_listener_pure_incremental():
+    """issues/102 纯增量红线：未注册监听器（ext 为空）时带 CC 发起/手动 CC
+    与上一版逐字节一致——不报错、不抛事件、cc 实例照常落库"""
+    eng, repo = setup()
+    df = load_flow(repo, "01-simple.json")
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    # 不 set_extensions：ext 保持 None
+
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": df.id, "operator": "applicant",
+                           "f_ccActors": "alice,bob"})
+    assert r["code"] == 0, r
+    inst_id = int(r["data"]["processInstanceId"])
+
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": inst_id, "operator": "applicant",
+                           "actorIds": ["carol"]})
+    assert r["code"] == 0, r
+
+    # cc 数据照常在（数据在、事件静默）：3 行抄送实例
+    r = await facade.flow("processInstance/ccList", {"operator": "alice"})
+    assert r["code"] == 0 and len(r["data"]["rows"]) == 1, r
+    r = await facade.flow("processInstance/ccList", {"operator": "carol"})
+    assert r["code"] == 0 and len(r["data"]["rows"]) == 1, r

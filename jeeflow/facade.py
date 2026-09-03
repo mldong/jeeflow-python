@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from .engine import Engine, KEY_NEXT_NODE_OPERATOR, KEY_PROCESS_START_NEXT_NODE_OPERATOR
+from .extensions import EventType, ProcessEvent
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState
 from .spi import ProcessExtRepository, ProcessRepository, QueryCondition
 
@@ -162,6 +163,11 @@ class JeeflowFacade:
                 cc_list = []
             if cc_list:
                 await self._repo.create_cc_instance(inst.id, operator, *cc_list)
+                # issues/102：CC 实例落库后逐抄送人 fire CC_CREATE（ccActorId 直传事件体，
+                # 在 start 事务内；监听器据此落抄送知会 NOTICE）
+                for actor in cc_list:
+                    await self._engine.fire_event(
+                        ProcessEvent(type=EventType.CC_CREATE, instanceId=inst.id, ccActorId=actor))
         # startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
         doing = await self._repo.find_doing_tasks(inst.id)
         for task in doing:
@@ -844,6 +850,10 @@ class JeeflowFacade:
         if not instance_id or not actor_ids:
             raise ValueError("processInstanceId/actorIds 缺失")
         await self._repo.create_cc_instance(instance_id, operator, *actor_ids)
+        # issues/102：手动 CC 与发起路径同语义——逐抄送人 fire CC_CREATE
+        for actor in actor_ids:
+            await self._engine.fire_event(
+                ProcessEvent(type=EventType.CC_CREATE, instanceId=instance_id, ccActorId=actor))
         return None
 
     async def _processInstance_updateCCStatus(self, args: dict) -> dict:

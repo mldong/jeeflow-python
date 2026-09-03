@@ -11,6 +11,8 @@ class EventType(Enum):
     PROCESS_REJECT = "PROCESS_REJECT"
     TASK_CREATE = "TASK_CREATE"
     TASK_COMPLETE = "TASK_COMPLETE"
+    # issues/102：抄送知会（对齐 Java CC_CREATE / Go EventCCCreate / Node CcCreate / PHP CC_CREATE）
+    CC_CREATE = "CC_CREATE"
 
 
 @dataclass
@@ -20,6 +22,8 @@ class ProcessEvent:
     taskId: int = 0
     taskName: str = ""
     operator: str = ""
+    # 抄送人 id 直传事件体，监听器免反查 cc 表（issues/102；对齐 Java ccActorId / Go CcActorID）
+    ccActorId: str = ""
 
 
 # ─── Interceptor ─────────────────────────────────────────────────────────────────

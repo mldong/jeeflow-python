@@ -529,6 +529,11 @@ class EngineImpl(Engine):
         self._ic_cache[define_id] = ic_list
         return ic_list
 
+    async def fire_event(self, evt: ProcessEvent):
+        """公开事件发布入口（issues/102）：facade 层 CC 创建后逐抄送人 fire CC_CREATE；
+        无监听器（ext/event_listener 为空）时零副作用，与上一版逐字节一致"""
+        await self._fire_event(evt)
+
     async def _fire_event(self, evt: ProcessEvent):
         if self.ext and self.ext.event_listener:
             result = self.ext.event_listener(evt)

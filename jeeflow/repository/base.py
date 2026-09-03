@@ -21,7 +21,7 @@ from typing import Any, Optional, Protocol, Sequence
 
 from ..spi import QueryCondition
 
-from ..model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate)
+from ..model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate, InstanceStatsRow, TaskStatsRow)
 from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository
 
 # 当前协程上下文绑定的事务连接
@@ -567,6 +567,135 @@ class JdbcRepository(ProcessRepository):
                 f"SELECT {cols}{where} ORDER BY t.id DESC LIMIT ? OFFSET ?"),
                 (filter_val, *cond_args, page_size, (page_num - 1) * page_size))
         return [self._map_task_row(r) for r in rows], total
+
+    # ── 统计查询（v1.8.25，issues/103） ──
+
+    async def query_instances_for_stats(self, state_in: list[int], order_by: str = "create_time",
+                                        start: Optional[datetime] = None,
+                                        end: Optional[datetime] = None) -> list[InstanceStatsRow]:
+        if not state_in:
+            return []
+        ph = repeat_ph(len(state_in))
+        sql = f"SELECT process_define_id, state, operator, create_time FROM wf_process_instance WHERE state IN ({ph})"
+        args: list = list(state_in)
+        if start:
+            sql += " AND create_time >= ?"; args.append(start)
+        if end:
+            sql += " AND create_time < ?"; args.append(end)
+        sql += f" ORDER BY {order_by}"
+        async with self._conn() as conn:
+            rows = await conn.fetchall(self._sql(sql), tuple(args))
+        return [InstanceStatsRow(defineId=r[0], state=r[1], operator=str(r[2] or ""), createTime=r[3]) for r in rows]
+
+    async def query_tasks_for_stats(self, task_state: Optional[int] = None,
+                                    start: Optional[datetime] = None,
+                                    end: Optional[datetime] = None) -> list[TaskStatsRow]:
+        sql = "SELECT operator, display_name, perform_type, create_time, finish_time, expire_time FROM wf_process_task WHERE 1=1"
+        args: list = []
+        if task_state is not None:
+            sql += " AND task_state = ?"; args.append(task_state)
+        if start:
+            sql += " AND finish_time >= ?"; args.append(start)
+        if end:
+            sql += " AND finish_time < ?"; args.append(end)
+        async with self._conn() as conn:
+            rows = await conn.fetchall(self._sql(sql), tuple(args))
+        return [TaskStatsRow(operator=str(r[0] or ""), displayName=r[1] or "", performType=r[2] or 0,
+                             createTime=r[3], finishTime=r[4], expireTime=r[5]) for r in rows]
+
+    async def stats_pending_and_overdue_count(self) -> tuple[int, int]:
+        now = datetime.now()
+        async with self._conn() as conn:
+            r1 = await conn.fetchone(
+                self._sql("SELECT COUNT(*) FROM wf_process_task WHERE task_state = 10"), ())
+            pending = int(r1[0]) if r1 else 0
+            r2 = await conn.fetchone(
+                self._sql("SELECT COUNT(*) FROM wf_process_task WHERE task_state = 10 AND expire_time IS NOT NULL AND expire_time < ?"),
+                (now,))
+            overdue = int(r2[0]) if r2 else 0
+        return pending, overdue
+
+    async def stats_completed_task_aggregate(self) -> tuple[int, int, int, int]:
+        async with self._conn() as conn:
+            r = await conn.fetchone(
+                self._sql("SELECT COUNT(*), SUM(CASE WHEN perform_type = 1 THEN 1 ELSE 0 END), "
+                          "SUM(CASE WHEN expire_time IS NOT NULL AND finish_time <= expire_time THEN 1 ELSE 0 END), "
+                          "SUM(CASE WHEN expire_time IS NOT NULL THEN 1 ELSE 0 END) "
+                          "FROM wf_process_task WHERE task_state = 20"), ())
+        if not r:
+            return 0, 0, 0, 0
+        return int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0)
+
+    async def stats_avg_completed_duration_seconds(self, start: Optional[datetime] = None,
+                                                   end: Optional[datetime] = None) -> int:
+        sql = ("SELECT AVG(ts.max_finish - i.create_time) FROM wf_process_instance i "
+               "INNER JOIN (SELECT process_instance_id, MAX(finish_time) AS max_finish "
+               "FROM wf_process_task WHERE task_state = 20 GROUP BY process_instance_id) ts "
+               "ON i.id = ts.process_instance_id WHERE i.state = 20")
+        args: list = []
+        if start:
+            sql += " AND i.create_time >= ?"; args.append(start)
+        if end:
+            sql += " AND i.create_time < ?"; args.append(end)
+        async with self._conn() as conn:
+            r = await conn.fetchone(self._sql(sql), tuple(args))
+        if not r or r[0] is None:
+            return 0
+        return int(r[0])
+
+    async def stats_define_group(self, start: Optional[datetime] = None,
+                                 end: Optional[datetime] = None,
+                                 limit: int = 10) -> list[dict]:
+        sql = ("SELECT i.process_define_id, pd.name, pd.display_name, COUNT(*) AS cnt, "
+               "AVG(ts.max_finish - i.create_time) AS avg_dur "
+               "FROM wf_process_instance i "
+               "LEFT JOIN wf_process_define pd ON i.process_define_id = pd.id "
+               "LEFT JOIN (SELECT process_instance_id, MAX(finish_time) AS max_finish "
+               "FROM wf_process_task WHERE task_state = 20 GROUP BY process_instance_id) ts "
+               "ON i.id = ts.process_instance_id WHERE 1=1")
+        args: list = []
+        if start:
+            sql += " AND i.create_time >= ?"; args.append(start)
+        if end:
+            sql += " AND i.create_time < ?"; args.append(end)
+        sql += " GROUP BY i.process_define_id, pd.name, pd.display_name ORDER BY cnt DESC LIMIT ?"
+        args.append(limit)
+        async with self._conn() as conn:
+            rows = await conn.fetchall(self._sql(sql), tuple(args))
+        return [{"key": str(r[0]), "label": r[2] or r[1], "count": int(r[3]),
+                 "avgDurationSeconds": int(r[4]) if r[4] is not None else None} for r in rows]
+
+    async def stats_stuck_node_group(self, limit: int = 10) -> list[dict]:
+        sql = ("SELECT display_name, COUNT(*) AS cnt FROM wf_process_task "
+               "WHERE task_state = 10 GROUP BY display_name ORDER BY cnt DESC LIMIT ?")
+        async with self._conn() as conn:
+            rows = await conn.fetchall(self._sql(sql), (limit,))
+        return [{"key": r[0] or "", "label": None, "count": int(r[1]),
+                 "avgDurationSeconds": None} for r in rows]
+
+    async def stats_stuck_approver_group(self, limit: int = 10) -> list[dict]:
+        sql = ("SELECT ta.actor_id, COUNT(DISTINCT t.id) AS cnt FROM wf_process_task_actor ta "
+               "INNER JOIN wf_process_task t ON ta.process_task_id = t.id "
+               "WHERE t.task_state = 10 GROUP BY ta.actor_id ORDER BY cnt DESC LIMIT ?")
+        async with self._conn() as conn:
+            rows = await conn.fetchall(self._sql(sql), (limit,))
+        return [{"key": str(r[0]), "label": None, "count": int(r[1]),
+                 "avgDurationSeconds": None} for r in rows]
+
+    async def stats_completed_instance_durations(self, start: Optional[datetime] = None,
+                                                 end: Optional[datetime] = None) -> list[int]:
+        sql = ("SELECT ts.max_finish - i.create_time FROM wf_process_instance i "
+               "INNER JOIN (SELECT process_instance_id, MAX(finish_time) AS max_finish "
+               "FROM wf_process_task WHERE task_state = 20 GROUP BY process_instance_id) ts "
+               "ON i.id = ts.process_instance_id WHERE i.state = 20")
+        args: list = []
+        if start:
+            sql += " AND i.create_time >= ?"; args.append(start)
+        if end:
+            sql += " AND i.create_time < ?"; args.append(end)
+        async with self._conn() as conn:
+            rows = await conn.fetchall(self._sql(sql), tuple(args))
+        return [int(r[0]) for r in rows if r[0] is not None]
 
     def _map_instance_row(self, r: Sequence[Any]) -> InstanceRow:
         import json

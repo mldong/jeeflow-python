@@ -2,8 +2,10 @@
 from copy import deepcopy
 from datetime import datetime
 from typing import Optional
-from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, CcInstanceRow, DefineRow, InstanceRow, TaskRow,
-                    ProcessDesign, ProcessDesignHis, ProcessSurrogate)
+from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState,
+                    CcInstanceRow, DefineRow, InstanceRow, TaskRow,
+                    ProcessDesign, ProcessDesignHis, ProcessSurrogate,
+                    InstanceStatsRow, TaskStatsRow)
 from .spi import ProcessRepository, ProcessExtRepository
 
 class MemoryRepository(ProcessRepository):
@@ -214,6 +216,197 @@ class MemoryRepository(ProcessRepository):
         total = len(rows)
         start = (page_num - 1) * page_size
         return rows[start:start + page_size], total
+
+    # ── 统计查询（v1.8.25，issues/103） ──
+
+    @staticmethod
+    def _to_dt(v) -> Optional[datetime]:
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, str):
+            s = v.replace("T", " ")[:19]
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(s, fmt)
+                except ValueError:
+                    continue
+        return None
+
+    async def query_instances_for_stats(self, state_in: list[int], order_by: str = "create_time",
+                                        start=None, end=None) -> list:
+        sd = self._to_dt(start)
+        ed = self._to_dt(end)
+        rows = []
+        for inst in self._instances.values():
+            sv = int(inst.state)
+            if sv not in state_in:
+                continue
+            ct = self._to_dt(inst.createTime)
+            if sd and ct and ct < sd:
+                continue
+            if ed and ct and ct > ed:
+                continue
+            rows.append(InstanceStatsRow(
+                defineId=inst.defineId, state=sv,
+                operator=inst.operator or "", createTime=inst.createTime))
+        return rows
+
+    async def query_tasks_for_stats(self, task_state=None, start=None, end=None) -> list:
+        sd = self._to_dt(start)
+        ed = self._to_dt(end)
+        rows = []
+        for t in self._tasks.values():
+            if task_state is not None and int(t.taskState) != task_state:
+                continue
+            ft = self._to_dt(t.finishTime)
+            if sd and ft and ft < sd:
+                continue
+            if ed and ft and ft > ed:
+                continue
+            rows.append(TaskStatsRow(
+                operator=t.actorId or "", displayName=t.displayName or "",
+                performType=t.performType or 0,
+                createTime=t.createTime, finishTime=t.finishTime, expireTime=t.expireTime))
+        return rows
+
+    async def stats_pending_and_overdue_count(self) -> tuple:
+        now = datetime.now()
+        pending = 0
+        overdue = 0
+        for t in self._tasks.values():
+            if int(t.taskState) != int(TaskState.DOING):
+                continue
+            pending += 1
+            exp = self._to_dt(t.expireTime)
+            if exp and exp < now:
+                overdue += 1
+        return pending, overdue
+
+    async def stats_completed_task_aggregate(self) -> tuple:
+        total = 0
+        countersign = 0
+        on_time = 0
+        on_time_denom = 0
+        for t in self._tasks.values():
+            if int(t.taskState) != int(TaskState.DONE):
+                continue
+            total += 1
+            if t.performType == 1:
+                countersign += 1
+            ft = self._to_dt(t.finishTime)
+            exp = self._to_dt(t.expireTime)
+            if exp is not None:
+                on_time_denom += 1
+                if ft and ft <= exp:
+                    on_time += 1
+        return total, countersign, on_time, on_time_denom
+
+    async def stats_avg_completed_duration_seconds(self, start=None, end=None) -> int:
+        sd = self._to_dt(start)
+        ed = self._to_dt(end)
+        total_sec = 0
+        count = 0
+        for inst in self._instances.values():
+            if int(inst.state) != int(InstanceState.DONE):
+                continue
+            ct = self._to_dt(inst.createTime)
+            if sd and ct and ct < sd:
+                continue
+            if ed and ct and ct > ed:
+                continue
+            max_ft = None
+            for t in self._tasks.values():
+                if t.processInstanceId != inst.id:
+                    continue
+                ft = self._to_dt(t.finishTime)
+                if ft and (max_ft is None or ft > max_ft):
+                    max_ft = ft
+            if max_ft and ct:
+                total_sec += int((max_ft - ct).total_seconds())
+                count += 1
+        return total_sec // count if count > 0 else 0
+
+    async def stats_define_group(self, start=None, end=None, limit=10) -> list:
+        sd = self._to_dt(start)
+        ed = self._to_dt(end)
+        grouped: dict[int, dict] = {}
+        for inst in self._instances.values():
+            ct = self._to_dt(inst.createTime)
+            if sd and ct and ct < sd:
+                continue
+            if ed and ct and ct > ed:
+                continue
+            did = inst.defineId
+            if did not in grouped:
+                defn = self._defines.get(did)
+                grouped[did] = {"key": defn.name if defn else "", "label": defn.displayName if defn else None,
+                                "count": 0, "totalDur": 0, "durCount": 0}
+            g = grouped[did]
+            g["count"] += 1
+            if int(inst.state) == int(InstanceState.DONE):
+                max_ft = None
+                for t in self._tasks.values():
+                    if t.processInstanceId != inst.id:
+                        continue
+                    ft = self._to_dt(t.finishTime)
+                    if ft and (max_ft is None or ft > max_ft):
+                        max_ft = ft
+                if max_ft and ct:
+                    g["totalDur"] += int((max_ft - ct).total_seconds())
+                    g["durCount"] += 1
+        entries = sorted(grouped.values(), key=lambda x: x["count"], reverse=True)[:limit]
+        return [{"key": e["key"], "label": e["label"], "count": e["count"],
+                 "avgDurationSeconds": (e["totalDur"] // e["durCount"] if e["durCount"] > 0 else None)}
+                for e in entries]
+
+    async def stats_stuck_node_group(self, limit=10) -> list:
+        grouped: dict[str, int] = {}
+        for t in self._tasks.values():
+            if int(t.taskState) != int(TaskState.DOING):
+                continue
+            dn = t.displayName
+            if not dn:
+                continue
+            grouped[dn] = grouped.get(dn, 0) + 1
+        entries = sorted(grouped.items(), key=lambda x: x[1], reverse=True)[:limit]
+        return [{"key": k, "count": c} for k, c in entries]
+
+    async def stats_stuck_approver_group(self, limit=10) -> list:
+        grouped: dict[str, int] = {}
+        for t in self._tasks.values():
+            if int(t.taskState) != int(TaskState.DOING):
+                continue
+            actors = self._actors.get(t.id, [])
+            for aid in actors:
+                if aid:
+                    grouped[aid] = grouped.get(aid, 0) + 1
+        entries = sorted(grouped.items(), key=lambda x: x[1], reverse=True)[:limit]
+        return [{"key": k, "count": c} for k, c in entries]
+
+    async def stats_completed_instance_durations(self, start=None, end=None) -> list:
+        sd = self._to_dt(start)
+        ed = self._to_dt(end)
+        durations = []
+        for inst in self._instances.values():
+            if int(inst.state) != int(InstanceState.DONE):
+                continue
+            ct = self._to_dt(inst.createTime)
+            if sd and ct and ct < sd:
+                continue
+            if ed and ct and ct > ed:
+                continue
+            max_ft = None
+            for t in self._tasks.values():
+                if t.processInstanceId != inst.id:
+                    continue
+                ft = self._to_dt(t.finishTime)
+                if ft and (max_ft is None or ft > max_ft):
+                    max_ft = ft
+            if max_ft and ct:
+                durations.append(int((max_ft - ct).total_seconds()))
+        return durations
 
 # ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
 

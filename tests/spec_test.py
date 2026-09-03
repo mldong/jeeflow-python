@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -11,8 +11,8 @@ from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowI
 from jeeflow.engine import KEY_AUTO_GEN_TITLE
 from jeeflow.facade import JeeflowFacade
 from jeeflow.memory import MemoryExtRepository
-from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessTask,
-                           TaskState, InstanceState, UserInfo)
+from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance,
+                           ProcessTask, TaskState, InstanceState, UserInfo)
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 
 import flows_resolver
@@ -1943,3 +1943,404 @@ async def test_cc_create_event_no_listener_pure_incremental():
     assert r["code"] == 0 and len(r["data"]["rows"]) == 1, r
     r = await facade.flow("processInstance/ccList", {"operator": "carol"})
     assert r["code"] == 0 and len(r["data"]["rows"]) == 1, r
+
+
+# ═══ issues/103 统计三 action 测试 ═══
+
+def _stats_setup():
+    """stats 测试专用 setup：返回 (eng, repo, facade)"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    return eng, repo, facade
+
+
+def _seed_stats(repo: MemoryRepository):
+    """向内存仓储注入可控的统计测试数据，返回 define"""
+    from datetime import timedelta
+    now = datetime.now()
+    d = ProcessDefine(name="stats-flow", displayName="统计测试流程", type="oa",
+                      state=1, content="{}")
+    repo.add_define(d)
+
+    def _mk_inst(inst_id, state, operator, create_time, expire_time=None):
+        inst = ProcessInstance(id=inst_id, defineId=d.id, state=state,
+                               operator=operator, createTime=create_time,
+                               expireTime=expire_time)
+        repo._instances[inst_id] = inst
+
+    def _mk_task(task_id, inst_id, task_name, display_name, task_state,
+                 operator="", perform_type=0, create_time=None,
+                 finish_time=None, expire_time=None):
+        t = ProcessTask(id=task_id, processInstanceId=inst_id,
+                        taskName=task_name, displayName=display_name,
+                        taskState=task_state, actorId=operator,
+                        performType=perform_type,
+                        createTime=create_time or now,
+                        finishTime=finish_time, expireTime=expire_time)
+        repo._tasks[task_id] = t
+
+    # 实例 1：已完成（DOING→DONE），耗时 3600s
+    ct1 = now - timedelta(hours=2)
+    ft1 = now - timedelta(hours=1)
+    _mk_inst(100, InstanceState.DONE, "alice", ct1)
+    _mk_task(1, 100, "task1", "审批节点A", TaskState.DONE,
+             operator="bob", perform_type=0,
+             create_time=ct1, finish_time=ft1)
+    repo._actors[1] = ["bob"]
+
+    # 实例 2：进行中（DOING），有一个 doing 任务（stuck）
+    ct2 = now - timedelta(hours=1)
+    _mk_inst(101, InstanceState.DOING, "charlie", ct2)
+    _mk_task(2, 101, "task2", "审批节点B", TaskState.DOING,
+             operator="", perform_type=0, create_time=ct2,
+             expire_time=now - timedelta(minutes=30))  # 已过期
+    repo._actors[2] = ["dave", "eve"]
+
+    # 实例 3：已驳回
+    ct3 = now - timedelta(days=1)
+    _mk_inst(102, InstanceState.REJECT, "alice", ct3)
+
+    # 实例 4：已完成，会签任务（performType=1）
+    ct4 = now - timedelta(days=2)
+    ft4 = now - timedelta(days=2, hours=-3)  # +3h → 10800s
+    _mk_inst(103, InstanceState.DONE, "frank", ct4)
+    _mk_task(3, 103, "cs1", "会签节点", TaskState.DONE,
+             operator="gina", perform_type=1,
+             create_time=ct4, finish_time=ft4)
+    repo._actors[3] = ["gina", "hank"]
+
+    return d
+
+
+@pytest.mark.asyncio
+async def test_stats_overview_empty_db():
+    """issues/103 空库边界：overview 全 0，不 NPE"""
+    eng, repo, facade = _stats_setup()
+    r = await facade.flow("processInstance/stats/overview", {})
+    assert r["code"] == 0, r
+    d = r["data"]
+    for k in ("total", "inProgress", "completed", "rejected", "withdrawn",
+              "suspended", "todayNew", "pendingTaskCount", "overdueTaskCount"):
+        assert d[k] == 0, f"{k}={d[k]}"
+    assert d["avgDurationSeconds"] == 0
+    assert d["rejectRate"] == 0.0
+    assert d["countersignRate"] == 0.0
+    assert d["onTimeRate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_stats_overview_with_data():
+    """issues/103 overview 13 字段验证"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+
+    r = await facade.flow("processInstance/stats/overview", {})
+    assert r["code"] == 0, r
+    d = r["data"]
+    assert d["total"] == 4
+    assert d["inProgress"] == 1   # state=10
+    assert d["completed"] == 2    # state=20 (inst 100, 103)
+    assert d["rejected"] == 1     # state=45
+    assert d["withdrawn"] == 0
+    assert d["suspended"] == 0
+    assert d["todayNew"] == 2     # inst 100/101 created today; 102=yesterday, 103=2d ago
+    assert isinstance(d["todayNew"], int) and d["todayNew"] >= 0
+    assert d["pendingTaskCount"] == 1  # task 2 is DOING
+    assert d["overdueTaskCount"] == 1  # task 2 expire < now
+
+    # avgDurationSeconds: inst 100 = 3600s, inst 103 = 10800s → avg = 7200
+    assert d["avgDurationSeconds"] == 7200, d["avgDurationSeconds"]
+
+    # rejectRate: 1 / max(1, 2+1) = 0.3333
+    assert d["rejectRate"] == 0.3333, d["rejectRate"]
+
+    # countersignRate: 1 performType=1 / 2 total DONE tasks = 0.5
+    assert d["countersignRate"] == 0.5, d["countersignRate"]
+
+    # onTimeRate: no expire_time on DONE tasks → 0/0 → 0.0
+    assert d["onTimeRate"] == 0.0, d["onTimeRate"]
+
+
+@pytest.mark.asyncio
+async def test_stats_trend_empty_db():
+    """issues/103 空库 trend：连续桶全 0"""
+    eng, repo, facade = _stats_setup()
+    r = await facade.flow("processInstance/stats/trend", {
+        "granularity": "day",
+        "start": "2026-09-01 00:00:00",
+        "end": "2026-09-03 00:00:00",
+    })
+    assert r["code"] == 0, r
+    series = r["data"]["series"]
+    assert len(series) == 3  # 3 days
+    for s in series:
+        assert s["started"] == 0
+        assert s["finished"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stats_trend_day_granularity():
+    """issues/103 trend day 粒度：桶连续，计数正确"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    two_days_ago = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+
+    r = await facade.flow("processInstance/stats/trend", {
+        "granularity": "day",
+        "start": f"{two_days_ago} 00:00:00",
+        "end": f"{today_str} 23:59:59",
+    })
+    assert r["code"] == 0, r
+    data = r["data"]
+    assert data["granularity"] == "day"
+    series = data["series"]
+    assert len(series) >= 3  # at least 3 days
+
+    # 桶格式验证
+    for s in series:
+        assert len(s["bucket"]) == 10  # yyyy-MM-dd
+
+    # started 合计应等于 4（4 个实例）
+    total_started = sum(s["started"] for s in series)
+    assert total_started == 4, f"total_started={total_started}"
+
+
+@pytest.mark.asyncio
+async def test_stats_trend_all_granularities():
+    """issues/103 trend 4 种粒度都不报错且桶连续"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+
+    for gran in ("hour", "day", "week", "month"):
+        r = await facade.flow("processInstance/stats/trend", {
+            "granularity": gran,
+            "start": "2026-08-01 00:00:00",
+            "end": "2026-09-03 23:59:59",
+        })
+        assert r["code"] == 0, f"{gran}: {r}"
+        series = r["data"]["series"]
+        assert len(series) > 0, f"{gran} should have buckets"
+        # 每个桶都有 bucket/started/finished 三字段
+        for s in series:
+            assert "bucket" in s and "started" in s and "finished" in s
+
+
+@pytest.mark.asyncio
+async def test_stats_trend_invalid_granularity():
+    """issues/103 非法 granularity → code!=0"""
+    eng, repo, facade = _stats_setup()
+    r = await facade.flow("processInstance/stats/trend", {
+        "granularity": "abc",
+        "start": "2026-09-01 00:00:00",
+        "end": "2026-09-03 00:00:00",
+    })
+    assert r["code"] != 0, r
+
+
+@pytest.mark.asyncio
+async def test_stats_group_empty_db():
+    """issues/103 空库 group：所有维度返回空数组"""
+    eng, repo, facade = _stats_setup()
+    for dim in ("state", "define", "category", "approver", "applicant",
+                "node", "stuckNode", "stuckApprover", "durationBucket"):
+        r = await facade.flow("processInstance/stats/group", {"dimension": dim})
+        assert r["code"] == 0, f"{dim}: {r}"
+        rows = r["data"]["rows"]
+        if dim == "durationBucket":
+            assert len(rows) == 4  # 固定 4 桶
+            assert [row["key"] for row in rows] == ["sameDay", "1to3d", "3to7d", "over7d"]
+            for row in rows:
+                assert row["count"] == 0
+        else:
+            assert len(rows) == 0, f"{dim} should be empty, got {rows}"
+
+
+@pytest.mark.asyncio
+async def test_stats_group_state_dimension():
+    """issues/103 group state 维度"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "state"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    state_map = {row["key"]: row["count"] for row in rows}
+    assert state_map.get("20") == 2  # DONE
+    assert state_map.get("10") == 1  # DOING
+    assert state_map.get("45") == 1  # REJECT
+    # count 降序
+    counts = [row["count"] for row in rows]
+    assert counts == sorted(counts, reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_stats_group_define_dimension():
+    """issues/103 group define 维度：key=code name, label=displayName, 含 avgDurationSeconds"""
+    eng, repo, facade = _stats_setup()
+    d = _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "define"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["key"] == "stats-flow"
+    assert row["label"] == "统计测试流程"
+    assert row["count"] == 4
+    # avgDurationSeconds = 7200 (same as overview)
+    assert row["avgDurationSeconds"] == 7200, row["avgDurationSeconds"]
+
+
+@pytest.mark.asyncio
+async def test_stats_group_category_dimension():
+    """issues/103 group category 维度：按 define.type 分组"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "category"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    assert len(rows) == 1
+    assert rows[0]["key"] == "oa"
+    assert rows[0]["count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_stats_group_approver_dimension():
+    """issues/103 group approver 维度：task.operator 且 task_state=DONE"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "approver"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    op_map = {row["key"]: row["count"] for row in rows}
+    assert op_map.get("bob") == 1
+    assert op_map.get("gina") == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_group_applicant_dimension():
+    """issues/103 group applicant 维度：instance.operator"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "applicant"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    op_map = {row["key"]: row["count"] for row in rows}
+    assert op_map.get("alice") == 2  # inst 100, 102
+    assert op_map.get("charlie") == 1
+    assert op_map.get("frank") == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_group_node_dimension():
+    """issues/103 group node 维度：task.display_name 且 task_state=DONE，含 avgDurationSeconds"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "node"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    node_map = {row["key"]: row for row in rows}
+    assert "审批节点A" in node_map
+    assert node_map["审批节点A"]["count"] == 1
+    assert node_map["审批节点A"]["avgDurationSeconds"] == 3600
+    assert "会签节点" in node_map
+    assert node_map["会签节点"]["count"] == 1
+    assert node_map["会签节点"]["avgDurationSeconds"] == 10800
+
+
+@pytest.mark.asyncio
+async def test_stats_group_stuck_node_dimension():
+    """issues/103 group stuckNode 维度：task_state=DOING 按 display_name"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "stuckNode"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    assert len(rows) == 1
+    assert rows[0]["key"] == "审批节点B"
+    assert rows[0]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_group_stuck_approver_dimension():
+    """issues/103 group stuckApprover 维度：task_state=DOING 的 task_actor 每 actor 一行"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "stuckApprover"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    actor_counts = {row["key"]: row["count"] for row in rows}
+    assert actor_counts.get("dave") == 1
+    assert actor_counts.get("eve") == 1
+
+
+@pytest.mark.asyncio
+async def test_stats_group_duration_bucket():
+    """issues/103 group durationBucket：固定 4 桶、定序、零填充"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group", {"dimension": "durationBucket"})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    assert len(rows) == 4
+    keys = [row["key"] for row in rows]
+    assert keys == ["sameDay", "1to3d", "3to7d", "over7d"]
+    # inst 100: 3600s → sameDay; inst 103: 10800s → sameDay
+    total = sum(row["count"] for row in rows)
+    assert total == 2  # 2 completed instances
+    assert rows[0]["count"] == 2  # sameDay has both
+    assert rows[1]["count"] == 0
+    assert rows[2]["count"] == 0
+    assert rows[3]["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stats_group_invalid_dimension():
+    """issues/103 非法 dimension → code!=0"""
+    eng, repo, facade = _stats_setup()
+    r = await facade.flow("processInstance/stats/group", {"dimension": "bogus"})
+    assert r["code"] != 0, r
+
+
+@pytest.mark.asyncio
+async def test_stats_group_limit():
+    """issues/103 group limit 参数：Top N 截断"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    r = await facade.flow("processInstance/stats/group",
+                          {"dimension": "state", "limit": 2})
+    assert r["code"] == 0, r
+    rows = r["data"]["rows"]
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_stats_overview_with_start_end_filter():
+    """issues/103 overview start/end 过滤：按 instance.create_time"""
+    eng, repo, facade = _stats_setup()
+    _seed_stats(repo)
+    now = datetime.now()
+    # 只看最近 90 分钟 → 只命中 inst 101（DOING，创建于 60 分钟前）
+    start = (now - timedelta(minutes=90)).strftime("%Y-%m-%d %H:%M:%S")
+    end = (now + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    r = await facade.flow("processInstance/stats/overview",
+                          {"start": start, "end": end})
+    assert r["code"] == 0, r
+    d = r["data"]
+    assert d["total"] == 1
+    assert d["inProgress"] == 1
+    assert d["completed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stats_regression_existing_actions():
+    """issues/103 回归：stats 加入后不影响已有 action"""
+    eng, repo, facade = _stats_setup()
+    df = load_flow(repo, "01-simple.json")
+    r = await facade.flow("processDefine/deploy", {"content": open(
+        os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8").read()})
+    assert r["code"] == 0, r
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": df.id, "operator": "zhangsan"})
+    assert r["code"] == 0, r

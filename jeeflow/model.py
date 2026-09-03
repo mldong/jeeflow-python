@@ -415,3 +415,25 @@ class TaskRow:
     defineVersion: int = 0
     instanceVariable: str = ""
     instanceCreateTime: Any = None
+
+
+# ─── 统计查询 DTO（v1.8.25，issues/103） ─────────────────────────────────────
+
+@dataclass
+class InstanceStatsRow:
+    """实例统计查询行（query_instances_for_stats）"""
+    defineId: int = 0
+    state: int = 0
+    operator: str = ""
+    createTime: Any = None
+
+
+@dataclass
+class TaskStatsRow:
+    """任务统计查询行（query_tasks_for_stats）"""
+    operator: str = ""
+    displayName: str = ""
+    performType: int = 0
+    createTime: Any = None
+    finishTime: Any = None
+    expireTime: Any = None

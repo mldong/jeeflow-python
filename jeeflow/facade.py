@@ -12,12 +12,12 @@ import dataclasses
 import inspect
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from .engine import Engine, KEY_NEXT_NODE_OPERATOR, KEY_PROCESS_START_NEXT_NODE_OPERATOR
 from .extensions import EventType, ProcessEvent
-from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState
+from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState
 from .spi import ProcessExtRepository, ProcessRepository, QueryCondition
 
 # submitType 枚举（对齐 boot3）
@@ -1197,6 +1197,192 @@ class JeeflowFacade:
                 return n.get("id")
         return None
 
+    # ── 统计（v1.8.25，issues/103） ──────────────────────────────────────────
+
+    _DEFAULT_STATE_IN = [10, 20, 30, 40, 45, 50]
+    _DEFAULT_STATS_LIMIT = 10
+    _VALID_GRANULARITY = {"hour", "day", "week", "month"}
+    _VALID_DIMENSION = {"state", "define", "category", "approver", "applicant",
+                        "node", "stuckNode", "stuckApprover", "durationBucket"}
+
+    async def _processInstance_stats_overview(self, args: dict) -> dict:
+        start = self._parse_surrogate_time(args.get("start"))
+        end = self._parse_surrogate_time(args.get("end"))
+        state_in = args.get("stateIn") or self._DEFAULT_STATE_IN
+
+        insts = await self._repo.query_instances_for_stats(state_in, "create_time", start, end)
+        total = len(insts)
+        in_progress = sum(1 for r in insts if r.state == 10)
+        completed = sum(1 for r in insts if r.state == 20)
+        withdrawn = sum(1 for r in insts if r.state == 30)
+        rejected = sum(1 for r in insts if r.state == 45)
+        suspended = sum(1 for r in insts if r.state == 50)
+
+        now = datetime.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+        today_insts = await self._repo.query_instances_for_stats(
+            self._DEFAULT_STATE_IN, "create_time", today_start, today_end)
+        today_new = len(today_insts)
+
+        pending, overdue = await self._repo.stats_pending_and_overdue_count()
+        avg_dur = await self._repo.stats_avg_completed_duration_seconds(start, end)
+
+        cs_total, cs_count, on_time, on_time_denom = await self._repo.stats_completed_task_aggregate()
+        countersign_rate = _stats_round4(cs_count / cs_total) if cs_total > 0 else 0.0
+        on_time_rate = _stats_round4(on_time / on_time_denom) if on_time_denom > 0 else 0.0
+        reject_rate = _stats_round4(rejected / max(1, completed + rejected))
+
+        return {
+            "total": total, "inProgress": in_progress, "completed": completed,
+            "rejected": rejected, "withdrawn": withdrawn, "suspended": suspended,
+            "todayNew": today_new, "avgDurationSeconds": avg_dur,
+            "rejectRate": reject_rate, "pendingTaskCount": pending,
+            "overdueTaskCount": overdue, "countersignRate": countersign_rate,
+            "onTimeRate": on_time_rate,
+        }
+
+    async def _processInstance_stats_trend(self, args: dict) -> dict:
+        granularity = str(args.get("granularity", ""))
+        if granularity not in self._VALID_GRANULARITY:
+            raise ValueError(f"不支持的 granularity: {granularity}")
+        start = self._parse_surrogate_time(args.get("start"))
+        end = self._parse_surrogate_time(args.get("end"))
+
+        insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+        done_tasks = await self._repo.query_tasks_for_stats(int(TaskState.DONE), start, end)
+
+        buckets = _stats_enumerate_buckets(start, end, granularity)
+        started_map: dict[str, int] = {}
+        for r in insts:
+            ct = self._parse_surrogate_time(r.createTime)
+            if ct:
+                bk = _stats_bucket_key(ct, granularity)
+                started_map[bk] = started_map.get(bk, 0) + 1
+        finished_map: dict[str, int] = {}
+        for r in done_tasks:
+            ft = self._parse_surrogate_time(r.finishTime)
+            if ft:
+                bk = _stats_bucket_key(ft, granularity)
+                finished_map[bk] = finished_map.get(bk, 0) + 1
+
+        series = []
+        for b in buckets:
+            series.append({"bucket": b, "started": started_map.get(b, 0),
+                           "finished": finished_map.get(b, 0)})
+        return {"granularity": granularity, "series": series}
+
+    async def _processInstance_stats_group(self, args: dict) -> dict:
+        dimension = str(args.get("dimension", ""))
+        if dimension not in self._VALID_DIMENSION:
+            raise ValueError(f"不支持的 dimension: {dimension}")
+        start = self._parse_surrogate_time(args.get("start"))
+        end = self._parse_surrogate_time(args.get("end"))
+        limit = self._to_int(args.get("limit")) or self._DEFAULT_STATS_LIMIT
+
+        if dimension == "define":
+            raw = await self._repo.stats_define_group(start, end, limit)
+            rows = [{"key": r["key"], "label": r.get("label"), "count": r["count"],
+                     "avgDurationSeconds": r.get("avgDurationSeconds")} for r in raw]
+
+        elif dimension == "state":
+            insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+            grouped: dict[str, int] = {}
+            for r in insts:
+                k = str(r.state)
+                grouped[k] = grouped.get(k, 0) + 1
+            entries = sorted(grouped.items(), key=lambda x: x[1], reverse=True)[:limit]
+            rows = [{"key": k, "label": None, "count": c, "avgDurationSeconds": None} for k, c in entries]
+
+        elif dimension == "category":
+            insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+            define_types: dict[int, str] = {}
+            for r in insts:
+                if r.defineId not in define_types:
+                    defn = await self._repo.find_define_by_id(r.defineId)
+                    define_types[r.defineId] = defn.type if defn else ""
+            grouped2: dict[str, int] = {}
+            for r in insts:
+                tp = define_types.get(r.defineId, "")
+                grouped2[tp] = grouped2.get(tp, 0) + 1
+            entries2 = sorted(grouped2.items(), key=lambda x: x[1], reverse=True)[:limit]
+            rows = [{"key": k, "label": None, "count": c, "avgDurationSeconds": None} for k, c in entries2]
+
+        elif dimension == "approver":
+            tasks = await self._repo.query_tasks_for_stats(int(TaskState.DONE), start, end)
+            grouped3: dict[str, int] = {}
+            for r in tasks:
+                if not r.operator:
+                    continue
+                grouped3[r.operator] = grouped3.get(r.operator, 0) + 1
+            entries3 = sorted(grouped3.items(), key=lambda x: x[1], reverse=True)[:limit]
+            rows = [{"key": k, "label": None, "count": c, "avgDurationSeconds": None} for k, c in entries3]
+
+        elif dimension == "applicant":
+            insts = await self._repo.query_instances_for_stats(self._DEFAULT_STATE_IN, "create_time", start, end)
+            grouped4: dict[str, int] = {}
+            for r in insts:
+                if not r.operator:
+                    continue
+                grouped4[r.operator] = grouped4.get(r.operator, 0) + 1
+            entries4 = sorted(grouped4.items(), key=lambda x: x[1], reverse=True)[:limit]
+            rows = [{"key": k, "label": None, "count": c, "avgDurationSeconds": None} for k, c in entries4]
+
+        elif dimension == "node":
+            tasks = await self._repo.query_tasks_for_stats(int(TaskState.DONE), start, end)
+            node_agg: dict[str, dict] = {}
+            for r in tasks:
+                if not r.displayName:
+                    continue
+                dur = 0
+                ft = self._parse_surrogate_time(r.finishTime)
+                ct = self._parse_surrogate_time(r.createTime)
+                if ft and ct:
+                    dur = int((ft - ct).total_seconds())
+                agg = node_agg.get(r.displayName)
+                if agg is None:
+                    agg = {"count": 0, "totalDur": 0}
+                    node_agg[r.displayName] = agg
+                agg["count"] += 1
+                agg["totalDur"] += dur
+            entries5 = sorted(node_agg.items(), key=lambda x: x[1]["count"], reverse=True)[:limit]
+            rows = []
+            for name, agg in entries5:
+                avg = int(round(agg["totalDur"] / agg["count"])) if agg["count"] > 0 else None
+                rows.append({"key": name, "label": None, "count": agg["count"],
+                             "avgDurationSeconds": avg})
+
+        elif dimension == "stuckNode":
+            raw5 = await self._repo.stats_stuck_node_group(limit)
+            rows = [{"key": r["key"], "label": r.get("label"), "count": r["count"],
+                     "avgDurationSeconds": r.get("avgDurationSeconds")} for r in raw5]
+
+        elif dimension == "stuckApprover":
+            raw6 = await self._repo.stats_stuck_approver_group(limit)
+            rows = [{"key": r["key"], "label": r.get("label"), "count": r["count"],
+                     "avgDurationSeconds": r.get("avgDurationSeconds")} for r in raw6]
+
+        elif dimension == "durationBucket":
+            durations = await self._repo.stats_completed_instance_durations(start, end)
+            same_day = d1to3 = d3to7 = over7d = 0
+            for dur in durations:
+                if dur < 86400:
+                    same_day += 1
+                elif dur < 259200:
+                    d1to3 += 1
+                elif dur < 604800:
+                    d3to7 += 1
+                else:
+                    over7d += 1
+            keys = ["sameDay", "1to3d", "3to7d", "over7d"]
+            counts = [same_day, d1to3, d3to7, over7d]
+            rows = [{"key": keys[i], "label": None, "count": counts[i],
+                     "avgDurationSeconds": None} for i in range(4)]
+        else:
+            rows = []
+
+        return {"dimension": dimension, "rows": rows}
+
     # ═══ 行输出转换（issues/05-2 字段契约 + 05-3 时间格式）═══
 
     @staticmethod
@@ -1271,6 +1457,65 @@ class JeeflowFacade:
                 "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
                 "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion,
                 "taskFormData": self._form_data_of(ext, "tf_")}  # issues/15
+
+
+def _stats_round4(v: float) -> float:
+    return round(v * 10000) / 10000
+
+
+def _stats_week_key(t: datetime) -> str:
+    iso = t.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def _stats_enumerate_buckets(start: Optional[datetime], end: Optional[datetime],
+                             granularity: str) -> list[str]:
+    now = datetime.now()
+    s = start if start else now - timedelta(days=30)
+    e = end if end else now
+
+    buckets: list[str] = []
+    if granularity == "hour":
+        cursor = s.replace(minute=0, second=0, microsecond=0)
+        while cursor <= e:
+            buckets.append(cursor.strftime("%Y-%m-%d %H:00"))
+            cursor += timedelta(hours=1)
+    elif granularity == "day":
+        cursor = s.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_day = e.replace(hour=0, minute=0, second=0, microsecond=0)
+        while cursor <= end_day:
+            buckets.append(cursor.strftime("%Y-%m-%d"))
+            cursor += timedelta(days=1)
+    elif granularity == "week":
+        cursor = s.replace(hour=0, minute=0, second=0, microsecond=0)
+        weekday = cursor.weekday()
+        cursor -= timedelta(days=weekday)
+        end_day = e.replace(hour=0, minute=0, second=0, microsecond=0)
+        while cursor <= end_day:
+            buckets.append(_stats_week_key(cursor))
+            cursor += timedelta(days=7)
+    elif granularity == "month":
+        year, month = s.year, s.month
+        end_year, end_month = e.year, e.month
+        while (year, month) <= (end_year, end_month):
+            buckets.append(f"{year}-{month:02d}")
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+    return buckets
+
+
+def _stats_bucket_key(t: datetime, granularity: str) -> str:
+    if granularity == "hour":
+        return t.strftime("%Y-%m-%d %H:00")
+    elif granularity == "day":
+        return t.strftime("%Y-%m-%d")
+    elif granularity == "week":
+        return _stats_week_key(t)
+    elif granularity == "month":
+        return t.strftime("%Y-%m")
+    return ""
 
 
 def _is_id_key(k: str) -> bool:

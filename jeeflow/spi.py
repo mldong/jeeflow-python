@@ -1,6 +1,7 @@
 """SPI 接口——对标 SPEC.md §6"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
 
@@ -10,7 +11,7 @@ class QueryCondition:
     column: str
     operator: str
     value: Any
-from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow, DefineRow, InstanceRow, TaskRow)
+from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow, DefineRow, InstanceRow, TaskRow, InstanceStatsRow, TaskStatsRow)
 
 class ProcessRepository(ABC):
     @abstractmethod
@@ -61,6 +62,61 @@ class ProcessRepository(ABC):
                                 actor_id: Optional[str] = None,
                                 conditions: Optional[list[QueryCondition]] = None) -> tuple[list[CcInstanceRow], int]:
         """我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：按抄送人 actor_id 过滤实例列表"""
+        ...
+
+    # ── 统计查询（v1.8.25，issues/103） ──
+
+    @abstractmethod
+    async def query_instances_for_stats(self, state_in: list[int], order_by: str = "create_time",
+                                        start: Optional[datetime] = None,
+                                        end: Optional[datetime] = None) -> list[InstanceStatsRow]:
+        """统计用实例查询：按 state IN + create_time 范围"""
+        ...
+
+    @abstractmethod
+    async def query_tasks_for_stats(self, task_state: Optional[int] = None,
+                                    start: Optional[datetime] = None,
+                                    end: Optional[datetime] = None) -> list[TaskStatsRow]:
+        """统计用任务查询：按 task_state + finish_time 范围"""
+        ...
+
+    @abstractmethod
+    async def stats_pending_and_overdue_count(self) -> tuple[int, int]:
+        """待办数 + 超期数（task_state=10）"""
+        ...
+
+    @abstractmethod
+    async def stats_completed_task_aggregate(self) -> tuple[int, int, int, int]:
+        """已完成任务聚合：(total, countersign, on_time, on_time_denom)"""
+        ...
+
+    @abstractmethod
+    async def stats_avg_completed_duration_seconds(self, start: Optional[datetime] = None,
+                                                   end: Optional[datetime] = None) -> int:
+        """已完成实例平均耗时（秒）"""
+        ...
+
+    @abstractmethod
+    async def stats_define_group(self, start: Optional[datetime] = None,
+                                 end: Optional[datetime] = None,
+                                 limit: int = 10) -> list[dict]:
+        """按流程定义分组（join define，含 avgDurationSeconds）"""
+        ...
+
+    @abstractmethod
+    async def stats_stuck_node_group(self, limit: int = 10) -> list[dict]:
+        """卡点节点分组（task_state=10，实时快照）"""
+        ...
+
+    @abstractmethod
+    async def stats_stuck_approver_group(self, limit: int = 10) -> list[dict]:
+        """卡点审批人分组（task_actor join task_state=10，实时快照）"""
+        ...
+
+    @abstractmethod
+    async def stats_completed_instance_durations(self, start: Optional[datetime] = None,
+                                                 end: Optional[datetime] = None) -> list[int]:
+        """已完成实例耗时列表（秒），用于 durationBucket 分组"""
         ...
 
     # ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──

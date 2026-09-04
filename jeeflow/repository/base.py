@@ -667,8 +667,8 @@ class JdbcRepository(ProcessRepository):
         args.append(limit)
         async with self._conn() as conn:
             rows = await conn.fetchall(self._sql(sql), tuple(args))
-        return [{"key": r[1], "label": r[2], "count": int(r[3]),
-                 "avgDurationSeconds": int(r[4]) if r[4] is not None else None} for r in rows]
+        return [{"key": r[0] or "", "label": r[1], "count": int(r[2]),
+                 "avgDurationSeconds": int(r[3]) if r[3] is not None else None} for r in rows]
 
     async def stats_stuck_node_group(self, limit: int = 10) -> list[dict]:
         sql = ("SELECT display_name, COUNT(*) AS cnt FROM wf_process_task "

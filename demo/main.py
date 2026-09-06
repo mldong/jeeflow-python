@@ -1,4 +1,5 @@
 """jeeflow FastAPI demo —— boot2 接口规范对齐"""
+import asyncio
 import json
 import os
 import sys
@@ -17,6 +18,7 @@ from jeeflow.memory import MemoryExtRepository
 from jeeflow.model import InstanceState, TaskState, ProcessDefine, ProcessInstance, ProcessTask, UserInfo, parse_flow_model
 from jeeflow.spi import IDGenerator, ExpressionEvaluator, OrgUserProvider
 import flows_resolver
+from seed_business import seed_business
 
 # ─── Setup ───────────────────────────────────────────────────────────────────────
 
@@ -130,6 +132,14 @@ def load_seed():
 
 load_seed()
 
+# T003：业务数据种子（引擎真实启动 16 进行中 + 9 已完成 + 8 委托），/api/reset 复跑。
+# 兼容 uvicorn reload：worker 在运行中的事件循环里 import 本模块，此时挂后台任务而非 asyncio.run。
+try:
+    asyncio.get_running_loop()
+    asyncio.get_event_loop().create_task(seed_business(facade))
+except RuntimeError:
+    asyncio.run(seed_business(facade))
+
 app = FastAPI(title="jeeflow demo", version="0.1.0")
 # CORS——允许 jeeflow-ui (localhost:5173) 跨域直连
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -217,6 +227,7 @@ async def api_reset():
     ext_repo._surrogates.clear()
     ext_repo._seq = 1
     load_seed()
+    await seed_business(facade)  # T003：reset 后复跑业务种子
     return _ok()
 
 

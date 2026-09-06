@@ -18,6 +18,7 @@ from jeeflow.memory import MemoryExtRepository
 from jeeflow.model import InstanceState, TaskState, ProcessDefine, ProcessInstance, ProcessTask, UserInfo, parse_flow_model
 from jeeflow.spi import IDGenerator, ExpressionEvaluator, OrgUserProvider
 import flows_resolver
+sys.path.insert(0, os.path.dirname(__file__))  # uvicorn demo.main:app 从仓根导入时 demo/ 不在 sys.path
 from seed_business import seed_business
 
 # ─── Setup ───────────────────────────────────────────────────────────────────────

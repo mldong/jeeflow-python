@@ -427,6 +427,31 @@ async def main():
               str(latest.name if latest else None))
         check("find_define_by_name 未命中", await repo.find_define_by_name("no-such-flow") is None)
 
+        # ── ⑫ issues/110：SQL 仓 find_instance_by_id 水合任务 → detail 任务列表非空 ──
+        # 修复前：JdbcRepository.find_instance_by_id 只查实例单表，tasks 恒空，
+        # 门面 processInstance/detail 的 tasks/activeTaskList 恒为空数组。
+        # 对齐 Java findTasksByInstanceId / PHP / C# issues/89 聚合水合。
+        from jeeflow.facade import JeeflowFacade
+        inst110 = await eng.start_process_instance_by_id(
+            DEFINE_ID, "zhangsan", {"BUSINESS_NO": f"BIZ-{DB}-110"})
+        # 直接仓储层：水合任务 + actorIds
+        hydrated = await repo.find_instance_by_id(inst110.id)
+        check("SQL 仓 find_instance_by_id 水合任务非空",
+              hydrated is not None and len(hydrated.tasks) > 0,
+              str([t.taskName for t in hydrated.tasks] if hydrated else None))
+        check("水合任务带参与者 actorIds",
+              all(len(t.actorIds) > 0 for t in hydrated.tasks),
+              str([t.actorIds for t in hydrated.tasks]))
+        # 门面层：detail 的 tasks / activeTaskList 非空
+        facade110 = JeeflowFacade(eng, repo, None)
+        detail = await facade110.flow("processInstance/detail", {"id": inst110.id})
+        d = detail.get("data") or {}
+        check("detail tasks 非空", isinstance(d.get("tasks"), list) and len(d["tasks"]) > 0,
+              str(len(d.get("tasks") or [])))
+        check("detail activeTaskList 非空",
+              isinstance(d.get("activeTaskList"), list) and len(d["activeTaskList"]) > 0,
+              str([t.get("taskName") for t in d.get("activeTaskList") or []]))
+
         # 清理测试残留
         await cleanup(adapter)
         conn = await adapter.acquire()

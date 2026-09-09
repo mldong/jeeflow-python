@@ -257,7 +257,8 @@ class JeeflowFacade:
         if not inst:
             raise ValueError("流程实例不存在")
         # 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：update_instance 级联落库）
-        # 注意：find_instance_by_id 不加载 tasks（空），必须按实例查 doing 任务废弃
+        # 注意：find_instance_by_id 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务废弃，
+        # 且必须把聚合副本重置为仅被废弃项（见下方 inst.tasks = abandoned），防级联回写多余任务
         operator = str(args.get("operator", "user1"))
         now = datetime.now()
         abandoned = []

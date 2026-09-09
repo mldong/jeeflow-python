@@ -286,6 +286,12 @@ class JdbcRepository(ProcessRepository):
         )
         if row[8]:
             inst.variables = json.loads(row[8])
+        # issues/110：聚合水合——二次查 wf_process_task 装任务副本（含 actorIds），
+        # 对齐 Java findTasksByInstanceId / PHP PdoProcessRepository / C# issues/89；
+        # 否则门面 detail 的 tasks/activeTaskList 恒空。
+        # _find_tasks_by_state 自管连接（事务上下文内经 _tx_conn_var 复用事务连接），
+        # 排序沿用本仓 find_history_tasks 的 id ASC 约定
+        inst.tasks = await self._find_tasks_by_state(id, None, None)
         return inst
 
     async def save_instance(self, inst: ProcessInstance) -> None:

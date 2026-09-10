@@ -2,14 +2,16 @@
 
 > 连接池必须 `autocommit=True` 创建：无事务时每条语句立即提交，
 > `with_tx` 内 begin/commit/rollback 显式控制（与 Go database/sql 语义对齐）。
+> 惰性引用：不安装 aiomysql 也能导入本包（类型标注仅 TYPE_CHECKING 时可见）。
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
-
-import aiomysql
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 from .base import SqlAdapter, SqlConnection
+
+if TYPE_CHECKING:
+    import aiomysql
 
 
 class MysqlConnection(SqlConnection):

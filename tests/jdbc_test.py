@@ -355,6 +355,23 @@ async def main():
               all(t.taskState == TaskState.ABANDONED for t in after),
               str([int(t.taskState) for t in after]))
 
+        # ── ⑨b issues/113：门面撤回须把 doing 任务以 30（WITHDRAW）落库 ──
+        # 改前撤回路径写 ABANDONED(99)，且门面级断言只验"doing 清空"→ 30/99 都满足，SQL 层无人验
+        from jeeflow.facade import JeeflowFacade
+        facade113 = JeeflowFacade(eng, repo, None)
+        inst113 = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
+                                                         {"BUSINESS_NO": f"BIZ-{DB}-113"})
+        doing113 = await repo.find_doing_tasks(inst113.id)
+        check("⑨b 撤回前存在 doing 任务", len(doing113) > 0, str(len(doing113)))
+        rw = await facade113.flow("processInstance/withdraw",
+                                  {"id": inst113.id, "operator": "zhangsan"})
+        check("⑨b 门面撤回成功", rw["code"] == 0, str(rw))
+        rows113 = await repo.find_history_tasks(inst113.id)
+        check("⑨b 撤回任务落库 task_state=30（非 99）",
+              len(rows113) > 0 and all(int(t.taskState) == int(TaskState.WITHDRAW) for t in rows113),
+              str([int(t.taskState) for t in rows113]))
+        check("⑨b 撤回后无 doing 任务", len(await repo.find_doing_tasks(inst113.id)) == 0)
+
         # ── ⑩ 扩展仓储：设计 CRUD + 委托生效（v1.1.0）──
         from jeeflow.memory import MemoryExtRepository  # noqa: F401
         ext_repo = JdbcProcessExtRepository(adapter, TsIDGenerator())

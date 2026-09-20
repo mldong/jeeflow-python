@@ -226,6 +226,11 @@ class ProcessTask:
         self.taskState = TaskState.ABANDONED
         self.updateTime = now
 
+    def withdraw(self, now) -> None:
+        """随实例撤回任务（区别于 abandon：撤回是发起人主动收回，废弃是引擎清理）"""
+        self.taskState = TaskState.WITHDRAW
+        self.updateTime = now
+
     def is_doing(self) -> bool:
         return self.taskState == TaskState.DOING
 

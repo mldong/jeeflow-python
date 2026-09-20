@@ -417,14 +417,24 @@ async def test_facade_instance_task_and_withdraw():
     inst = await repo.find_instance_by_id(instance_id)
     assert inst.state == InstanceState.DONE, f"实例应完成: {inst.state}"
 
-    # withdraw 级联废弃 doing
+    # withdraw 级联撤回 doing → 任务态 30（WITHDRAW）
     r = await facade.flow("processInstance/startAndExecute",
                           {"processDefineId": define_id, "operator": "zhangsan"})
-    instance_id2 = r["data"]["processInstanceId"]
+    instance_id2 = int(r["data"]["processInstanceId"])
+    before = await repo.find_doing_tasks(instance_id2)
+    assert len(before) >= 1, "撤回前应有 doing 任务"
     r = await facade.flow("processInstance/withdraw", {"id": instance_id2, "operator": "zhangsan"})
     assert r["code"] == 0, r
     after = await repo.find_doing_tasks(instance_id2)
-    assert len(after) == 0, f"撤回应废弃 doing 任务: {after}"
+    assert len(after) == 0, f"撤回应清空 doing 任务: {after}"
+    # issues/113：原 doing 任务须落 30，不能落 99——"doing 清空"两种码值都满足，抓不到该缺陷
+    for t in before:
+        stored = await repo.find_task_by_id(t.id)
+        assert stored is not None, f"撤回后任务应仍可读到: {t.id}"
+        assert stored.taskState == TaskState.WITHDRAW, \
+            f"撤回任务态应=30(WITHDRAW)，实测 {stored.taskState}（99 是废弃码，两码不得混用）"
+    inst2 = await repo.find_instance_by_id(instance_id2)
+    assert inst2.state == InstanceState.WITHDRAW, f"实例态应=30: {inst2.state}"
 
 
 @pytest.mark.asyncio
@@ -1172,6 +1182,16 @@ async def test_e2e_feedback_regression():
     cs_doing = await repo.find_doing_tasks(int(r3["data"]["processInstanceId"]))
     cs = [t for t in cs_doing if t.taskName == "task1"]
     assert len(cs) == 3 and all(t.performType == 1 for t in cs), f"会签任务 performType 应=1: {[t.performType for t in cs]}"
+    # issues/113：会签实例整单撤回时，3 条 doing 会签任务同样落 30——99 留给一票否决的废弃路径
+    cs_iid = int(r3["data"]["processInstanceId"])
+    cw = await facade.flow("processInstance/withdraw", {"id": cs_iid, "operator": "user1"})
+    assert cw["code"] == 0, cw
+    for t in cs:
+        stored = await repo.find_task_by_id(t.id)
+        assert stored is not None and stored.taskState == TaskState.WITHDRAW, \
+            f"撤回会签任务态应=30(WITHDRAW)，实测 {getattr(stored, 'taskState', None)}"
+    left = await repo.find_doing_tasks(cs_iid)
+    assert not left, f"会签实例撤回后仍剩 {len(left)} 条 doing 任务"
     # 54：upAndDown 批量 {ids, opType}
     r4 = await facade.flow("processDefine/upAndDown",
                            {"ids": [r0["data"]["processDefineId"], r2["data"]["processDefineId"]], "opType": 0})

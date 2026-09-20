@@ -256,20 +256,22 @@ class JeeflowFacade:
         inst = await self._repo.find_instance_by_id(instance_id)
         if not inst:
             raise ValueError("流程实例不存在")
-        # 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：update_instance 级联落库）
-        # 注意：find_instance_by_id 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务废弃，
-        # 且必须把聚合副本重置为仅被废弃项（见下方 inst.tasks = abandoned），防级联回写多余任务
+        # 撤回：全部 doing 任务置 WITHDRAW(30) + 实例置 30（v1.0.1：update_instance 级联落库）
+        # 注意：find_instance_by_id 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务撤回，
+        # 且必须把聚合副本重置为仅被撤回项（见下方 inst.tasks = withdrawn），防级联回写多余任务
         operator = str(args.get("operator", "user1"))
         now = datetime.now()
-        abandoned = []
+        withdrawn = []
         for t in await self._repo.find_doing_tasks(instance_id):
-            t.abandon(now)
-            abandoned.append(t)
+            # issues/113：撤回写 WITHDRAW(30)，不用 ABANDONED(99)——99 是引擎废弃码
+            # （会签一票否决 / abandon_all_doing 用它），混用会让撤回单与废弃单在任务表里塌成同值
+            t.withdraw(now)
+            withdrawn.append(t)
         inst.withdraw(now)  # issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
         inst.updateUser = operator
-        # 级联覆盖防护（issues/57 补正）：废弃副本同步回聚合（update_instance 级联覆盖防护）
-        inst.tasks = abandoned
-        for t in abandoned:
+        # 级联覆盖防护（issues/57 补正）：撤回副本同步回聚合（update_instance 级联覆盖防护）
+        inst.tasks = withdrawn
+        for t in withdrawn:
             await self._repo.update_task(t)
         await self._repo.update_instance(inst)
         return None

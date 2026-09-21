@@ -1570,8 +1570,10 @@ class JeeflowFacade:
                 instance_ext = json.loads(instance_ext) if instance_ext else {}
             except Exception:
                 instance_ext = {}
+        # issues/121 P1：引擎建单必写的控制键不算「任务变量非空」，否则新建任务的 ext
+        # 永远不再回退实例变量（issues/82-3 既有契约）。
         ext = r.variables or {}
-        if not ext:
+        if not [k for k in ext if k != 'isFirstTaskNode']:
             ext = instance_ext
         return {"id": r.id, "processInstanceId": r.processInstanceId, "taskName": r.taskName,
                 "displayName": r.displayName, "taskType": r.taskType, "performType": r.performType,

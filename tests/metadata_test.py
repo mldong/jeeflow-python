@@ -32,9 +32,14 @@ def test_instance_state_dict():
 
 def test_submit_type_dict():
     items = enum_dict("wf_process_submit_type")
-    assert len(items) == 8
+    assert len(items) == 9
     assert items[0].value == "0" and items[0].label == "发起申请"
-    assert items[7].value == "20" and items[7].label == "拒绝申请"
+    # issues/115：转办档注册进引擎元数据字典（顺序对齐 spec 07：6 退回发起人 / 7 转办 / 20）
+    assert items[7].value == "7" and items[7].label == "转办"
+    # spec 07：20 的 label 是「会签拒绝」，与 2「拒绝申请」区分（同字典两项同名前端下拉分不开）
+    assert items[8].value == "20" and items[8].label == "会签拒绝"
+    assert items[2].value == "2" and items[2].label == "拒绝申请"
+    assert len({i.label for i in items}) == len(items), "字典 label 不得重复（前端下拉可读性）"
 
 
 def test_unknown_key_returns_empty():

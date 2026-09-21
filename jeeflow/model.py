@@ -75,6 +75,7 @@ class SubmitType(IntEnum):
     JUMP                 = 4
     RE_APPLY             = 5
     ROLLBACK_TO_OPERATOR = 6
+    TRANSFER             = 7   # issues/115：转办（processTask/transfer 留痕，不走 execute）
     COUNTERSIGN_DISAGREE = 20
 
 class TaskType(IntEnum):

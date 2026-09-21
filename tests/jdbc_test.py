@@ -469,6 +469,182 @@ async def main():
               isinstance(d.get("activeTaskList"), list) and len(d["activeTaskList"]) > 0,
               str([t.get("taskName") for t in d.get("activeTaskList") or []]))
 
+        # ── ⑬ issues/114+115：撤回鉴权 / 转办——SQL 仓真实落库（门面级断言）──
+        # 修复前：撤回零鉴权 + operator 缺省回落 user1；门面分派表从未挂 removeTaskActor（转办无从实现）。
+        # 断言形状纪律：一律读回库里的持久值（state/update_user/variable/actor 行），不看"列表空不空"。
+        facade_bc = JeeflowFacade(eng, repo, None)
+
+        async def _one(sql, args=()):
+            conn = await adapter.acquire()
+            try:
+                return await conn.fetchone(sql_of(adapter, sql), args)
+            finally:
+                await adapter.release(conn)
+
+        async def _to_task1(instance_id, tag="⑬"):
+            """提交申请节点 → 推进到 task1：让"发起人"与"进行中任务参与者"是两个人，
+            判据 ①（发起人）与判据 ②（参与者）才可分别验证，同时留下一行已完成(20) 任务。"""
+            a_task = [t for t in await repo.find_doing_tasks(instance_id) if t.taskName == "apply"][0]
+            r = await facade_bc.flow("processTask/execute", {"processTaskId": a_task.id,
+                                                             "operator": "zhangsan", "submitType": 1})
+            if not check(f"{tag} 申请节点提交后推进", r["code"] == 0, str(r)):
+                raise AssertionError(f"申请节点提交失败: {r}")
+            doing = [t for t in await repo.find_doing_tasks(instance_id) if t.taskName == "task1"]
+            if not check(f"{tag} 存在 task1 进行中任务", len(doing) == 1, str([t.taskName for t in doing])):
+                raise AssertionError("未推进到 task1")
+            return await repo.find_task_by_id(a_task.id), doing[0]
+
+        inst114 = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
+                                                         {"BUSINESS_NO": f"BIZ-{DB}-114"})
+        apply114, task114 = await _to_task1(inst114.id)
+        check("⑬ task1 参与者是 leader（非发起人）",
+              await repo.find_task_actors(task114.id) == ["leader"],
+              str(await repo.find_task_actors(task114.id)))
+
+        r = await facade_bc.flow("processInstance/withdraw", {"id": inst114.id})
+        check("⑬ 缺 operator 明确报错（非回落 user1）",
+              r["code"] == 99999999 and "operator 必填" in r["msg"], str(r))
+        r = await facade_bc.flow("processInstance/withdraw",
+                                 {"id": inst114.id, "operator": "intruder"})
+        check("⑬ 无关第三人撤回被拒",
+              r["code"] == 99999999 and "无权限撤回该流程实例" in r["msg"], str(r))
+        row = await _one("SELECT state, update_user FROM wf_process_instance WHERE id=?", [inst114.id])
+        check("⑬ 拒绝后实例仍 10 且未记他人", int(row[0]) == 10 and row[1] != "intruder", str(row))
+        row = await _one("SELECT task_state FROM wf_process_task WHERE id=?", [task114.id])
+        check("⑬ 拒绝后任务仍 10", int(row[0]) == 10, str(row))
+
+        r = await facade_bc.flow("processInstance/withdraw",
+                                 {"id": inst114.id, "operator": "leader"})
+        check("⑬ 进行中任务参与者可撤回整单", r["code"] == 0, str(r))
+        row = await _one("SELECT state, update_user, operator FROM wf_process_instance WHERE id=?",
+                         [inst114.id])
+        check("⑬ 实例落库 30 + update_user=撤回人（发起人列不动）",
+              int(row[0]) == 30 and row[1] == "leader" and row[2] == "zhangsan", str(row))
+        row = await _one("SELECT task_state, update_user FROM wf_process_task WHERE id=?", [task114.id])
+        check("⑬ 进行中任务落库 30 + update_user=撤回人",
+              int(row[0]) == 30 and row[1] == "leader", str(row))
+        row = await _one("SELECT task_state, update_user FROM wf_process_task WHERE id=?", [apply114.id])
+        check("⑬ 已完成(20)任务行不被撤回改写",
+              int(row[0]) == 20 and row[1] == "zhangsan", str(row))
+        r = await facade_bc.flow("processTask/transfer", {"processTaskId": task114.id, "fromActor": "leader",
+                                                          "toActor": "nobody", "operator": "leader"})
+        check("⑬ 已撤回任务不可转办", r["code"] == 99999999 and "任务非进行中，不可转办" in r["msg"], str(r))
+
+        inst115 = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
+                                                         {"BUSINESS_NO": f"BIZ-{DB}-115"})
+        _apply115, task115 = await _to_task1(inst115.id)
+        await repo.add_task_actor(task115.id, ["zhaoliu"])  # 追加第三人：验证只摘 fromActor 那一行
+        r = await facade_bc.flow("processTask/transfer", {"processTaskId": task115.id, "fromActor": "leader",
+                                                          "toActor": "zhaoliu", "operator": "leader"})
+        check("⑬ 目标人已是参与者 → 明确报错",
+              r["code"] == 99999999 and "目标人已是该任务参与人" in r["msg"], str(r))
+        r = await facade_bc.flow("processTask/transfer", {"processTaskId": task115.id, "fromActor": "leader",
+                                                          "toActor": "lisi", "reason": "出差一周",
+                                                          "operator": "intruder"})
+        check("⑬ 越权转办被拒", r["code"] == 99999999 and "无权限转办该任务" in r["msg"], str(r))
+        check("⑬ 越权失败后参与者零变动",
+              await repo.find_task_actors(task115.id) == ["leader", "zhaoliu"],
+              str(await repo.find_task_actors(task115.id)))
+        r = await facade_bc.flow("processTask/transfer", {"processTaskId": task115.id, "fromActor": "leader",
+                                                          "toActor": "lisi", "reason": "出差一周",
+                                                          "operator": "leader"})
+        check("⑬ 转办成功", r["code"] == 0, str(r))
+        check("⑬ 只摘 fromActor 一行、其余参与人保留",
+              await repo.find_task_actors(task115.id) == ["zhaoliu", "lisi"],
+              str(await repo.find_task_actors(task115.id)))
+        left = await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_task_actor"
+                                        " WHERE process_task_id = ? AND actor_id = 'leader'", [task115.id])
+        check("⑬ 原办理人 actor 行确已从库中摘除", int(left) == 0, str(left))
+        row = await _one("SELECT task_state, operator, variable, update_user FROM wf_process_task WHERE id=?",
+                         [task115.id])
+        tv = json.loads(row[2]) if row[2] else {}
+        check("⑬ 任务不新建（同一行仍 DOING=10）+ operator 列恒无值（契约 06 §transfer⚠️ 严禁覆写）"
+              " + update_user=操作人",
+              int(row[0]) == 10 and (row[1] in (None, "")) and row[3] == "leader",
+              str(row[:2] + (row[3],)))
+        check("⑬ submitType=7 + tf_transferTo/tf_transferReason 落任务变量",
+              int(tv.get("submitType", -1)) == 7 and tv.get("tf_transferTo") == "lisi"
+              and tv.get("tf_transferReason") == "出差一周", str(row[2]))
+        check("⑬ 审批记录文案可读「A 转办给 B（原因）」",
+              "leader 转办给 lisi" in str(tv.get("tf_approvalComment", ""))
+              and "出差一周" in str(tv.get("tf_approvalComment", "")), str(tv.get("tf_approvalComment")))
+        led115 = tv.get("tf_transferHistory") or []
+        check("⑬ 留痕三件之②：单跳也落 1 条 tf_transferHistory（六字段齐全）",
+              len(led115) == 1 and led115[0].get("submitType") == 7
+              and led115[0].get("fromActor") == "leader" and led115[0].get("toActor") == "lisi"
+              and led115[0].get("reason") == "出差一周" and led115[0].get("operator") == "leader",
+              json.dumps(led115, ensure_ascii=False))
+        rec = await facade_bc.flow("processInstance/approvalRecord", {"id": inst115.id})
+        rrow = [x for x in rec["data"] if x["taskName"] == "task1"][0]
+        check("⑬ approvalRecord 读回 submitType=7",
+              int((rrow["ext"] or {}).get("submitType", -1)) == 7, str(rrow["ext"]))
+        rows_lisi, _ = await repo.page_todo_tasks(1, 100, "lisi")
+        check("⑬ 接手人 B 待办出现该单（同一 taskId）",
+              task115.id in [t.id for t in rows_lisi], str([t.id for t in rows_lisi]))
+        rows_leader, _ = await repo.page_todo_tasks(1, 100, "leader")
+        check("⑬ 原办理人 A 待办消失", task115.id not in [t.id for t in rows_leader],
+              str([t.id for t in rows_leader]))
+
+        # ── ⑬ 契约 06 §transfer 留痕⚠️（Node 实测复现的冒单缺陷，SQL 落库版）：
+        #    转办→撤回后 operator 列仍无值，被摘走的 leader / 未办的 lisi 的「我已办」不得冒入该单 ──
+        r = await facade_bc.flow("processInstance/withdraw", {"id": inst115.id, "operator": "zhangsan"})
+        check("⑬ 发起人撤回已转办的单", r["code"] == 0, str(r))
+        row = await _one("SELECT task_state, operator FROM wf_process_task WHERE id=?", [task115.id])
+        check("⑬ 撤回后任务落 30 且 operator 列仍恒无值",
+              int(row[0]) == 30 and (row[1] in (None, "")), str(row))
+        for who in ("leader", "lisi"):
+            drows, _ = await repo.page_done_tasks(1, 100, who)
+            check(f"⑬ 转办→撤回后 {who} 的已办列表不冒入该单（他从没办过）",
+                  task115.id not in [t.id for t in drows], str([t.id for t in drows]))
+
+        # ── ⑭ issues/115 契约 06 §4 之②（fc0883a）：tf_transferHistory 追加式账本——SQL 仓跨跳 + 办结后存活 ──
+        # 断言形状纪律：每步都直查 wf_process_task.variable 读回 JSON，不看内存对象、不看列表空不空。
+        from datetime import datetime as _dt
+        inst116 = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
+                                                         {"BUSINESS_NO": f"BIZ-{DB}-116"})
+        _apply116, task116 = await _to_task1(inst116.id, "⑭")
+        hops = [("leader", "lisi", "出差一周"), ("lisi", "wangwu", "李四也不在，转王五")]
+        for src, dst, why in hops:
+            r = await facade_bc.flow("processTask/transfer", {"processTaskId": task116.id,
+                                                              "fromActor": src, "toActor": dst,
+                                                              "reason": why, "operator": src})
+            check(f"⑭ {src}→{dst} 转办成功", r["code"] == 0, str(r))
+        row = await _one("SELECT variable FROM wf_process_task WHERE id=?", [task116.id])
+        led = json.loads(row[0]).get("tf_transferHistory") or []
+        check("⑭ 两跳读回两条（追加不覆盖）", len(led) == 2, json.dumps(led, ensure_ascii=False))
+        ok_fields = len(led) == 2 and all(
+            sorted(h) == sorted(("submitType", "fromActor", "toActor", "reason", "time", "operator"))
+            and (h["submitType"], h["fromActor"], h["toActor"], h["reason"], h["operator"])
+            == (7, src, dst, why, src)
+            for h, (src, dst, why) in zip(led, hops))
+        check("⑭ 两条账本逐字段正确（六键 camelCase + submitType=7 + 办理人=该跳 fromActor）",
+              ok_fields, json.dumps(led, ensure_ascii=False))
+        check("⑭ time 为 yyyy-MM-dd HH:mm:ss 串（datetime 不进 JSON，否则 json.dumps 直接炸）",
+              all(_dt.strptime(h.get("time", ""), "%Y-%m-%d %H:%M:%S") for h in led) if len(led) == 2
+              else False, str([h.get("time") for h in led]))
+        r = await facade_bc.flow("processTask/execute", {"processTaskId": task116.id,
+                                                         "operator": "wangwu", "submitType": 1,
+                                                         "tf_approvalComment": "已核实，同意"})
+        check("⑭ 接手人 C 办结成功", r["code"] == 0, str(r))
+        row = await _one("SELECT task_state, operator, variable FROM wf_process_task WHERE id=?",
+                         [task116.id])
+        tv = json.loads(row[2])
+        check("⑭ 办结后槽位被 C 的提交覆盖（task_state=20 / submitType=1 / operator=wangwu，契约明说属预期）",
+              int(row[0]) == 20 and int(tv.get("submitType", -1)) == 1 and row[1] == "wangwu",
+              f"{row[0]}|{tv.get('submitType')}|{row[1]}")
+        check("⑭ 账本在 C 办结后仍是两条且逐字段不变（实测：execute 的 vars_ 含 **task.variables，合并非整体替换）",
+              len(tv.get("tf_transferHistory") or []) == 2 and tv.get("tf_transferHistory") == led,
+              json.dumps(tv.get("tf_transferHistory"), ensure_ascii=False))
+        check("⑭ C 自己的 tf_approvalComment 按 args 最高优先级覆盖末跳文案",
+              tv.get("tf_approvalComment") == "已核实，同意", str(tv.get("tf_approvalComment")))
+        st = await raw_count(adapter, "SELECT state FROM wf_process_instance WHERE id=?", [inst116.id])
+        check("⑭ 实例办结落库 20", int(st) == 20, str(st))
+        rec = await facade_bc.flow("processInstance/approvalRecord", {"id": inst116.id})
+        rrow = [x for x in rec["data"] if x["taskName"] == "task1"][0]
+        check("⑭ 审批历史读得到两跳账本（转办事实不因办结消失）",
+              [h.get("toActor") for h in (rrow["ext"] or {}).get("tf_transferHistory") or []]
+              == ["lisi", "wangwu"], str(rrow["ext"]))
+
         # 清理测试残留
         await cleanup(adapter)
         conn = await adapter.acquire()

@@ -34,7 +34,7 @@ _DICTS: dict[str, list[DictItem]] = {
     "wf_process_submit_type": [
         DictItem("0", "发起申请"), DictItem("1", "同意申请"), DictItem("2", "拒绝申请"),
         DictItem("3", "退回上一步"), DictItem("4", "跳转"), DictItem("5", "重新提交"),
-        DictItem("6", "退回发起人"), DictItem("20", "拒绝申请"),
+        DictItem("6", "退回发起人"), DictItem("7", "转办"), DictItem("20", "会签拒绝"),
     ],
     "wf_process_task_state": [
         DictItem("10", "进行中"), DictItem("20", "已完成"), DictItem("30", "已撤回"),

@@ -15,7 +15,8 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from .engine import Engine, KEY_NEXT_NODE_OPERATOR, KEY_PROCESS_START_NEXT_NODE_OPERATOR
+from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_NEXT_NODE_OPERATOR,
+                     KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState
 from .spi import ProcessExtRepository, ProcessRepository, QueryCondition
@@ -27,6 +28,7 @@ SUBMIT_REJECT = 2
 SUBMIT_ROLLBACK = 3
 SUBMIT_JUMP = 4
 SUBMIT_ROLLBACK_TO_OPERATOR = 6
+SUBMIT_TRANSFER = 7  # issues/115：转办留痕（不走 execute，由 processTask/transfer 写）
 SUBMIT_COUNTERSIGN_DISAGREE = 20
 
 
@@ -253,19 +255,29 @@ class JeeflowFacade:
         instance_id = self._to_int(args.get("id"))
         if not instance_id:
             raise ValueError("id 缺失或非法")
+        # issues/114：operator 硬必填——严禁缺省回落 "user1" 等固定账号
+        # （那会把撤回人静默记成别人，审计链失真且不报错）
+        operator = str(args.get("operator") or "").strip()
+        if not operator:
+            raise ValueError("operator 必填")
         inst = await self._repo.find_instance_by_id(instance_id)
         if not inst:
             raise ValueError("流程实例不存在")
         # 撤回：全部 doing 任务置 WITHDRAW(30) + 实例置 30（v1.0.1：update_instance 级联落库）
         # 注意：find_instance_by_id 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务撤回，
         # 且必须把聚合副本重置为仅被撤回项（见下方 inst.tasks = withdrawn），防级联回写多余任务
-        operator = str(args.get("operator", "user1"))
+        # ——已完成(20)/已终止(40) 的任务行因此不被改写（契约 06 §processInstance/withdraw）
+        doing = await self._repo.find_doing_tasks(instance_id)
+        if not await self._can_withdraw(inst, operator, doing):
+            raise ValueError("无权限撤回该流程实例")
         now = datetime.now()
         withdrawn = []
-        for t in await self._repo.find_doing_tasks(instance_id):
+        for t in doing:
             # issues/113：撤回写 WITHDRAW(30)，不用 ABANDONED(99)——99 是引擎废弃码
             # （会签一票否决 / abandon_all_doing 用它），混用会让撤回单与废弃单在任务表里塌成同值
             t.withdraw(now)
+            # issues/114：进行中任务的 update_user 回写为真实撤回人（契约同段）
+            t.updateUser = operator
             withdrawn.append(t)
         inst.withdraw(now)  # issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
         inst.updateUser = operator
@@ -275,6 +287,28 @@ class JeeflowFacade:
             await self._repo.update_task(t)
         await self._repo.update_instance(inst)
         return None
+
+    async def _can_withdraw(self, inst, operator: str, doing: list) -> bool:
+        """撤回归属判据（issues/114，命中任一即放行）：
+
+        ① operator = 实例发起人；② operator 是该实例任一**进行中任务**的参与者；
+        ③ operator ∈ {flow.auto, flow.admin}。
+
+        ⚠️ 判据 ① **不可复用** ``Engine._is_allowed``：它只判"operator 在不在该任务
+        actorIds" + auto/admin 放行，不查实例发起人（contract 06 §processInstance/withdraw）。
+        本方法只沿用它的 ②③ 两支口径（KEY_AUTO_ID/KEY_ADMIN_ID 常量 + 子实体 actorIds 判定），
+        发起人一支显式补齐。
+        """
+        op = operator.lower()
+        if op == KEY_AUTO_ID or op == KEY_ADMIN_ID:
+            return True
+        if inst.operator and inst.operator == operator:
+            return True
+        for t in doing:
+            # 参与者以仓储为准（find_task_actors），水合副本 actorIds 兜底
+            if operator in (await self._repo.find_task_actors(t.id) or t.actorIds or []):
+                return True
+        return False
 
     # ── 流程任务 ─────────────────────────────────────────────────────────────
 
@@ -1025,6 +1059,74 @@ class JeeflowFacade:
         if not task_id or not actor_ids:
             raise ValueError("processTaskId/actorIds 缺失")
         await self._repo.add_task_actor(task_id, actor_ids)
+        return None
+
+    async def _processTask_transfer(self, args: dict) -> dict:
+        """转办（issues/115，契约 06 §processTask/transfer）：摘原办理人 + 追加新参与人。
+
+        与 surrogate/addCandidate（**只追加不清空**）是两回事：本 action 摘走 fromActor 在
+        该任务的**那一行**参与者（会签节点转的是"自己那一票"，其余成员不受影响），
+        待办从 A 的列表挪到 B 的列表；任务不新建（沿用同一 processTaskId），
+        节点进度与高亮图不变。留痕三件（契约 06 §4「缺一不可」）：任务行 submitType=7 槽位 +
+        追加式账本 tf_transferHistory + 末跳可读文案 tf_approvalComment。
+        """
+        task_id = self._to_int(args.get("processTaskId"))
+        if not task_id:
+            raise ValueError("processTaskId 缺失或非法")
+        from_actor = str(args.get("fromActor") or "").strip()
+        to_actor = str(args.get("toActor") or "").strip()
+        if not from_actor:
+            raise ValueError("fromActor 必填")
+        if not to_actor:
+            raise ValueError("toActor 必填")
+        operator = str(args.get("operator") or "").strip()
+        if not operator:
+            raise ValueError("operator 必填")
+        task = await self._repo.find_task_by_id(task_id)
+        if not task:
+            raise ValueError(f"task not found: {task_id}")
+        # 归属：只能转自己那一条待办，系统代执行/超级管理员除外（对齐撤回口径）
+        op = operator.lower()
+        if operator != from_actor and op != KEY_AUTO_ID and op != KEY_ADMIN_ID:
+            raise ValueError("无权限转办该任务")
+        if task.taskState != TaskState.DOING:
+            raise ValueError("任务非进行中，不可转办")
+        actors = await self._repo.find_task_actors(task_id) or list(task.actorIds or [])
+        if from_actor not in actors:
+            raise ValueError("原办理人不是该任务参与人")
+        if to_actor in actors:
+            raise ValueError("目标人已是该任务参与人")
+        # 摘原人 + 加新人：走仓储既有 remove/add（add 为去重追加，issues/03 语义不动）
+        await self._repo.remove_task_actor(task_id, [from_actor])
+        await self._repo.add_task_actor(task_id, [to_actor])
+        # 留痕：任务不新建，审批记录即本任务行 → submitType=7 + tf_ 变量（契约 §4 之①槽位）
+        reason = str(args.get("reason") or "").strip()
+        now = datetime.now()
+        vars_ = dict(task.variables or {})
+        vars_[KEY_SUBMIT_TYPE] = SUBMIT_TRANSFER
+        vars_["tf_transferTo"] = to_actor
+        vars_["tf_transferReason"] = reason
+        # 展示文案走本栈既有方式：approvalRecord 的 ext 即任务变量，前端读 ext.tf_approvalComment
+        vars_["tf_approvalComment"] = (f"{from_actor} 转办给 {to_actor}（{reason}）" if reason
+                                       else f"{from_actor} 转办给 {to_actor}")
+        # 契约 §4 之②：追加式账本 tf_transferHistory，每跳 append 一条、只追加不覆盖。
+        # 动机：审批记录的槽位就是任务行本身，B 办结时 submitType 被自己的办理参数覆盖——没有追加式账本，
+        # 多跳转办只剩末跳、办结后转办事实整体消失（键名 camelCase 属跨栈契约键，勿改 snake_case）。
+        history = vars_.get("tf_transferHistory")
+        vars_["tf_transferHistory"] = [
+            *(history if isinstance(history, list) else []),
+            {"submitType": SUBMIT_TRANSFER, "fromActor": from_actor, "toActor": to_actor,
+             "reason": reason, "time": self._fmt_time(now), "operator": operator}]
+        task.variables = vars_
+        # 契约 06 §transfer 留痕⚠️：**严禁覆写 actor_id 列**——进行中任务该列恒无值是既有不变量；
+        # 写进被摘走的人，该单撤回/终止后（离开 DOING 但列值留着）会凭空出现在他从没办过的
+        # 「我已办」列表（page_done_tasks 按 state <> DOING AND operator = ? 过滤）。
+        # "办理人记谁"由 updateUser + tf_transferHistory[].operator 承载。
+        # 同步聚合副本：内存仓 update_task 会按 actorIds 覆写参与者表，须与 remove/add 结果一致
+        task.actorIds = [*(a for a in actors if a != from_actor), to_actor]
+        task.updateTime = now
+        task.updateUser = operator
+        await self._repo.update_task(task)
         return None
 
     async def _processTask_latest(self, args: dict) -> dict:

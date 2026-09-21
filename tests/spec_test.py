@@ -2417,3 +2417,353 @@ async def test_stats_regression_existing_actions():
     r = await facade.flow("processInstance/startAndExecute",
                           {"processDefineId": df.id, "operator": "zhangsan"})
     assert r["code"] == 0, r
+
+
+# ═══ issues/114 撤回鉴权 + issues/115 转办（契约 06 §processInstance/withdraw / §processTask/transfer）═══
+
+async def _deploy(facade, filename: str) -> int:
+    with open(os.path.join(FLOW_DIR, filename), encoding="utf-8") as f:
+        r = await facade.flow("processDefine/deploy", {"content": f.read()})
+    assert r["code"] == 0, r
+    return int(r["data"]["processDefineId"])
+
+
+async def _start(facade, define_id: int, operator: str) -> int:
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": operator})
+    assert r["code"] == 0, r
+    return int(r["data"]["processInstanceId"])
+
+
+@pytest.mark.asyncio
+async def test_withdraw_operator_hard_required():
+    """issues/114：operator 缺失/空串 → 明确报错，绝不回落 user1；失败路径零副作用"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+
+    for args in ({"id": iid}, {"id": iid, "operator": ""}, {"id": iid, "operator": "   "}):
+        r = await facade.flow("processInstance/withdraw", args)
+        assert r["code"] == 99999999, r
+        assert "operator 必填" in r["msg"], r
+
+    # 报错后实例/任务原样不动（缺省回落 user1 的旧实现会在此处把单子撤掉并记成 user1）
+    inst = await repo.find_instance_by_id(iid)
+    assert inst.state == InstanceState.DOING, f"缺 operator 不得撤回: {inst.state}"
+    assert inst.operator == "zhangsan"
+    assert len(await repo.find_doing_tasks(iid)) == 1, "缺 operator 不得动 doing 任务"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_ownership_three_criteria():
+    """issues/114：三条归属判据（发起人 / 任一进行中任务参与者 / flow.auto·flow.admin）+ update_user 回写"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    doing_before = await repo.find_doing_tasks(iid)
+    apply_before = [t for t in await repo.find_history_tasks(iid) if t.taskName == "apply"][0]
+
+    # ① 无关第三人：拒绝 + 零副作用
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "intruder"})
+    assert r["code"] == 99999999 and "无权限撤回该流程实例" in r["msg"], r
+    assert (await repo.find_instance_by_id(iid)).state == InstanceState.DOING
+    assert len(await repo.find_doing_tasks(iid)) == 1
+
+    # ② 进行中任务参与者（leader 不是发起人）可撤回**整单**，update_user 回写真实撤回人
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "leader"})
+    assert r["code"] == 0 and r["data"] is None, r
+    inst = await repo.find_instance_by_id(iid)
+    assert inst.state == InstanceState.WITHDRAW, f"实例态应=30: {inst.state}"
+    assert inst.updateUser == "leader", f"实例 update_user 应回写撤回人: {inst.updateUser}"
+    assert inst.operator == "zhangsan", "发起人字段不得被撤回改写"
+    stored = await repo.find_task_by_id(doing_before[0].id)
+    assert stored.taskState == TaskState.WITHDRAW, f"撤回任务态应=30: {stored.taskState}"
+    assert stored.updateUser == "leader", f"任务 update_user 应回写撤回人: {stored.updateUser}"
+    # 已完成(20) 的任务行不得被撤回改写（含 update_user）
+    apply_after = await repo.find_task_by_id(apply_before.id)
+    assert apply_after.taskState == TaskState.DONE, f"已完成任务应保持 20: {apply_after.taskState}"
+    assert apply_after.updateUser == apply_before.updateUser, \
+        f"已完成任务 update_user 不应被改写: {apply_after.updateUser} != {apply_before.updateUser}"
+
+    # ③ 发起人自己可撤回
+    iid2 = await _start(facade, define_id, "zhangsan")
+    r = await facade.flow("processInstance/withdraw", {"id": iid2, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    assert (await repo.find_instance_by_id(iid2)).state == InstanceState.WITHDRAW
+
+    # ④ flow.auto / flow.admin 放行（大小写不敏感，沿用 isAllowed 既有约定）
+    for op in ("flow.auto", "flow.admin", "FLOW.ADMIN"):
+        iidn = await _start(facade, define_id, "zhangsan")
+        r = await facade.flow("processInstance/withdraw", {"id": iidn, "operator": op})
+        assert r["code"] == 0, (op, r)
+        assert (await repo.find_instance_by_id(iidn)).updateUser == op, f"{op} 撤回人应落库"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_by_countersign_member_withdraws_whole_order():
+    """issues/114：会签任一成员（参与者判据）可撤回整单——3 条 doing 会签任务全部落 30"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "05-countersign-parallel.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    members = {a: await _doing_task_id_by_actor(repo, iid, "task1", a) for a in ("userA", "userB", "userC")}
+    assert all(members.values()), f"会签三成员任务应齐全: {members}"
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "userB"})
+    assert r["code"] == 0, r
+    for actor, tid in members.items():
+        t = await repo.find_task_by_id(tid)
+        assert t.taskState == TaskState.WITHDRAW, f"{actor} 的会签任务应落 30: {t.taskState}"
+    assert not await repo.find_doing_tasks(iid), "整单撤回后不得残留 doing 任务"
+
+
+@pytest.mark.asyncio
+async def test_transfer_moves_actor_and_records_submit_type_7():
+    """issues/115：转办摘原人 + 追加新人（同一 DOING 任务）+ submitType=7 留痕 + 待办挪位"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    task1 = (await repo.find_doing_tasks(iid))[0]
+    # 先加签第三人：验证转办只摘 fromActor 那一行，其余参与人不受影响
+    assert (await facade.flow("processTask/surrogate",
+                              {"processTaskId": task1.id, "actorIds": ["zhaoliu"]})).get("code") == 0
+    assert await repo.find_task_actors(task1.id) == ["leader", "zhaoliu"]
+    todo_leader = (await facade.flow("processTask/todoList", {"operator": "leader"}))["data"]["rows"]
+    assert [t["id"] for t in todo_leader] == [str(task1.id)], todo_leader
+
+    r = await facade.flow("processTask/transfer", {"processTaskId": task1.id, "fromActor": "leader",
+                                                   "toActor": "lisi", "reason": "出差，请李四代办",
+                                                   "operator": "leader"})
+    assert r["code"] == 0 and r["data"] is None, r
+
+    # 参与者：leader 那一行摘走、zhaoliu 保留、lisi 追加
+    assert await repo.find_task_actors(task1.id) == ["zhaoliu", "lisi"]
+    # 任务不新建：同一 id 仍 DOING，高亮/节点进度不变
+    stored = await repo.find_task_by_id(task1.id)
+    assert stored.id == task1.id and stored.taskState == TaskState.DOING, \
+        f"转办后任务应保持同一 DOING 行: {stored.taskState}"
+    hl = await facade.flow("processInstance/highLight", {"id": iid})
+    assert "task1" in hl["data"]["activeNodeNames"], hl["data"]
+    # 待办从 A 挪到 B
+    assert [t["id"] for t in (await facade.flow("processTask/todoList",
+                                                {"operator": "lisi"}))["data"]["rows"]] == [str(task1.id)]
+    assert str(task1.id) not in [t["id"] for t in (await facade.flow(
+        "processTask/todoList", {"operator": "leader"}))["data"]["rows"]], "原办理人待办应消失"
+    # 留痕：审批记录 submitType=7 + tf_transferTo/tf_transferReason + 可读文案；
+    # 契约 06 §transfer 留痕⚠️：operator/actor_id 列恒无值（严禁覆写），办理人经 update_user + 账本承载
+    rec = await facade.flow("processInstance/approvalRecord", {"id": iid})
+    assert rec["code"] == 0, rec
+    row = [x for x in rec["data"] if x["taskName"] == "task1"][0]
+    ext = row["ext"]
+    assert int(ext["submitType"]) == 7, f"转办留痕 submitType 应=7: {ext}"
+    assert ext["tf_transferTo"] == "lisi" and ext["tf_transferReason"] == "出差，请李四代办", ext
+    assert "leader 转办给 lisi" in ext["tf_approvalComment"], ext
+    assert "出差，请李四代办" in ext["tf_approvalComment"], ext
+    assert stored.actorId in ("", None), f"转办后 DOING 任务 actor_id 应恒无值: {stored.actorId!r}"
+    assert row["operator"] in ("", None), f"审批记录 operator 列读回应为空（严禁覆写）: {row}"
+    assert stored.updateUser == "leader", f"办理人经 update_user 承载: {stored.updateUser}"
+    assert stored.variables["submitType"] == 7 and stored.variables["tf_transferTo"] == "lisi"
+    # 留痕三件之②：单跳同样要落一条追加式账本（不是只有多跳才写）
+    assert [h["toActor"] for h in ext["tf_transferHistory"]] == ["lisi"], \
+        f"tf_transferHistory 应有且仅有 1 条首跳记录: {ext}"
+
+    # 回归：接手人能正常办完该单
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": task1.id, "operator": "lisi", "submitType": 1})
+    assert r["code"] == 0, r
+    assert (await repo.find_instance_by_id(iid)).state == InstanceState.DONE
+
+
+@pytest.mark.asyncio
+async def test_transfer_negative_matrix():
+    """issues/115：转办四类明确报错 + operator 必填 + auto/admin 代转"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+
+    async def bad(payload, keyword):
+        r = await facade.flow("processTask/transfer", payload)
+        assert r["code"] == 99999999, (payload, r)
+        assert keyword in r["msg"], (payload, r)
+        return r
+
+    # ① 参数缺失
+    await bad({"fromActor": "leader", "toActor": "lisi", "operator": "leader"}, "processTaskId")
+    await bad({"processTaskId": tid, "toActor": "lisi", "operator": "leader"}, "fromActor 必填")
+    await bad({"processTaskId": tid, "fromActor": "leader", "operator": "leader"}, "toActor 必填")
+    # ② operator 必填
+    await bad({"processTaskId": tid, "fromActor": "leader", "toActor": "lisi"}, "operator 必填")
+    # ③ 越权：C 转别人的单（参与者表不得被改动）
+    await bad({"processTaskId": tid, "fromActor": "leader", "toActor": "lisi", "operator": "intruder"},
+              "无权限转办该任务")
+    assert await repo.find_task_actors(tid) == ["leader"], "越权失败后参与者不得变动"
+    # ④ fromActor 不在参与者里
+    await bad({"processTaskId": tid, "fromActor": "nosuch", "toActor": "lisi", "operator": "nosuch"},
+              "原办理人不是该任务参与人")
+    # ⑤ toActor 已是参与者（明确报错，不静默成功）
+    await bad({"processTaskId": tid, "fromActor": "leader", "toActor": "leader", "operator": "leader"},
+              "目标人已是该任务参与人")
+    assert await repo.find_task_actors(tid) == ["leader"]
+
+    # ⑥ flow.admin / flow.auto 可代转（放行分支）
+    r = await facade.flow("processTask/transfer", {"processTaskId": tid, "fromActor": "leader",
+                                                   "toActor": "boss", "operator": "flow.admin"})
+    assert r["code"] == 0, r
+    assert await repo.find_task_actors(tid) == ["boss"]
+
+    # ⑦ 任务非进行中：办完再转 → 明确报错，且不改写已完成行
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": tid, "operator": "boss", "submitType": 1})
+    assert r["code"] == 0, r
+    done = await repo.find_task_by_id(tid)
+    assert done.taskState == TaskState.DONE
+    r = await facade.flow("processTask/transfer", {"processTaskId": tid, "fromActor": "boss",
+                                                   "toActor": "lisi", "operator": "boss"})
+    assert r["code"] == 99999999 and "任务非进行中，不可转办" in r["msg"], r
+    again = await repo.find_task_by_id(tid)
+    assert again.taskState == TaskState.DONE and again.actorIds == ["boss"], \
+        f"失败转办不得改写已完成任务: {again.taskState} {again.actorIds}"
+
+
+@pytest.mark.asyncio
+async def test_transfer_countersign_only_moves_own_row():
+    """issues/115：会签节点转办只摘 fromActor 一行，其余成员待办不受影响"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "05-countersign-parallel.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    task_a = await _doing_task_id_by_actor(repo, iid, "task1", "userA")
+    task_b = await _doing_task_id_by_actor(repo, iid, "task1", "userB")
+    assert task_a and task_b, f"会签成员任务应存在: A={task_a} B={task_b}"
+
+    r = await facade.flow("processTask/transfer", {"processTaskId": task_a, "fromActor": "userA",
+                                                   "toActor": "userD", "reason": "转岗",
+                                                   "operator": "userA"})
+    assert r["code"] == 0, r
+    assert await repo.find_task_actors(task_a) == ["userD"], "A 的那一行应换成 userD"
+    assert await repo.find_task_actors(task_b) == ["userB"], "其余会签成员不受影响"
+    moved = await repo.find_task_by_id(task_a)
+    assert moved.taskState == TaskState.DOING and moved.variables["tf_transferTo"] == "userD"
+    assert not await _doing_task_id_by_actor(repo, iid, "task1", "userA"), "userA 待办应消失"
+    assert await _doing_task_id_by_actor(repo, iid, "task1", "userD") == task_a
+
+
+@pytest.mark.asyncio
+async def test_surrogate_still_append_only():
+    """issues/115 回归：加签（surrogate/addCandidate）仍是"只追加不清空"，与 transfer 区分"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+
+    for action in ("processTask/surrogate", "processTask/addCandidate"):
+        r = await facade.flow(action, {"processTaskId": tid, "actorIds": [f"extra-{action[-6:]}"]})
+        assert r["code"] == 0, (action, r)
+    actors = await repo.find_task_actors(tid)
+    assert actors[0] == "leader", f"加签原人必须保留: {actors}"
+    assert len(actors) == 3, actors
+    # 原人仍可办理（未摘走）
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": tid, "operator": "leader", "submitType": 1})
+    assert r["code"] == 0, r
+
+
+@pytest.mark.asyncio
+async def test_transfer_multi_hop_ledger_survives_completion():
+    """契约 06 §4 之②（fc0883a 新增）：tf_transferHistory 是跨跳**追加式**账本。
+
+    A→B、B→C 两跳各留一条，C 办结（submitType=1 覆盖末跳「槽位」，契约明说属预期）后
+    账本必须仍是两条——这一条断言同时实测钉死「execute 的
+    vars_ = {**base_vars, **task.variables, **args} 是合并含自身，不是整体替换」。
+    """
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+
+    hops = [("leader", "lisi", "出差一周"), ("lisi", "wangwu", "李四也不在，转王五")]
+    for src, dst, why in hops:
+        r = await facade.flow("processTask/transfer", {"processTaskId": tid, "fromActor": src,
+                                                       "toActor": dst, "reason": why,
+                                                       "operator": src})
+        assert r["code"] == 0, (src, dst, r)
+
+    ledger = (await repo.find_task_by_id(tid)).variables["tf_transferHistory"]
+    assert isinstance(ledger, list) and len(ledger) == 2, \
+        f"两跳应追加为两条（只追加不覆盖）: {ledger}"
+    for (src, dst, why), entry in zip(hops, ledger):
+        assert entry["submitType"] == 7, entry
+        assert entry["fromActor"] == src and entry["toActor"] == dst, entry
+        assert entry["reason"] == why, entry
+        assert entry["operator"] == src, entry
+        # time 走本栈统一 yyyy-MM-dd HH:mm:ss 串（datetime 直接进 json 会炸序列化）
+        assert datetime.strptime(entry["time"], "%Y-%m-%d %H:%M:%S"), entry
+        assert set(entry) == {"submitType", "fromActor", "toActor", "reason", "time", "operator"}, entry
+    # 便捷键 + 末跳文案只留末跳（契约 §4 之①③）
+    assert (await repo.find_task_by_id(tid)).variables["tf_transferTo"] == "wangwu"
+
+    # C 办结：槽位被本次提交参数覆盖属预期，账本不得随之消失
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": tid, "operator": "wangwu", "submitType": 1,
+                           "tf_approvalComment": "已核实，同意"})
+    assert r["code"] == 0, r
+    assert (await repo.find_instance_by_id(iid)).state == InstanceState.DONE
+    stored = await repo.find_task_by_id(tid)
+    assert stored.taskState == TaskState.DONE, stored.taskState
+    assert int(stored.variables["submitType"]) == 1, \
+        f"合并序 args 最高：C 的 1 应覆盖转办的 7（契约 §5）: {stored.variables['submitType']}"
+    assert stored.variables["tf_approvalComment"] == "已核实，同意", "C 自己的意见覆盖末跳文案"
+    led_after = stored.variables.get("tf_transferHistory") or []
+    assert len(led_after) == 2, f"办结后账本仍必须两条（转办事实不得随槽位消失）: {led_after}"
+    assert led_after == ledger, f"办结后两跳账本应逐字段原样存活: {led_after}"
+    # 同一实例的两行任务里，只有被转办那条带账本（不污染兄弟任务）
+    apply_task = [t for t in (await repo.find_history_tasks(iid)) if t.taskName == "apply"][0]
+    assert "tf_transferHistory" not in apply_task.variables, apply_task.variables
+    # 审批历史读回：记录读作 C 的同意，转办事实在 ext 账本里
+    rec = await facade.flow("processInstance/approvalRecord", {"id": iid})
+    row = [x for x in rec["data"] if x["taskName"] == "task1"][0]
+    assert int(row["ext"]["submitType"]) == 1, row["ext"]
+    assert [h["toActor"] for h in row["ext"]["tf_transferHistory"]] == ["lisi", "wangwu"], row["ext"]
+
+
+@pytest.mark.asyncio
+async def test_transfer_never_overwrites_operator_column_done_list_clean():
+    """契约 06 §transfer 留痕⚠️（778340a 固化，Node 实测复现）：转办严禁覆写 actor_id 列——
+    进行中任务该列恒无值是既有不变量；写进被摘走的人，该单撤回后离开 DOING 但列值留着，
+    page_done_tasks（state <> DOING AND operator = ?）会让他凭空看到从没办过的「我已办」单。
+    断言全落持久值/读回值。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+
+    r = await facade.flow("processTask/transfer", {"processTaskId": tid, "fromActor": "leader",
+                                                   "toActor": "lisi", "reason": "出差",
+                                                   "operator": "leader"})
+    assert r["code"] == 0, r
+    mid = await repo.find_task_by_id(tid)
+    assert mid.actorId in ("", None), f"转办后持久任务行 actor_id 应恒无值: {mid.actorId!r}"
+    assert mid.updateUser == "leader", "办理人经 update_user 承载"
+    assert mid.variables["tf_transferHistory"][0]["operator"] == "leader", "真操作人在账本"
+
+    # 发起人撤回：任务离开 DOING(→30)，operator 列不被污染
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    after = await repo.find_task_by_id(tid)
+    assert after.taskState == TaskState.WITHDRAW, f"撤回后应落 30（判据生效前提）: {after.taskState}"
+    assert after.actorId in ("", None), f"撤回后 actor_id 列仍恒无值: {after.actorId!r}"
+    # 被摘走的 leader 与未办的 lisi：doneList 都不含该单（冒单即缺陷实证形态）
+    for who in ("leader", "lisi"):
+        rd = await facade.flow("processTask/doneList", {"operator": who, "pageSize": 100})
+        assert rd["code"] == 0, rd
+        ids = [t["id"] for t in rd["data"]["rows"]]
+        assert str(tid) not in ids and tid not in ids, \
+            f"转办→撤回后 {who} 的「我已办」冒入该单（他从没办过）: {ids}"
+

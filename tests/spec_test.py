@@ -1453,7 +1453,8 @@ async def test_facade_execute_submit_type_behavior():
     eng, repo = setup()
     facade = JeeflowFacade(eng, repo, MemoryExtRepository())
 
-    # ── submitType=3 ROLLBACK：task2 退回上一步 → task1 新待办（actor=退回操作人），实例保持 DOING(10)
+    # ── submitType=3 ROLLBACK（血缘版 issues/121 P2）：task2 退回 → 复活 task1 那条历史行，
+    #    参与者＝task1 的原办结人 leader（不是执行回退的 manager），实例保持 DOING(10)
     rb = await _start_multi_task_at(facade, repo, "task2")
     t2 = await _doing_task_id(repo, rb, "task2")
     await repo.add_task_actor(t2, ["manager"])
@@ -1462,7 +1463,9 @@ async def test_facade_execute_submit_type_behavior():
     assert r["code"] == 0, r
     rb_task1 = await _doing_task_id(repo, rb, "task1")
     assert rb_task1, "ROLLBACK 应在 task1 产生新待办"
-    assert "manager" in await repo.find_task_actors(rb_task1), "退回任务 actor 应为退回操作人 manager"
+    rb1_actors = await repo.find_task_actors(rb_task1)
+    assert "leader" in rb1_actors and "manager" not in rb1_actors, \
+        f"血缘版：复活行 actor 应为 task1 原办结人 leader，不该是执行回退的 manager：{rb1_actors}"
     assert (await repo.find_instance_by_id(rb)).state == InstanceState.DOING
 
     # ── submitType=4 JUMP：task3 跳转 apply（首任务节点 = start 直接后继，assignee 强制发起人）
@@ -3269,24 +3272,22 @@ async def test_surrogate_applies_on_jump_path():
 
 @pytest.mark.asyncio
 async def test_surrogate_applies_on_rollback_path():
-    """路径 2/3 回退 ROLLBACK（execute_and_jump_task 空 target）：新任务落在**上一节点**、
-    参与者 = 回退操作人（_rollback_actors 取 task.actorId）。代理人配在回退操作人身上、
-    诱饵配在上一节点原参与者身上 ⇒ 新 b1 任务里只能出现 rbk-agent。"""
+    """路径 2/3 回退 ROLLBACK（execute_and_jump_task 空 target）：issues/121 P2 血缘版——复活 b1
+    那条历史行，参与者＝该行办结人 rbk-zhang（不是执行回退的 rbk-wang）。台账延后到 b1 建单之后
+    再配 ⇒ 起点自证仍然成立；诱饵配在 rbk-wang 身上 ⇒ 新行里出现 rbk-decoy 就说明用错了人。"""
     content = _flow_json([("b1", "rbk-zhang"), ("b2", "rbk-wang")], name="surrback116")
     eng, repo, ext, def_id = _surr_harness("surrback116", content)
-    await _put_surr(ext, "rbk-wang", "rbk-agent", "surrback116")     # 回退操作人的委托
-    await _put_surr(ext, "rbk-zhang", "rbk-decoy", "surrback116")    # 诱饵：原 b1 参与者的委托
 
     inst = await eng.start_process_instance_by_id(def_id, "boss1")
-    assert await _doing_actors(repo, inst.id, "b1") == ["rbk-zhang", "rbk-decoy"], \
-        "起点自证：发起产生的 b1 只带 rbk-zhang 自己的代理人（新 b1 的代理人必须是另一个）"
+    assert await _doing_actors(repo, inst.id, "b1") == ["rbk-zhang"],         "起点自证：台账还没配，发起产生的 b1 不该有任何代理人"
     b1 = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b1"][0]
     await eng.execute_process_task(b1.id, "rbk-zhang")
+    await _put_surr(ext, "rbk-zhang", "rbk-agent", "surrback116")    # 该行办结人的委托
+    await _put_surr(ext, "rbk-wang", "rbk-decoy", "surrback116")     # 诱饵：执行回退的人
     b2 = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b2"][0]
     await eng.execute_and_jump_task(b2.id, "rbk-wang", None, "")
-    # 原 b1 已 DONE，b1 上唯一的进行中任务就是回退新建的那一条
-    assert await _doing_actors(repo, inst.id, "b1") == ["rbk-wang", "rbk-agent"], \
-        "条款 1「回退(ROLLBACK)」：回退新建的任务未并入代理人（期望 [rbk-wang rbk-agent]）"
+    # 原 b1 已 DONE，b1 上唯一的进行中任务就是复活出来的那一条
+    assert await _doing_actors(repo, inst.id, "b1") == ["rbk-zhang", "rbk-agent"],         "条款 1「回退(ROLLBACK)」：复活行应＝该行办结人 + 其代理人，且不得带执行回退人的代理人"
 
 
 @pytest.mark.asyncio
@@ -3391,3 +3392,47 @@ async def test_i121_p1_lineage_written_on_create():
     assert r2["code"] == 0, r2
     ext2 = [x for x in r2["data"]["tasks"] if x["taskName"] == "apply"][0]["ext"]
     assert ext2["isFirstTaskNode"] is False, "缺键的存量历史行回退现算（仅进行中口径）⇒ False，且不得报错"
+
+@pytest.mark.asyncio
+async def test_i121_p2_rollback_lineage_and_negatives():
+    """issues/121 P2：① 无血缘（parent 为 0，以及 P1 之前老行的 None 形状）⇒ 20010007；
+    ② 血缘前驱跨不过 fork（boot2 canRejected 遇 fork/join/start 跳过该入边不再深入）⇒ 20010008；
+    （正向落点/参与者由上面两处旧语义用例改血缘版后一并钉住。）"""
+    eng, repo = setup()
+    df = load_flow(repo, "02-multi-task.json")
+    inst = await eng.start_process_instance_by_id(df.id, "applicant")
+    apply = (await repo.find_doing_tasks(inst.id))[0]
+    assert apply.taskName == "apply"
+    assert apply.parentTaskId == 0, "前置条件：发起那条 parent 应为 0"
+    try:
+        await eng.execute_and_jump_task(apply.id, "applicant", None, "")
+        assert False, "无血缘必须报错，不得静默不建单"
+    except ValueError as e:
+        assert "20010007" in str(e), f"错码应在 msg：{e}"
+
+    # 老行形状：parent=None
+    old = apply
+    old.parentTaskId = None
+    await repo.update_task(old)
+    try:
+        await eng.execute_and_jump_task(apply.id, "applicant", None, "")
+        assert False, "parent=None 必须报 20010007"
+    except ValueError as e:
+        assert "20010007" in str(e), f"实得：{e}"
+
+    # ② fork 分支行退到 fork 之前的节点
+    eng2, repo2 = setup()
+    df2 = load_flow(repo2, "04-fork-join.json")
+    inst2 = await eng2.start_process_instance_by_id(df2.id, "applicant")
+    apply2 = (await repo2.find_doing_tasks(inst2.id))[0]
+    await repo2.add_task_actor(apply2.id, ["applicant"])
+    await eng2.execute_process_task(apply2.id, "applicant")
+    branch = [t for t in await repo2.find_doing_tasks(inst2.id) if t.taskName == "taskA"][0]
+    assert branch.parentTaskId, "前置条件：分支行的 parent 应已由 P1 写入"
+    assert branch.actorIds, "前置条件：分支行应有参与者，否则会被权限校验先挡下"
+    try:
+        await eng2.execute_and_jump_task(branch.id, branch.actorIds[0], None, "")
+        assert False, "血缘前驱跨不过 fork 时必须报 20010008"
+    except ValueError as e:
+        assert "20010008" in str(e), f"实得：{e}"
+

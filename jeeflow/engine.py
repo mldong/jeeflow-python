@@ -225,17 +225,10 @@ class EngineImpl(Engine):
                                      target_task_name: str = None) -> ProcessInstance:
         task, inst, flow, vars_ = await self._prepare_execute_task(task_id, operator, args)
         if not target_task_name:
-            # issues/79：ROLLBACK 对齐 Java rejectTask——退回上一任务节点（首条输入边 source），
-            # 新任务 actor=当前任务完成人（退回操作人）；无上一任务节点则不产生新待办
-            prev_name = self._previous_task_name(flow, task.taskName)
-            if prev_name:
-                prev = _find_node(flow, prev_name)
-                if prev:
-                    actors = self._rollback_actors(prev, inst, operator, task)
-                    await self._create_task_with_actors(prev, inst, operator, vars_, actors,
-                                                        await self._surrogate_process_name(flow, inst),
-                                                        # 仍是拓扑版落点（P2 换血缘版）：parent＝被回退的那条任务
-                                                        task.id, self._is_first_task_node(flow, prev))
+            # issues/121 P2：ROLLBACK 走血缘版——复活 parentTaskId 指的那条历史行，
+            # 参与者＝该行办结人（首任务节点行取该行 u_userId）。无血缘/守卫不过显式报错，
+            # 不再像拓扑版那样"什么都不做、实例保持 DOING 却零待办"。
+            await self._rollback_to_parent(flow, inst, task, operator)
         else:
             # issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
             target = _find_node(flow, target_task_name)
@@ -294,17 +287,42 @@ class EngineImpl(Engine):
         await self.repo.update_instance(inst)
         return task, inst, flow, vars_
 
-    def _previous_task_name(self, flow: FlowModel, task_name: str) -> str:
-        """当前任务节点的首条输入边 source（issues/79 对齐 Java getPreviousTaskName）"""
-        node = _find_node(flow, task_name)
-        if node is None:
-            return ""
-        for edge in flow.edges:
-            if edge.targetNodeId == node.id:
-                src = _find_node(flow, edge.sourceNodeId)
-                if src is not None and src.type in (TYPE_TASK, TYPE_CUSTOM):
-                    return src.id
-        return ""
+    async def _rollback_to_parent(self, flow: FlowModel, inst: ProcessInstance,
+                                   task: ProcessTask, operator: str) -> ProcessTask:
+        """退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parentTaskId，
+        复活那条历史行；不按模型入边拓扑推。错码写在异常 msg 前缀（出口统一 99999999）。"""
+        NO_LINEAGE = "20010007: 上一步任务ID为空，无法驳回至上一步处理"
+        GUARD = "20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+        parent_id = getattr(task, "parentTaskId", None)
+        if not parent_id:
+            raise ValueError(NO_LINEAGE)
+        his = await self.repo.find_task_by_id(parent_id)
+        if his is None:
+            raise ValueError(NO_LINEAGE)
+        prev = _find_node(flow, his.taskName)
+        if prev is None or not _can_rejected(flow, task.taskName, prev.id):
+            raise ValueError(GUARD)
+        # 首任务节点那条由发起人提交 ⇒ 参与者取该行 u_userId；其余取该行办结人。
+        # 老行没这个键 ⇒ 按 False 处理（宁可派给该行 actorId，也不用带"仅进行中"判定的现算值）。
+        is_first = bool((his.variables or {}).get("isFirstTaskNode"))
+        actor = his.actorId
+        if is_first:
+            actor = (his.variables or {}).get("u_userId") or inst.operator
+        if not actor:
+            raise ValueError(NO_LINEAGE)
+        now = datetime.now()
+        form = (prev.properties or {}).get("form", "")
+        nt = inst.create_task(self._next_id(), prev.id, (prev.text or {}).get("value", ""),
+                              actor, his.createUser, form, now,
+                              his.parentTaskId if his.parentTaskId is not None else 0, is_first,
+                              his.performType or 0)
+        # 复活行只带数据类键（tf_*/csv_*/submitType/taskName/会签簿记都是上次提交的残留）
+        nt.variables = _lineage_vars(his.variables)
+        nt.variables["isFirstTaskNode"] = is_first
+        await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
+        await self.repo.save_task(nt)
+        await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, prev.id, operator))
+        return nt
 
     def _is_first_task_node(self, flow: FlowModel, node: FlowNode) -> bool:
         """是否 start 直接后继任务节点（issues/79 对齐 Java FlowUtil.isFirstTaskName）"""
@@ -659,6 +677,37 @@ class EngineImpl(Engine):
                 logging.exception("[jeeflow] process event listener error: type=%s", evt.type)
 
 # ─── Pure Functions ─────────────────────────────────────────────────────────────
+
+def _can_rejected(flow: FlowModel, current_id: str, parent_id: str) -> bool:
+    """照 mldong-boot2 NodeModel.canRejected：自 current 的入边回溯，命中 parent 放行；
+    入边来源是 fork/join/start 时**跳过该条入边、不再深入**（boot2 是 continue，不是穿越），
+    其余来源递归。subprocess 在 boot2 里被注释掉，等同普通节点。"""
+    for edge in flow.edges:
+        if edge.targetNodeId != current_id:
+            continue
+        if edge.sourceNodeId == parent_id:
+            return True
+        src = _find_node(flow, edge.sourceNodeId)
+        if src is None:
+            continue
+        if src.type in (TYPE_FORK, TYPE_JOIN, TYPE_START):
+            continue
+        if _can_rejected(flow, src.id, parent_id):
+            return True
+    return False
+
+
+def _lineage_vars(src: dict) -> dict:
+    """复活行的变量净化：剔控制类残留，保留 f_*/u_*/autoGenTitle/isFirstTaskNode。"""
+    out = {}
+    for k, v in (src or {}).items():
+        if (k in ("submitType", "taskName")
+                or k.startswith("tf_") or k.startswith("csv_")
+                or k.startswith("loopCounter") or k.startswith("nrOfInstances")
+                or k.startswith("operatorList")):
+            continue
+        out[k] = v
+    return out
 
 def _find_node(flow: FlowModel, id: str) -> Optional[FlowNode]:
     return next((n for n in flow.nodes if n.id == id), None)

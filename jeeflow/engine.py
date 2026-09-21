@@ -49,6 +49,9 @@ class EngineImpl(Engine):
         self.expr_eval = expr_eval
         self.ext: Optional[EngineExtensions] = None
         self._ic_cache: dict = {}   # 定义级拦截器解析缓存（issue 34，按 defineId）
+        # 定义行 name 缓存（spec 06 §4.5 条款 1.1 回落路径，按 defineId）——
+        # 委托查询的流程名解析全栈唯一入口是 _surrogate_process_name，缓存只是它的取数底座
+        self._define_name_cache: dict = {}
 
     def set_extensions(self, ext: EngineExtensions):
         # 已接入的扩展仓储跨 set_extensions 保留（门面先 attach、集成方后设扩展体的顺序不能丢能力）
@@ -77,15 +80,59 @@ class EngineImpl(Engine):
             raise ValueError("ExpressionEvaluator 未配置")
         return await self.expr_eval.eval(expr, vars_)
 
+    # ─── 委托查询流程名解析（spec 06 §4.5 条款 1.1 全栈唯一实现）────────────────
+
+    def _cache_define_name(self, define_id, define_name) -> None:
+        """把**已经读到手**的定义行 name 记入回落缓存（起点处 def_ 已在手，
+        回落路径因此零额外定义读——见 _surrogate_process_name）。"""
+        if define_id is not None:
+            self._define_name_cache[define_id] = str(define_name or "").strip()
+
+    async def _surrogate_process_name(self, flow: FlowModel, inst: ProcessInstance) -> str:
+        """委托查询用的流程名（契约 06 §4.5 条款 1.1）：**先 trim 再判空**。
+
+        取流程模型 ``name``（迁移基线：内置版 SurrogateInterceptor 用
+        ``execution.getProcessModel().getName()``，Java 参考实现与之同构）；
+        模型未带（键缺失 / ``null`` / 空串 / **仅空白**）才回落 ``wf_process_define.name``。
+        **返回给委托查询的值一律 trim 后**（``" 名 "`` 与 ``"名"`` 必须命中同一条委托）。
+
+        为什么不是"假值判空"（此前本栈写法 ``flow.name or def_.name``）：模型 name 为纯空白时，
+        假值判空会把空白串当流程名去查委托——精确查必不中、兜底查也拿不到该流程自己配的委托，
+        只剩"全流程兜底"行能命中 ⇒ 用户视角＝委托静默失效；而 Java/PHP/Node/Go 同数据会回落
+        定义行 name 并命中。同一份数据两栈不同答案，就是本轮堵掉的分叉。
+
+        回落路径要读定义行（部分栈含 ``content`` BLOB），故按 defineId 缓存复用，**不得逐任务解析**
+        （条款 1.1 尾注）。读定义行失败按「拿不到流程名」处理（只能命中全流程兜底委托），
+        绝不打断建单（条款 4：委托是增强能力）。
+        """
+        name = str(getattr(flow, "name", "") or "").strip()
+        if name:
+            return name
+        define_id = getattr(inst, "defineId", None)
+        if define_id is None:
+            return ""
+        cached = self._define_name_cache.get(define_id)
+        if cached is not None:
+            return cached
+        name = ""
+        try:
+            def_ = await self.repo.find_define_by_id(define_id)
+            name = str(getattr(def_, "name", "") or "").strip()
+        except Exception:  # noqa: BLE001 —— 回落读定义行失败不得打断建单
+            logging.exception("[jeeflow] find_define_by_id(%s) failed, surrogate processName unresolved",
+                              define_id)
+        self._define_name_cache[define_id] = name
+        return name
+
     # ─── Start ────────────────────────────────────────────────────────────────
 
     async def start_process_instance_by_id(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         def_ = await self.repo.find_define_by_id(define_id)
         if not def_: raise ValueError(f"define not found: {define_id}")
         flow = parse_flow_model(json.loads(def_.content))
-        # 委托查询按「流程模型 name」（spec 06 §4.5 条款 1.1：迁移基线用 processModel.getName()），
-        # 模型未带 name 才回落定义行 name。deploy 有 def.setName(model.getName()) 不变量，两者恒等。
-        flow.name = flow.name or def_.name
+        # 委托查询的流程名解析已收敛到 _surrogate_process_name 单点（spec 06 §4.5 条款 1.1）。
+        # 此处只做一件事：把**刚读到手**的定义行 name 记入回落缓存，令模型未带 name 时的回落零额外读。
+        self._cache_define_name(define_id, def_.name)
         vars_ = {**(args or {})}
         await self._add_user_info(operator, vars_)
         self._add_auto_gen_title(def_.displayName, vars_)
@@ -132,7 +179,7 @@ class EngineImpl(Engine):
                                               actors[lc + 1], operator, cur_node.properties.get("form", ""), now, 1)
                         nt.variables = {f"operatorList_{cur_node.id}": actors, f"loopCounter_{cur_node.id}": lc + 1,
                                         f"nrOfInstances_{cur_node.id}": len(actors)}
-                        await self._apply_surrogate(nt, flow.name)
+                        await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
                         await self.repo.save_task(nt)
                         # TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
                         await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, cur_node.id, operator))
@@ -184,7 +231,7 @@ class EngineImpl(Engine):
                 if prev:
                     actors = self._rollback_actors(prev, inst, operator, task)
                     await self._create_task_with_actors(prev, inst, operator, vars_, actors,
-                                                        getattr(flow, "name", "") or "")
+                                                        await self._surrogate_process_name(flow, inst))
         else:
             # issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
             target = _find_node(flow, target_task_name)
@@ -222,8 +269,8 @@ class EngineImpl(Engine):
         # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
         def_ = await self.repo.find_define_by_id(inst.defineId)
         flow = parse_flow_model(json.loads(def_.content))
-        # 委托查询按「流程模型 name」（同上，spec 06 §4.5 条款 1.1），缺失才回落定义行 name
-        flow.name = flow.name or def_.name
+        # 定义行 name 记入回落缓存（同 start 路径，条款 1.1 解析收敛在 _surrogate_process_name 单点）
+        self._cache_define_name(inst.defineId, def_.name)
         args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
         # issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
         # 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
@@ -354,7 +401,8 @@ class EngineImpl(Engine):
         # 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
         # 任务完成的拦截器由 execute_process_task 显式触发，1.8.0 SYNC 同步演进）
         if node.type in (TYPE_TASK, TYPE_CUSTOM):
-            await self._create_task(node, inst, operator, vars_, getattr(flow, "name", "") or "")
+            await self._create_task(node, inst, operator, vars_,
+                                    await self._surrogate_process_name(flow, inst))
             return
         if not await self._fire_pre(node, inst): return
         try:

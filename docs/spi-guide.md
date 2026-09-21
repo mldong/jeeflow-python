@@ -198,3 +198,10 @@ engine.set_extensions(EngineExtensions(ext_repository=ext_repo,
 委托查询四判据（内存仓 `MemoryExtRepository` 与 SQL 仓 `JdbcProcessExtRepository` 同答案）：
 空 `processName` 全流程兜底（先精确后兜底，多条命中取 id 最大者）、时间窗任一侧 NULL=不限、
 `surrogate <> operator` 自委托过滤、`enabled` 只认整数 1（脏值按停用，写入侧见 `processSurrogate/save`）。
+
+**查询用的流程名取值口径**（spec 06 §4.5 条款 1.1，单点实现 `EngineImpl._surrogate_process_name`）：
+以**流程模型的 `name`** 为准（对齐内置版迁移基线 `processModel.getName()`），模型未带
+（键缺失 / `null` / 空串 / **仅空白**）才回落 `wf_process_define.name`；判据是**先 trim 再判空**，
+传给 `get_surrogate` 的值一律 trim 后（`" 名 "` 与 `"名"` 命中同一条委托）。
+回落读定义行按 `defineId` 缓存复用，不逐任务解析。覆盖**全部建任务路径**：发起、办理推进、
+串行会签的每一步推进、跳转(JUMP)、回退(ROLLBACK)。

@@ -3048,3 +3048,297 @@ async def test_facade_surrogate_save_dirty_enabled_is_off():
         assert rb["code"] == 0, rb
         assert (await facade._ext.find_surrogate_by_id(int(rb["data"]["id"]))).enabled == want,             f"布尔 {flag!r} 应落 {want}"
 
+
+# ═══ 批次 D 收尾 · 06-facade §4.5 条款 1.1 / 条款 1 覆盖范围 / 条款 1.4 判别力 ═══
+# 用例构造姿势对齐 Go 栈 engine/surrogate_test.go（同口径同形状）：
+# 自建流程 JSON（可控的 name 形态）+ 引擎直用 + **断言一律落在读回的持久参与者行上**。
+
+_MISSING = object()
+
+
+def _flow_json(specs, name=_MISSING) -> str:
+    """线性流程 start → specs… → end（节点 id 即 taskName）。
+    spec 支持两种写法：``(id, assignee)`` 普通任务 / ``(id, assignee, countersignType)`` 会签。
+    ``name`` 原样写入 JSON（因此 "   " 纯空白、" padded " 首尾空白这些条款 1.1 的形态都能精确构造）；
+    不传 = **不带 name 键**；传 None = ``"name": null``。"""
+    nodes = [{'id': 'start', 'type': 'snaker:start', 'properties': {}, 'text': {'value': '开始'}}]
+    edges = []
+    prev = 'start'
+    for spec in specs:
+        tid, assignee = spec[0], spec[1]
+        cs = spec[2] if len(spec) > 2 else ""
+        props = {"assignee": assignee, "taskType": 0, "performType": 0}
+        if cs:
+            props = {"assignee": assignee, "taskType": 0, "performType": "1", "countersignType": cs}
+        nodes.append({'id': tid, 'type': 'snaker:task', 'properties': props, 'text': {'value': tid}})
+        edges.append({'id': f"e_{prev}_{tid}", 'sourceNodeId': prev, 'targetNodeId': tid,
+                      'properties': {}})
+        prev = tid
+    nodes.append({'id': 'end', 'type': 'snaker:end', 'properties': {}, 'text': {'value': '结束'}})
+    edges.append({'id': f"e_{prev}_end", 'sourceNodeId': prev, 'targetNodeId': 'end',
+                  'properties': {}})
+    raw = {"displayName": "委托测试", "type": "approval", "nodes": nodes, "edges": edges}
+    if name is not _MISSING:
+        raw = {"name": name, **raw}          # 原样写入（含空白串 / null / 键缺失三态）
+    return json.dumps(raw, ensure_ascii=False)
+
+
+def _seed_define(repo: MemoryRepository, define_name: str, content: str) -> int:
+    """直接落定义行（**绕过门面 deploy 的 def.setName(model.name) 不变量**）——
+    条款 1.1 的诱饵/回落形态只有在"define.name ≠ 模型 name"时才造得出来，
+    与内置版导入链路（定义行自带 name）同形。"""
+    d = ProcessDefine(name=define_name, displayName="委托测试", type="test", state=1, content=content)
+    repo.add_define(d)
+    return d.id
+
+
+def _surr_harness(define_name: str, content: str, ext=None):
+    """引擎直用 + 接入扩展仓储（零配置默认生效）"""
+    eng, repo = setup()
+    ext = ext if ext is not None else MemoryExtRepository()
+    eng.attach_ext_repository(ext)
+    return eng, repo, ext, _seed_define(repo, define_name, content)
+
+
+async def _put_surr(ext, operator: str, agent: str, pname: str, enabled: int = 1):
+    now = datetime.now()
+    s = ProcessSurrogate(operator=operator, surrogate=agent, processName=pname,
+                         startTime=now - timedelta(hours=1), endTime=now + timedelta(hours=1),
+                         enabled=enabled)
+    await ext.save_surrogate(s)
+    return s
+
+
+async def _doing_actors(repo, inst_id: int, node: str, want_tasks: int = 1) -> list[str]:
+    """读回某节点进行中任务的**持久参与者行**（不看内存对象、不看待办列表空不空）"""
+    doing = [t for t in await repo.find_doing_tasks(inst_id) if t.taskName == node]
+    assert len(doing) == want_tasks, f"节点 {node} 进行中任务数 = {len(doing)}, want {want_tasks}"
+    return await repo.find_task_actors(doing[0].id)
+
+
+# ─── 条款 1.1：processName 取值口径（trim 判空 + 回落定义行 + 传出去必 trim）────
+
+@pytest.mark.asyncio
+async def test_surrogate_process_name_prefers_model_name():
+    """诱饵行钉住"取的到底是哪一头"：模型 name 与 define.name **不一致**时两个名字各配一条
+    委托、指向不同代理人——取错那头必然选错人（断言落在读回的 actor 行上）。"""
+    content = _flow_json([("t1", "nm-zhang")], name="model-surr116")
+    eng, repo, ext, def_id = _surr_harness("define-surr116", content)
+    await _put_surr(ext, "nm-zhang", "from-model-agent", "model-surr116")
+    await _put_surr(ext, "nm-zhang", "from-define-agent", "define-surr116")
+
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    actors = await _doing_actors(repo, inst.id, "t1")
+    assert actors == ["nm-zhang", "from-model-agent"], \
+        f"条款 1.1 必须取流程模型 name（内置版迁移基线 processModel.getName()）：读回 {actors}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("what,model_name,define_name,agent", [
+    ("模型 name 纯空白", "   ", "blankdef-surr116", "blank-agent"),
+    ("模型 name 制表符+空格", "\t ", "tabdef-surr116", "tab-agent"),
+    ("模型 name 空串", "", "emptydef-surr116", "empty-agent"),
+    ("模型不带 name 键", _MISSING, "nodef-surr116", "nokey-agent"),
+    ("模型 name 为 null", None, "nulldef-surr116", "null-agent"),
+    # 回落值本身也 trim：define.name 带首尾空白时台账存的是干净名，不 trim 就查不到
+    ("回落值带首尾空白（define.name 也 trim）", "  ", "  spaced-def-surr116  ", "spaced-def-agent"),
+])
+async def test_surrogate_process_name_falls_back_to_define_name(what, model_name, define_name, agent):
+    """条款 1.1「未带」= 键缺失 / null / 空串 / **仅空白** → 全部回落 wf_process_define.name 并命中。
+    这正是本轮修的跨栈分叉：改前 ``flow.name or def_.name`` 把 "   " 当假值以外的有效名传给
+    查询 ⇒ 该流程自己配的委托一条也查不到（只剩全流程兜底行能命中），用户视角＝委托静默失效。"""
+    specs = [("t1", "fb-zhang")]
+    content = _flow_json(specs, name=model_name)
+    eng, repo, ext, def_id = _surr_harness(define_name, content)
+    # 台账里存的是 **trim 后**的定义行 name（不 trim 就查不到 ⇒ 断的正是回落值也要 trim）
+    await _put_surr(ext, "fb-zhang", agent, define_name.strip())
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    actors = await _doing_actors(repo, inst.id, "t1")
+    assert actors == ["fb-zhang", agent], \
+        f"条款 1.1「{what}」应回落 wf_process_define.name={define_name.strip()!r} 并命中，读回 {actors}"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_process_name_is_trimmed_before_query():
+    """模型 name 带首尾空白 → **传给委托查询的必须是 trim 后的值**（``" 名 "`` 与 ``"名"``
+    必须命中同一条）。在假扩展仓储里捕获真实入参，防止"引擎内部 trim 了又怎样"的口头断言。"""
+    class _CaptureExt(MemoryExtRepository):
+        def __init__(self):
+            super().__init__()
+            self.queries: list[tuple[str, str]] = []
+
+        async def get_surrogate(self, operator, process_name, at=None):
+            self.queries.append((operator, process_name))
+            return await super().get_surrogate(operator, process_name, at)
+
+    cap = _CaptureExt()
+    content = _flow_json([("t1", "pd-zhang")], name="  padded-surr116  ")
+    eng, repo, _, def_id = _surr_harness("paddeddef-surr116", content, ext=cap)
+    await _put_surr(cap, "pd-zhang", "pd-agent", "padded-surr116")   # 台账存干净名
+
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    actors = await _doing_actors(repo, inst.id, "t1")
+    assert actors == ["pd-zhang", "pd-agent"], \
+        f"模型 name 首尾空白须 trim 后再查委托（台账存的是 padded-surr116），读回 {actors}"
+    assert cap.queries, "未捕获到任何 get_surrogate 调用，用例空转"
+    bad = [(i + 1, q) for i, q in enumerate(cap.queries) if q[1] != "padded-surr116"]
+    assert not bad, f"传给委托查询的流程名必须是 trim 后的值，实测未 trim 入参：{bad}"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_define_name_fallback_reads_define_once_not_per_task():
+    """条款 1.1 尾注：回落路径要读定义行（部分栈含 content BLOB），**逐次 execution 解析一次后
+    复用，不要逐任务解析**。本栈起点（start / _prepare_execute_task）已把 def_.name 记进缓存 ⇒
+    fork 出两个任务节点时读定义行总次数恒为 **2**：① 发起取 content、② 拦截器解析（issue 34 的
+    defineId 缓存）。回落贡献 **0 次**；若回落不缓存、逐任务解析，实测会是 4 次。"""
+    class _CountRepo(MemoryRepository):
+        def __init__(self):
+            super().__init__()
+            self.define_reads = 0
+
+        async def find_define_by_id(self, id):
+            self.define_reads += 1
+            return await super().find_define_by_id(id)
+
+    content = json.dumps({
+        "name": "   ", "displayName": "委托测试", "type": "approval",
+        "nodes": [
+            {"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+            {"id": "fork", "type": "snaker:fork", "properties": {}, "text": {"value": "并行"}},
+            {"id": "ta", "type": "snaker:task", "properties": {"assignee": "ck-zhang", "taskType": 0,
+                                                              "performType": 0}, "text": {"value": "ta"}},
+            {"id": "tb", "type": "snaker:task", "properties": {"assignee": "ck-wang", "taskType": 0,
+                                                              "performType": 0}, "text": {"value": "tb"}},
+            {"id": "join", "type": "snaker:join", "properties": {}, "text": {"value": "汇聚"}},
+            {"id": "end", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}],
+        "edges": [
+            {"id": "e0", "sourceNodeId": "start", "targetNodeId": "fork", "properties": {}},
+            {"id": "e1", "sourceNodeId": "fork", "targetNodeId": "ta", "properties": {}},
+            {"id": "e2", "sourceNodeId": "fork", "targetNodeId": "tb", "properties": {}},
+            {"id": "e3", "sourceNodeId": "ta", "targetNodeId": "join", "properties": {}},
+            {"id": "e4", "sourceNodeId": "tb", "targetNodeId": "join", "properties": {}},
+            {"id": "e5", "sourceNodeId": "join", "targetNodeId": "end", "properties": {}}]},
+        ensure_ascii=False)
+    repo = _CountRepo()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    ext = MemoryExtRepository()
+    eng.attach_ext_repository(ext)
+    def_id = _seed_define(repo, "cachedef-surr116", content)
+    await _put_surr(ext, "ck-zhang", "ck-agent-a", "cachedef-surr116")
+    await _put_surr(ext, "ck-wang", "ck-agent-b", "cachedef-surr116")
+
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    assert await _doing_actors(repo, inst.id, "ta") == ["ck-zhang", "ck-agent-a"], "分支 A 回落命中"
+    assert await _doing_actors(repo, inst.id, "tb") == ["ck-wang", "ck-agent-b"], "分支 B 回落命中"
+    assert repo.define_reads == 2, \
+        (f"回落读定义行必须缓存复用、不得逐任务解析：find_define_by_id 次数 = {repo.define_reads}, "
+         f"want 2（① 发起取 content ② 拦截器解析；回落贡献 0 次，逐任务解析会是 4 次）")
+
+
+# ─── 条款 1「覆盖范围」：每条建任务路径各留一条独立用例 ──────────────────────────
+#
+# 跳转(JUMP) / 回退(ROLLBACK) / 串行会签的每一步推进 三条路径各一条，**专属流程名 +
+# 专属参与者 + 专属代理人**（多条用例绝不共用代理人，否则某路径失能时看不出谁红），
+# 并在断言前先做"起点自证"（委托只配在本路径新建任务的参与者身上 ⇒ 代理人只可能来自本路径）。
+# 挂点归属与"单路径注掉"实测结论（本轮逐条注一遍跑全量，恢复后 md5 核对逐字节回到改前）：
+#   · 串行会签推进 = execute_process_task 的 SEQUENTIAL 分支调用点（**独占**）
+#       → 只注它：1 failed = test_surrogate_applies_on_sequential_countersign_advance
+#   · ROLLBACK     = _create_task_with_actors 的四个调用点（只被 ROLLBACK 用到，**独占**）
+#       → 只注它们：1 failed = test_surrogate_applies_on_rollback_path
+#   · JUMP         = _execute_node → _create_task，与"发起 / 办理推进 / 跳首节点"**共用同一挂点**：
+#       → 注掉共用挂点 = 14 failed（发起 + 条款 1.1 全家 + JUMP + 回退的起点自证），做不到"只红自己"
+#       → 故 JUMP 的单路径失能用**路径内注入**验证（在 jump 分支把流程名换成不存在的名字）：
+#         1 failed = test_surrogate_applies_on_jump_path —— 该用例确实在钉这条路径
+
+@pytest.mark.asyncio
+async def test_surrogate_applies_on_jump_path():
+    """路径 1/3 跳转 JUMP（execute_and_jump_task 带 target）：委托只配在**跳转目标节点**的
+    参与者身上 ⇒ 发起产生的 j1 拿不到代理人（起点自证），j2 里的代理人只能由跳转路径写入。"""
+    content = _flow_json([("j1", "jmp-zhang"), ("j2", "jmp-wang")], name="surrjump116")
+    eng, repo, ext, def_id = _surr_harness("surrjump116", content)
+    await _put_surr(ext, "jmp-wang", "jmp-agent", "surrjump116")
+
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    assert await _doing_actors(repo, inst.id, "j1") == ["jmp-zhang"], \
+        "起点自证：发起产生的 j1 不该出现代理人（jmp-zhang 无委托）"
+    j1 = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "j1"][0]
+    await eng.execute_and_jump_task(j1.id, "jmp-zhang", {"comment": "跳转"}, "j2")
+    assert await _doing_actors(repo, inst.id, "j2") == ["jmp-wang", "jmp-agent"], \
+        "条款 1「跳转(JUMP)」：跳转新建的任务未并入代理人（期望 [jmp-wang jmp-agent]）"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_applies_on_rollback_path():
+    """路径 2/3 回退 ROLLBACK（execute_and_jump_task 空 target）：新任务落在**上一节点**、
+    参与者 = 回退操作人（_rollback_actors 取 task.actorId）。代理人配在回退操作人身上、
+    诱饵配在上一节点原参与者身上 ⇒ 新 b1 任务里只能出现 rbk-agent。"""
+    content = _flow_json([("b1", "rbk-zhang"), ("b2", "rbk-wang")], name="surrback116")
+    eng, repo, ext, def_id = _surr_harness("surrback116", content)
+    await _put_surr(ext, "rbk-wang", "rbk-agent", "surrback116")     # 回退操作人的委托
+    await _put_surr(ext, "rbk-zhang", "rbk-decoy", "surrback116")    # 诱饵：原 b1 参与者的委托
+
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    assert await _doing_actors(repo, inst.id, "b1") == ["rbk-zhang", "rbk-decoy"], \
+        "起点自证：发起产生的 b1 只带 rbk-zhang 自己的代理人（新 b1 的代理人必须是另一个）"
+    b1 = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b1"][0]
+    await eng.execute_process_task(b1.id, "rbk-zhang")
+    b2 = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b2"][0]
+    await eng.execute_and_jump_task(b2.id, "rbk-wang", None, "")
+    # 原 b1 已 DONE，b1 上唯一的进行中任务就是回退新建的那一条
+    assert await _doing_actors(repo, inst.id, "b1") == ["rbk-wang", "rbk-agent"], \
+        "条款 1「回退(ROLLBACK)」：回退新建的任务未并入代理人（期望 [rbk-wang rbk-agent]）"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_applies_on_sequential_countersign_advance():
+    """路径 3/3 串行会签的每一步推进（execute_process_task 的 SEQUENTIAL 分支，引擎侧独立调用点）：
+    只给**第二步**成员配委托 ⇒ 第一步任务拿不到代理人（起点自证）。
+    顺带钉条款 1.3：代理人只进当一步任务，不得扩 operatorList 投票名册、不得改票数。"""
+    content = _flow_json([("cs", "seq-zhang,seq-wang", "SEQUENTIAL")], name="surrseq116")
+    eng, repo, ext, def_id = _surr_harness("surrseq116", content)
+    await _put_surr(ext, "seq-wang", "seq-agent", "surrseq116")
+
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    assert await _doing_actors(repo, inst.id, "cs") == ["seq-zhang"], \
+        "起点自证：第一步任务不该出现代理人（seq-zhang 无委托）"
+    step1 = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "cs"][0]
+    await eng.execute_process_task(step1.id, "seq-zhang")
+    second = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "cs"]
+    assert len(second) == 1, f"串行会签推进后应恰好一条进行中任务: {len(second)}"
+    assert str(second[0].variables.get("loopCounter_cs")) == "1", \
+        f"自证：断言对象必须是串行会签第 2 步，实读 loopCounter_cs = {second[0].variables.get('loopCounter_cs')}"
+    # 落库读回（不是内存对象）
+    assert await repo.find_task_actors(second[0].id) == ["seq-wang", "seq-agent"], \
+        "条款 1「串行会签的每一步推进」：推进出的下一步任务未并入代理人（期望 [seq-wang seq-agent]）"
+    # 条款 1.3：投票名册与票数不得因代理人改变
+    assert second[0].variables.get("operatorList_cs") == ["seq-zhang", "seq-wang"], \
+        f"条款 1.3：代理人不得进投票名册: {second[0].variables.get('operatorList_cs')}"
+    assert second[0].variables.get("nrOfInstances_cs") == 2, \
+        f"条款 1.3：票数不得因代理人改变: {second[0].variables.get('nrOfInstances_cs')}"
+
+
+# ─── 条款 1.4 判别力：打乱 id 序的夹具，内存仓侧（SQL 仓侧见 jdbc_test ⑯）───────
+
+@pytest.mark.asyncio
+async def test_surrogate_query_shuffled_id_parity_memory():
+    """四判据 + 条款 1.4「多条命中取 id 最大」在**内存仓**侧对拍：数据集与期望表来自
+    tests/surrparity.py（与真机 SQL 仓 ⑯ 同一份，期望值只写一处）。
+    此前本栈夹具的 id 按插入序单调递增 ⇒ "取遍历首条/末条"的错实现也会绿（假绿形状）。"""
+    try:
+        from tests import surrparity        # 以仓根为 sys.path 跑（pytest 默认）
+    except ImportError:                     # pragma: no cover
+        import surrparity                   # 从 tests/ 目录直跑
+
+    ext = MemoryExtRepository()
+    now = datetime.now().replace(microsecond=(datetime.now().microsecond // 1000) * 1000)  # 与 SQL DATETIME(3) 同精度
+    failures: list[str] = []
+
+    def report(desc: str, ok: bool, detail: str = "") -> bool:
+        if not ok:
+            failures.append(f"{desc} ({detail})" if detail else desc)
+        return ok
+
+    await surrparity.run_parity(ext, now, surrparity.MEM_BASE_ID, report)
+    assert not failures, "内存仓与共用期望表不一致：\n  " + "\n  ".join(failures)
+
+

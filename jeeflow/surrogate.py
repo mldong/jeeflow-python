@@ -83,7 +83,9 @@ class SurrogateApplier(ABC):
 
     @abstractmethod
     async def expand(self, actors: list[str], process_name: str, task: Any = None) -> list[str]:
-        """actors: 已解析的任务参与者；process_name: 流程模型 name（缺失回落定义行 name，spec 06 §4.5 条款 1.1）；task: 待落库任务对象（只读上下文）"""
+        """actors: 已解析的任务参与者；process_name: 委托查询流程名，取值口径与 trim 由引擎侧
+        `EngineImpl._surrogate_process_name` 单点保证（模型 name 优先、trim 后判空、
+        未带回落 wf_process_define.name，spec 06 §4.5 条款 1.1）；task: 待落库任务对象（只读上下文）"""
         ...
 
 
@@ -109,6 +111,8 @@ class ExtRepositorySurrogateApplier(SurrogateApplier):
         if not result:
             return result
         now = datetime.now()
+        # 入参 process_name 已由引擎侧单点 trim（条款 1.1）；此处**故意不再二次 trim**——
+        # 否则引擎回归（把未 trim 的名字传下来）会被这里掩盖，用例捕获不到真实入参。
         pname = process_name or ""
         for actor in list(result):  # 快照：本轮追加的代理人不再触发查询
             if not actor:

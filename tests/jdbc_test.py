@@ -816,6 +816,34 @@ async def main():
         check("⑮ 注册空实现同样回到仅台账", await repo.find_task_actors(_t_null.id) == ["leader"],
               str(await repo.find_task_actors(_t_null.id)))
 
+        # ── ⑯ issues/116 批次 D 收尾：条款 1.4「多条命中取 id 最大」的**打乱序夹具**对拍
+        #    （SQL 仓侧；内存仓侧同一份数据 + 同一份期望见 spec_test 同名用例，
+        #     数据与期望单点维护在 tests/surrparity.py）
+        # ⚠️ 已知事实（Java/Go 实测踩到）：SQL 侧 "打乱 id 序" **没有判别力**——InnoDB 对
+        #    `WHERE operator=? ORDER BY id DESC` 本就按主键序回行，插入序在结果里根本不出现，
+        #    打乱与否答案都一样。真正钉住条款 1.4 的是 SQL 里的 `ORDER BY id DESC` 子句本身
+        #    （去掉它就退化成"取物理首行"）；打乱序起作用的是内存侧。两侧仍各跑一遍并对同一答案负责。
+        try:
+            from tests import surrparity          # 以仓根为 sys.path 跑
+        except ImportError:                       # pragma: no cover
+            import surrparity                     # 从 tests/ 目录直跑
+        parity_base = DEFINE_ID * 1000 + 1000     # Python 栈自己的段（避开 ⑮ 的 DEFINE_ID*1000+n）
+        _now_ms = now_dt.replace(microsecond=(now_dt.microsecond // 1000) * 1000)  # 与 DATETIME(3) 同精度
+
+        def _rep(desc, ok, detail=""):
+            return check(f"⑯ {desc}", ok, detail)
+
+        parity_ids = await surrparity.run_parity(ext_repo, _now_ms, parity_base, _rep)
+        srg_ids.extend(parity_ids)
+        # 读回库里真值自证：期望行确实按显式 id 落在 wf_process_surrogate（含 process_name IS NULL 行）。
+        # 条数由**共用夹具**推导（不在此另造一份期望），SQL 侧真存 NULL 才算这行落库成功。
+        null_ids = [parity_base + r.id_off for r in surrparity.rows() if r.process_name is None]
+        n_null_flow = await raw_count(
+            adapter, "SELECT COUNT(*) FROM wf_process_surrogate WHERE process_name IS NULL AND id IN ("
+            + ",".join(["?"] * len(null_ids)) + ")", null_ids)
+        check("⑯ process_name=NULL 的兜底行真落库（SQL 侧 NULL 与 '' 同属兜底）",
+              int(n_null_flow) == len(null_ids), f"{n_null_flow}/{len(null_ids)}")
+
         # 清理本轮委托台账行（按显式 id，不碰别人的数据）
         conn = await adapter.acquire()
         try:

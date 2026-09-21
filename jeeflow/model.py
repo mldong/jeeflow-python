@@ -178,14 +178,21 @@ class ProcessInstance:
         return not any(t.is_doing() for t in self.tasks)
 
     def create_task(self, task_id: int, task_name: str, display_name: str, actor: str,
-                    operator: str, form_key: str, now, perform_type: int = 0) -> "ProcessTask":
-        """创建任务（子实体工厂）——perform_type：0 普通 / 1 会签（issues/52 E24 落库对齐 Java）"""
+                    operator: str, form_key: str, now,
+                    parent_task_id: int, is_first_task_node: bool,
+                    perform_type: int = 0) -> "ProcessTask":
+        """创建任务（子实体工厂）——perform_type：0 普通 / 1 会签（issues/52 E24 落库对齐 Java）
+
+        建单不变量（issues/121 P1）：必写 parentTaskId（发起 execution 无当前任务⇒0）
+        与行级 isFirstTaskNode。二者无默认值，漏传即 TypeError，不留静默路径。"""
         task = ProcessTask(id=task_id, processInstanceId=self.id,
                            taskName=task_name, displayName=display_name,
                            taskState=TaskState.DOING, actorIds=[actor],
                            formKey=form_key, performType=perform_type,
+                           parentTaskId=parent_task_id,
                            createTime=now, updateTime=now,
                            createUser=operator, updateUser=operator)
+        task.variables["isFirstTaskNode"] = is_first_task_node
         self.tasks.append(task)
         return task
 

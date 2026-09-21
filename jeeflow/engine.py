@@ -176,8 +176,10 @@ class EngineImpl(Engine):
                     if actors and lc + 1 < len(actors):
                         # 聚合根：创建串行会签下一步任务
                         nt = inst.create_task(self._next_id(), cur_node.id, cur_node.text.get("value", ""),
-                                              actors[lc + 1], operator, cur_node.properties.get("form", ""), now, 1)
-                        nt.variables = {f"operatorList_{cur_node.id}": actors, f"loopCounter_{cur_node.id}": lc + 1,
+                                              actors[lc + 1], operator, cur_node.properties.get("form", ""), now,
+                                              # 建单不变量：parent＝刚办结的那一位成员任务
+                                              task.id, self._is_first_task_node(flow, cur_node), 1)
+                        nt.variables |= {f"operatorList_{cur_node.id}": actors, f"loopCounter_{cur_node.id}": lc + 1,
                                         f"nrOfInstances_{cur_node.id}": len(actors)}
                         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
                         await self.repo.save_task(nt)
@@ -204,7 +206,7 @@ class EngineImpl(Engine):
             for node in _follow_edges(flow, cur_node.id):
                 # 统一走 _execute_node：结束节点也经节点执行链（拦截器/事件完整触发），
                 # _execute_node 内部 TYPE_END 分支完成聚合根 finish + 事件发布
-                await self._execute_node(flow, inst, node, operator, vars_)
+                await self._execute_node(flow, inst, node, operator, vars_, task.id)
         return await self.repo.find_instance_by_id(inst.id)
 
     # ─── Reject ───────────────────────────────────────────────────────────────
@@ -231,7 +233,9 @@ class EngineImpl(Engine):
                 if prev:
                     actors = self._rollback_actors(prev, inst, operator, task)
                     await self._create_task_with_actors(prev, inst, operator, vars_, actors,
-                                                        await self._surrogate_process_name(flow, inst))
+                                                        await self._surrogate_process_name(flow, inst),
+                                                        # 仍是拓扑版落点（P2 换血缘版）：parent＝被回退的那条任务
+                                                        task.id, self._is_first_task_node(flow, prev))
         else:
             # issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
             target = _find_node(flow, target_task_name)
@@ -240,7 +244,7 @@ class EngineImpl(Engine):
             # 对齐 Java isFirstTaskName：跳首任务节点（start 直接后继）assignee 强制为发起人
             if target.type == TYPE_TASK and self._is_first_task_node(flow, target):
                 target.properties["assignee"] = inst.operator
-            await self._execute_node(flow, inst, target, operator, vars_)
+            await self._execute_node(flow, inst, target, operator, vars_, task.id)
         return await self.repo.find_instance_by_id(inst.id)
 
     # ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）───────
@@ -254,7 +258,7 @@ class EngineImpl(Engine):
             for node in _follow_edges(flow, start_node.id):
                 if node.type in (TYPE_TASK, TYPE_CUSTOM):
                     node.properties["assignee"] = inst.operator
-                    await self._execute_node(flow, inst, node, operator, vars_)
+                    await self._execute_node(flow, inst, node, operator, vars_, task_id)
                     break
         return await self.repo.find_instance_by_id(inst.id)
 
@@ -347,7 +351,8 @@ class EngineImpl(Engine):
         return []
 
     async def _create_task_with_actors(self, node: FlowNode, inst: ProcessInstance, operator: str,
-                                        vars_: dict, actors: list[str], process_name: str = ""):
+                                        vars_: dict, actors: list[str], process_name: str = "",
+                                        parent_id: int = 0, is_first: bool = False):
         """以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）；
         建单前同样应用委托（issues/116：任何新任务都是"建单那一刻"）"""
         if not actors: return
@@ -362,24 +367,24 @@ class EngineImpl(Engine):
         if perform_type == 1 and ct:
             if ct in ("PARALLEL", ""):
                 for a in actors:
-                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             elif ct == "SEQUENTIAL":
-                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, 1)
-                nt.variables = {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
+                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
+                nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
                 await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             else:
                 for a in actors:
-                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
         else:
-            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
+            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
             if len(actors) > 1:
                 nt.actorIds = actors
             await self._apply_surrogate(nt, process_name)
@@ -397,22 +402,24 @@ class EngineImpl(Engine):
         if not inst: raise ValueError("instance not found")
         return task, inst
 
-    async def _execute_node(self, flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: str, vars_: dict):
+    async def _execute_node(self, flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: str, vars_: dict,
+                            parent_id: int = 0):
         # 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
         # 任务完成的拦截器由 execute_process_task 显式触发，1.8.0 SYNC 同步演进）
         if node.type in (TYPE_TASK, TYPE_CUSTOM):
             await self._create_task(node, inst, operator, vars_,
-                                    await self._surrogate_process_name(flow, inst))
+                                    await self._surrogate_process_name(flow, inst),
+                                    parent_id, self._is_first_task_node(flow, node))
             return
         if not await self._fire_pre(node, inst): return
         try:
             if node.type == TYPE_DECISION:
-                await self._evaluate_decision(flow, inst, node, operator, vars_)
+                await self._evaluate_decision(flow, inst, node, operator, vars_, parent_id)
             elif node.type == TYPE_FORK:
-                for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_)
+                for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_, parent_id)
             elif node.type == TYPE_JOIN:
                 if not await self.repo.find_doing_tasks(inst.id):
-                    for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_)
+                    for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_, parent_id)
             elif node.type == TYPE_END:
                 # 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish
                 submit_type = inst.variables.get(KEY_SUBMIT_TYPE)
@@ -427,7 +434,7 @@ class EngineImpl(Engine):
         finally:
             await self._fire_post(node, inst)
 
-    async def _evaluate_decision(self, flow, inst, node, operator, vars_):
+    async def _evaluate_decision(self, flow, inst, node, operator, vars_, parent_id: int = 0):
         # 收集所有出边
         edges = [e for e in flow.edges if e.sourceNodeId == node.id]
         if not edges: return
@@ -439,20 +446,20 @@ class EngineImpl(Engine):
                 result = await self.expr_eval.eval(expr, vars_)
                 if _is_truthy(result):
                     target = _find_node(flow, edge.targetNodeId)
-                    if target: return await self._execute_node(flow, inst, target, operator, vars_)
+                    if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
         # 回退：取第一条没有 expr 的边作为默认路径
         for edge in edges:
             expr = edge.properties.get("expr", "")
             if not expr:
                 target = _find_node(flow, edge.targetNodeId)
-                if target: return await self._execute_node(flow, inst, target, operator, vars_)
+                if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
         # 最后的回退：取第一条边
         if edges:
             target = _find_node(flow, edges[0].targetNodeId)
-            if target: return await self._execute_node(flow, inst, target, operator, vars_)
+            if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
 
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict,
-                           process_name: str = ""):
+                           process_name: str = "", parent_id: int = 0, is_first: bool = False):
         actors = await self._resolve_actors(node, inst, operator, vars_)
         if not actors: return
         # performType 容错解析（对齐 Java codeOf，issue 42）：int 优先；
@@ -468,26 +475,26 @@ class EngineImpl(Engine):
         if perform_type == 1 and ct:
             if ct == "PARALLEL":
                 for a in actors:
-                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     # TASK_CREATE：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             elif ct == "SEQUENTIAL":
-                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, 1)
-                nt.variables = {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
+                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
+                nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
                 await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             else:
                 for a in actors:
-                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
         else:
             # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
+            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
             if len(actors) > 1:
                 nt.actorIds = actors
             await self._apply_surrogate(nt, process_name)

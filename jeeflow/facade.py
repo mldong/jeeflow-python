@@ -126,7 +126,9 @@ class JeeflowFacade:
             vo = self._task_vo(t)
             ext = dict(t.variables or {})
             doing = t.taskState == TaskState.DOING
-            ext["isFirstTaskNode"] = doing and t.taskName == first_task_id
+            # issues/121 P1：行上值优先（引擎建单时写入，历史行同样有效），缺键（存量行）才回退现算
+            row_first = (t.variables or {}).get("isFirstTaskNode")
+            ext["isFirstTaskNode"] = bool(row_first) if row_first is not None                 else (doing and t.taskName == first_task_id)
             vo["ext"] = ext
             tasks.append(vo)
             if doing:
@@ -934,7 +936,9 @@ class JeeflowFacade:
         # 首个任务节点且 DOING → true，与 instance detail 的 activeTaskList 行语义一致
         t_ext = dict(task.variables or {})
         doing = task.taskState == TaskState.DOING
-        t_ext["isFirstTaskNode"] = False
+        # 先留住行上值再覆写出口（"缺键"这个事实一旦丢了就没法回退现算）
+        t_row_first = t_ext.get("isFirstTaskNode")
+        t_ext["isFirstTaskNode"] = bool(t_row_first) if t_row_first is not None else False
         vo = {
             "id": task.id, "processInstanceId": task.processInstanceId,
             "taskName": task.taskName, "displayName": task.displayName,
@@ -951,8 +955,10 @@ class JeeflowFacade:
             def_ = await self._repo.find_define_by_id(inst.defineId)
             if def_:
                 vo["jsonObject"] = self._parse_graph(def_.content)  # issues/05
-                t_ext["isFirstTaskNode"] = doing and task.taskName == self._first_task_node_id(
-                    self._parse_graph(def_.content))
+                if t_row_first is None:
+                    # 存量行没有落库标记 ⇒ 回退现算（仅进行中口径）
+                    t_ext["isFirstTaskNode"] = doing and task.taskName == self._first_task_node_id(
+                        self._parse_graph(def_.content))
                 try:
                     flow = json.loads(def_.content)
                     for n in flow.get("nodes", []):

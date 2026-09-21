@@ -3342,3 +3342,52 @@ async def test_surrogate_query_shuffled_id_parity_memory():
     assert not failures, "内存仓与共用期望表不一致：\n  " + "\n  ".join(failures)
 
 
+
+
+# ─── Test 121-P1: 建单不变量 task_parent_id 与行级 isFirstTaskNode ────────────────
+
+@pytest.mark.asyncio
+async def test_i121_p1_lineage_written_on_create():
+    """夹具是 apply→task1→task2→task3 四级链。两步流里"上一节点"与"首任务节点"同格，
+    断言恒真、抓不到缺陷，所以必须用 ≥3 个任务节点的流程。"""
+    eng, repo = setup()
+    df = load_flow(repo, "02-multi-task.json")
+    inst = await eng.start_process_instance_by_id(df.id, "applicant")
+
+    apply = (await repo.find_doing_tasks(inst.id))[0]
+    assert apply.taskName == "apply"
+    assert apply.parentTaskId == 0, "发起那条 execution 没有当前任务 ⇒ parent 落 0（不是 None）"
+    assert apply.variables["isFirstTaskNode"] is True, "首任务节点行应落 isFirstTaskNode=True"
+    await repo.add_task_actor(apply.id, ["applicant"])
+    await eng.execute_process_task(apply.id, "applicant")
+
+    prev = apply
+    for name, who in (("task1", "leader"), ("task2", "manager"), ("task3", "boss")):
+        t = (await repo.find_doing_tasks(inst.id))[0]
+        assert t.taskName == name, f"期望 {name}，实得 {t.taskName}"
+        assert t.parentTaskId == prev.id, f"{name}.parent 应为刚办结的 {prev.taskName}.id"
+        assert t.variables["isFirstTaskNode"] is False, "非首节点必须 False（否则'parent=0 当首节点'这类假判据蒙得过）"
+        await repo.add_task_actor(t.id, [who])
+        await eng.execute_process_task(t.id, who)
+        prev = t
+
+    # 本案真正要的那格：血缘版回退读的是已办结的历史行，标记必须随行存活
+    his = await repo.find_task_by_id(apply.id)
+    doing_ids = {t.id for t in await repo.find_doing_tasks(inst.id)}
+    assert his.id not in doing_ids, "apply 应已办结"
+    assert his.variables["isFirstTaskNode"] is True, "历史行标记必须还在（现算版在历史行上恒 False）"
+    assert his.parentTaskId == 0, "历史行的血缘指针不应被后续路径覆写"
+
+    # 门面出口：行上值优先 → 历史行也报 True；缺键（存量行）才回退现算 → False
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    r = await facade.flow("processInstance/detail", {"id": inst.id})
+    assert r["code"] == 0, r
+    ext_apply = [x for x in r["data"]["tasks"] if x["taskName"] == "apply"][0]["ext"]
+    assert ext_apply["isFirstTaskNode"] is True, "已办结的 apply 行出口应给行上值 true"
+
+    his.variables.pop("isFirstTaskNode")
+    await repo.update_task(his)
+    r2 = await facade.flow("processInstance/detail", {"id": inst.id})
+    assert r2["code"] == 0, r2
+    ext2 = [x for x in r2["data"]["tasks"] if x["taskName"] == "apply"][0]["ext"]
+    assert ext2["isFirstTaskNode"] is False, "缺键的存量历史行回退现算（仅进行中口径）⇒ False，且不得报错"

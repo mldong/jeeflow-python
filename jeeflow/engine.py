@@ -51,8 +51,25 @@ class EngineImpl(Engine):
         self._ic_cache: dict = {}   # 定义级拦截器解析缓存（issue 34，按 defineId）
 
     def set_extensions(self, ext: EngineExtensions):
+        # 已接入的扩展仓储跨 set_extensions 保留（门面先 attach、集成方后设扩展体的顺序不能丢能力）
+        if self.ext is not None and ext.ext_repository is None:
+            ext.ext_repository = self.ext.ext_repository
         self.ext = ext
         self._ic_cache.clear()
+
+    def attach_ext_repository(self, ext_repo) -> "EngineImpl":
+        """接入扩展仓储（委托自动生效的查询数据源，issues/116 批次 D）
+
+        ``JeeflowFacade`` 构造时自动调用——集成方只要给门面传了 ``ext_repo``，
+        委托就默认生效（零配置，对齐内置版白拿体验）。未接入（传 None / 从未调用）时
+        建任务阶段静默跳过委托查询，不抛错。
+        """
+        if ext_repo is None:
+            return self
+        if self.ext is None:
+            self.ext = EngineExtensions()
+        self.ext.ext_repository = ext_repo
+        return self
 
     async def eval_expr(self, expr: str, vars_: dict) -> Any:
         """表达式求值（v1.5.0，门面 highLight 决策分支过滤用）"""
@@ -66,6 +83,8 @@ class EngineImpl(Engine):
         def_ = await self.repo.find_define_by_id(define_id)
         if not def_: raise ValueError(f"define not found: {define_id}")
         flow = parse_flow_model(json.loads(def_.content))
+        # 委托查询按「流程定义 name」（05-spi 生效规则），定义表 name 优先于 content name
+        flow.name = def_.name or flow.name
         vars_ = {**(args or {})}
         await self._add_user_info(operator, vars_)
         self._add_auto_gen_title(def_.displayName, vars_)
@@ -112,6 +131,7 @@ class EngineImpl(Engine):
                                               actors[lc + 1], operator, cur_node.properties.get("form", ""), now, 1)
                         nt.variables = {f"operatorList_{cur_node.id}": actors, f"loopCounter_{cur_node.id}": lc + 1,
                                         f"nrOfInstances_{cur_node.id}": len(actors)}
+                        await self._apply_surrogate(nt, flow.name)
                         await self.repo.save_task(nt)
                         # TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
                         await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, cur_node.id, operator))
@@ -162,7 +182,8 @@ class EngineImpl(Engine):
                 prev = _find_node(flow, prev_name)
                 if prev:
                     actors = self._rollback_actors(prev, inst, operator, task)
-                    await self._create_task_with_actors(prev, inst, operator, vars_, actors)
+                    await self._create_task_with_actors(prev, inst, operator, vars_, actors,
+                                                        getattr(flow, "name", "") or "")
         else:
             # issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
             target = _find_node(flow, target_task_name)
@@ -200,6 +221,8 @@ class EngineImpl(Engine):
         # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
         def_ = await self.repo.find_define_by_id(inst.defineId)
         flow = parse_flow_model(json.loads(def_.content))
+        # 委托查询按「流程定义 name」（同上，05-spi 生效规则）
+        flow.name = def_.name or flow.name
         args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
         # issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
         # 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
@@ -276,8 +299,9 @@ class EngineImpl(Engine):
         return []
 
     async def _create_task_with_actors(self, node: FlowNode, inst: ProcessInstance, operator: str,
-                                        vars_: dict, actors: list[str]):
-        """以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）"""
+                                        vars_: dict, actors: list[str], process_name: str = ""):
+        """以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）；
+        建单前同样应用委托（issues/116：任何新任务都是"建单那一刻"）"""
         if not actors: return
         ct = node.properties.get("countersignType", "")
         _pt = node.properties.get("performType", 0)
@@ -291,22 +315,26 @@ class EngineImpl(Engine):
             if ct in ("PARALLEL", ""):
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             elif ct == "SEQUENTIAL":
                 nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, 1)
                 nt.variables = {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
+                await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
                 await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             else:
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
         else:
             nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
             if len(actors) > 1:
                 nt.actorIds = actors
+            await self._apply_surrogate(nt, process_name)
             await self.repo.save_task(nt)
             await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
 
@@ -325,7 +353,7 @@ class EngineImpl(Engine):
         # 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
         # 任务完成的拦截器由 execute_process_task 显式触发，1.8.0 SYNC 同步演进）
         if node.type in (TYPE_TASK, TYPE_CUSTOM):
-            await self._create_task(node, inst, operator, vars_)
+            await self._create_task(node, inst, operator, vars_, getattr(flow, "name", "") or "")
             return
         if not await self._fire_pre(node, inst): return
         try:
@@ -374,7 +402,8 @@ class EngineImpl(Engine):
             target = _find_node(flow, edges[0].targetNodeId)
             if target: return await self._execute_node(flow, inst, target, operator, vars_)
 
-    async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict):
+    async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict,
+                           process_name: str = ""):
         actors = await self._resolve_actors(node, inst, operator, vars_)
         if not actors: return
         # performType 容错解析（对齐 Java codeOf，issue 42）：int 优先；
@@ -391,17 +420,20 @@ class EngineImpl(Engine):
             if ct == "PARALLEL":
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     # TASK_CREATE：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             elif ct == "SEQUENTIAL":
                 nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, 1)
                 nt.variables = {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
+                await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
                 await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             else:
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, 1)
+                    await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
         else:
@@ -409,8 +441,32 @@ class EngineImpl(Engine):
             nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now)
             if len(actors) > 1:
                 nt.actorIds = actors
+            await self._apply_surrogate(nt, process_name)
             await self.repo.save_task(nt)
             await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+
+    async def _apply_surrogate(self, task: ProcessTask, process_name: str) -> None:
+        """委托代理自动生效（issues/116 批次 D，引擎内置默认开启）——
+        **参与者解析完成后、落库前**把命中的代理人并入 ``task.actorIds``，
+        由紧随其后的 ``save_task`` 随任务一起写进 ``wf_process_task_actor``。
+
+        - 不走"事后 ``add_task_actor`` 补写"：Java 首版补写打在 taskId 分配前的空 id 上静默无效
+          （06 §4.5 条款 2 ⚠️）。本实现挂在 save_task 之前，taskId 已由 ``create_task`` 分配，
+          且代理人直接进落库的参与者集合。
+        - 授权人保留（只追加去重，任一可办）。
+        - 未接入扩展仓储 / 显式关闭（开关或空实现）→ 静默跳过（``resolve_surrogate_applier`` 返回 None）。
+        - 查询异常只记录不外抛：委托是增强能力，不得打断建单（同 ``_fire_event`` 兜底口径）。
+        """
+        applier = self.ext.resolve_surrogate_applier() if self.ext is not None else None
+        if applier is None:
+            return
+        base = list(task.actorIds) if task.actorIds else ([task.actorId] if task.actorId else [])
+        if not base:
+            return
+        try:
+            task.actorIds = await applier.expand(base, process_name, task)
+        except Exception:  # noqa: BLE001 —— 建单不被委托查询打断
+            logging.exception("[jeeflow] surrogate apply error, keep original actors: task=%s", task.id)
 
     async def _resolve_actors(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict) -> list[str]:
         # 1. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）

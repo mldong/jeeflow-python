@@ -162,3 +162,39 @@ deploy 自动版本管理，execute 按 submitType 全分发，操作人由 `arg
 
 > 分页说明（v1.1.0）：核心表分页 SPI（pageDefines/pageTodoTasks 等）目前 Java 提供，
 > 本语言对应分页 action 返回明确错误，计划 1.2.0 补齐；设计/委托分页全支持。
+
+---
+
+## 委托代理自动生效（引擎内置，默认开启）
+
+`processSurrogate/*` 五个 action 只是台账 CRUD；真正的能力是**建任务那一刻自动应用生效中的委托**
+（文档站 spec 06 §4.5「运行期语义」）。Python 引擎内置该行为：参与者解析完成后、落库前，
+对每个参与者查一次 `ProcessExtRepository.get_surrogate`，命中则把代理人**并入该任务的参与者集合**
+（随 `save_task` 一起写 `wf_process_task_actor`，授权人保留、任一可办）。实现见 `jeeflow/surrogate.py`。
+
+零配置：把扩展仓储传给门面即生效（门面会自动 `engine.attach_ext_repository(ext_repo)`）。
+
+```python
+ext_repo = MemoryExtRepository()            # 或 JdbcProcessExtRepository(adapter)
+engine = EngineImpl(repo, user_prov, idgen)
+facade = JeeflowFacade(engine, repo, ext_repo)   # ← 委托自此自动生效
+```
+
+**显式关闭**（回到"仅台账"）两条路，任选其一：
+
+```python
+# ① 配置开关
+engine.set_extensions(EngineExtensions(surrogate_enabled=False))
+engine.ext.surrogate_enabled = False            # 运行期改也可以
+# ② 注册空实现（也可换成自定义数据源的 SurrogateApplier）
+from jeeflow.surrogate import NullSurrogateApplier
+engine.set_extensions(EngineExtensions(ext_repository=ext_repo,
+                                       surrogate_applier=NullSurrogateApplier()))
+```
+
+**未配置扩展仓储时静默跳过**：`ext_repository is None` 不查不抛，建单流程零影响；
+查询本身报错也只记日志不外溢（委托是增强能力，不得打断建单）。
+
+委托查询四判据（内存仓 `MemoryExtRepository` 与 SQL 仓 `JdbcProcessExtRepository` 同答案）：
+空 `processName` 全流程兜底（先精确后兜底，多条命中取 id 最大者）、时间窗任一侧 NULL=不限、
+`surrogate <> operator` 自委托过滤、`enabled` 只认整数 1（脏值按停用，写入侧见 `processSurrogate/save`）。

@@ -45,6 +45,11 @@ class JeeflowFacade:
         self._user_search = user_search  # 可空：candidatePage 用户分页搜索依赖
         self._org_prov = org_prov  # 可空：candidatePage candidateGroups 角色取人（v1.6.0）
         self._meta_reader = None  # 可空：bizData 业务数据读取器（issue 30，注入式）
+        # issues/116 批次 D：委托代理自动生效是**引擎内置、默认开启**能力，数据源就是门面的扩展仓储。
+        # 集成方只要给门面传了 ext_repo 即零配置生效（对齐内置版白拿体验）；未传则引擎侧静默跳过。
+        attach = getattr(engine, "attach_ext_repository", None)
+        if attach is not None and ext_repo is not None:
+            attach(ext_repo)
 
     def set_meta_reader(self, reader) -> "JeeflowFacade":
         """注入业务数据读取器（issue 30）：需有 read_by_process_instance(table_name, process_instance_id)"""
@@ -672,8 +677,14 @@ class JeeflowFacade:
         s.surrogate = str(args.get("surrogate", ""))
         s.startTime = JeeflowFacade._parse_surrogate_time(args.get("startTime"))
         s.endTime = JeeflowFacade._parse_surrogate_time(args.get("endTime"))
-        enabled = JeeflowFacade._to_int(args.get("enabled"))
-        s.enabled = 1 if enabled is None else enabled  # 显式 0 不得被 or 1 吞掉（对齐 Java/Go toIntDef）
+        enabled = args.get("enabled", None)
+        if enabled is None or (isinstance(enabled, str) and not enabled.strip()):
+            s.enabled = 1  # 未传/空串 = 契约默认值（06 §4.5 save 参数表：enabled 默认 1）
+        else:
+            parsed = JeeflowFacade._to_int(enabled)
+            # 显式 0 不得被 or 1 吞掉（对齐 Java/Go toIntDef）；
+            # 传了但解析不出整数的脏值 → **停用**（05-spi 判据④：脏值不得默认当启用，各栈方向一致）
+            s.enabled = parsed if parsed is not None else 0
         s.updateUser = operator
 
     @staticmethod

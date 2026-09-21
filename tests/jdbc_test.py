@@ -645,6 +645,192 @@ async def main():
               [h.get("toActor") for h in (rrow["ext"] or {}).get("tf_transferHistory") or []]
               == ["lisi", "wangwu"], str(rrow["ext"]))
 
+        # ── ⑮ issues/116 批次 D：委托代理运行期自动生效 + 查询四判据（SQL 仓侧）──
+        # 契约：06-facade §4.5「运行期语义」六条 / 05-spi SurrogateInterceptor / 08-compliance 用例 26+27。
+        # 断言形状纪律：读回 wf_process_task_actor 真实行与仓储读回值，不看"返回码 0"；
+        # 判据组与 spec_test 内存仓同名同数据同答案（同栈两仓结论不同即缺陷）。
+        from datetime import timedelta
+        from jeeflow.extensions import EngineExtensions
+        from jeeflow.surrogate import NullSurrogateApplier
+
+        now_dt = datetime.now()
+        srg_ids = []
+        _srg_seq = [DEFINE_ID * 1000]
+
+        async def add_srg(pn, op, agent, start=None, end=None, enabled=1):
+            """建一条委托台账行（显式 id 便于清理 + 决定"最新一条"次序）"""
+            _srg_seq[0] += 1
+            s = ProcessSurrogate(id=_srg_seq[0], processName=pn, operator=op, surrogate=agent,
+                                 startTime=start, endTime=end, enabled=enabled,
+                                 createUser="t", updateUser="t")
+            await ext_repo.save_surrogate(s)
+            srg_ids.append(s.id)
+            return s
+
+        # ⑮.1 判据①：空 processName 全流程兜底 + 精确优先 + 多条命中取最新（对齐内存仓）
+        await add_srg("", "py-c1", "g1")
+        hit = await ext_repo.get_surrogate("py-c1", "any-flow")
+        check("⑮-①空 processName 全流程兜底", hit is not None and hit.surrogate == "g1",
+              str(hit.surrogate if hit else None))
+        await add_srg("leave", "py-c1", "exact")
+        hit = await ext_repo.get_surrogate("py-c1", "leave")
+        check("⑮-①精确命中优先于兜底", hit is not None and hit.surrogate == "exact",
+              str(hit.surrogate if hit else None))
+        await add_srg("", "py-c1", "g-new")
+        hit = await ext_repo.get_surrogate("py-c1", "other-flow")
+        check("⑮-①多条兜底取最新一条（ORDER BY id DESC，与内存仓同答案）",
+              hit is not None and hit.surrogate == "g-new", str(hit.surrogate if hit else None))
+
+        # ⑮.2 判据②：时间窗 start<=now<=end，任一侧 NULL = 该侧不限
+        await add_srg("w1", "py-c2", "future", start=now_dt + timedelta(days=2),
+                      end=now_dt + timedelta(days=3))
+        check("⑮-②未到窗不生效", await ext_repo.get_surrogate("py-c2", "w1") is None)
+        await add_srg("w2", "py-c2", "past", start=now_dt - timedelta(days=5),
+                      end=now_dt - timedelta(days=4))
+        check("⑮-②已过窗不生效", await ext_repo.get_surrogate("py-c2", "w2") is None)
+        await add_srg("w3", "py-c2", "open-end", start=now_dt - timedelta(days=1))
+        hit = await ext_repo.get_surrogate("py-c2", "w3")
+        check("⑮-②end 为 NULL = 该侧不限", hit is not None and hit.surrogate == "open-end",
+              str(hit.surrogate if hit else None))
+        await add_srg("w4", "py-c2", "open-start", end=now_dt + timedelta(days=1))
+        hit = await ext_repo.get_surrogate("py-c2", "w4")
+        check("⑮-②start 为 NULL = 该侧不限", hit is not None and hit.surrogate == "open-start",
+              str(hit.surrogate if hit else None))
+        await add_srg("w5", "py-c2", "both-null")
+        check("⑮-②两侧均 NULL = 不限",
+              (await ext_repo.get_surrogate("py-c2", "w5")).surrogate == "both-null")
+
+        # ⑮.3 判据③：自委托过滤（精确与兜底两路都要滤；内存仓此前漏此判据）
+        await add_srg("self", "py-c3", "py-c3")
+        check("⑮-③精确路径自委托不生效", await ext_repo.get_surrogate("py-c3", "self") is None)
+        await add_srg("", "py-c3", "py-c3")
+        check("⑮-③兜底路径自委托同样不生效", await ext_repo.get_surrogate("py-c3", "any-flow") is None)
+
+        # ⑮.4 判据④：enabled 只认 1（脏值不得当启用；INT 列存不进文本，脏值方向由门面写入侧兜）
+        for dirty, label in ((0, "零停用"), (None, "NULL非启用"), (2, "非1整数")):
+            await add_srg("en-" + label, "py-c4", "agent", enabled=dirty)
+            check(f"⑮-④{label}不生效", await ext_repo.get_surrogate("py-c4", "en-" + label) is None)
+        await add_srg("en-on", "py-c4", "agent", enabled=1)
+        check("⑮-④enabled=1 生效",
+              (await ext_repo.get_surrogate("py-c4", "en-on")).surrogate == "agent")
+        facade_srg = JeeflowFacade(eng, repo, ext_repo)  # 顺带把扩展仓储接入引擎（零配置默认生效）
+        rd = await facade_srg.flow("processSurrogate/save",
+                                   {"operator": "py-c4", "surrogate": "agent", "processName": "en-dirty",
+                                    "enabled": "abc"})
+        check("⑮-④门面存脏值不报错", rd["code"] == 0, str(rd))
+        srg_ids.append(int(rd["data"]["id"]))
+        rdet = await facade_srg.flow("processSurrogate/detail", {"id": rd["data"]["id"]})
+        check("⑮-④脏值「abc」落库为停用（detail 读回值）",
+              rdet["data"]["enabled"] == 0, str(rdet["data"]["enabled"]))
+        check("⑮-④脏值委托查询不生效", await ext_repo.get_surrogate("py-c4", "en-dirty") is None)
+
+        # ⑮.5 运行期自动生效：一条正例 + 三条同 operator 的负例同时压在 task1 参与者上
+        win_start, win_end = now_dt - timedelta(hours=1), now_dt + timedelta(hours=1)
+        await add_srg("py-simple", "leader", "py-agent", start=win_start, end=win_end)      # 正例
+        await add_srg("py-simple", "leader", "py-off", enabled=0)                          # 负例：停用
+        await add_srg("py-simple", "leader", "py-future", start=now_dt + timedelta(days=2),
+                      end=now_dt + timedelta(days=3))                                       # 负例：窗外
+        await add_srg("py-simple", "leader", "leader")                                      # 负例：自委托
+        await add_srg("simple", "zhangsan", "py-decoy")  # 诱饵：content name ≠ 流程定义 name
+        r116 = await facade_srg.flow("processInstance/startAndExecute",
+                                     {"processDefineId": DEFINE_ID, "operator": "zhangsan"})
+        check("⑮ 配好委托后建单成功", r116["code"] == 0, str(r116))
+        iid116 = int(r116["data"]["processInstanceId"])
+        doing116 = [t for t in await repo.find_doing_tasks(iid116) if t.taskName == "task1"]
+        check("⑮ 存在 task1 进行中任务", len(doing116) == 1, str([t.taskName for t in doing116]))
+        task116 = doing116[0]
+        actors116 = await repo.find_task_actors(task116.id)
+        check("⑮ 代理人随任务并入参与者集合（授权人保留在后，停用/窗外/自委托三条不进）",
+              actors116 == ["leader", "py-agent"], str(actors116))
+        n_agent = await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_task_actor"
+                                           " WHERE process_task_id = ? AND actor_id = ?",
+                                  [task116.id, "py-agent"])
+        check("⑮ wf_process_task_actor 真落代理人那一行（反 Java 首版空 taskId 静默无效）",
+              int(n_agent) == 1, str(n_agent))
+        n_leader = await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_task_actor"
+                                            " WHERE process_task_id = ? AND actor_id = ?",
+                                   [task116.id, "leader"])
+        check("⑮ 授权人那一行仍在（委托不是转办，任一可办）", int(n_leader) == 1, str(n_leader))
+        n_decoy = await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_task_actor"
+                                           " WHERE process_task_id = ? AND actor_id = ?",
+                                  [task116.id, "py-decoy"])
+        check("⑮ 停用/窗外/自委托/诱饵名 四者均无 actor 行", int(n_decoy) == 0, str(n_decoy))
+        rows_agent, _ = await repo.page_todo_tasks(1, 100, "py-agent")
+        check("⑮ 代理人待办分页读得到该单", task116.id in [t.id for t in rows_agent],
+              str([t.id for t in rows_agent]))
+        rows_leader, _ = await repo.page_todo_tasks(1, 100, "leader")
+        check("⑮ 授权人待办分页仍在（未被顶掉）", task116.id in [t.id for t in rows_leader],
+              str([t.id for t in rows_leader]))
+        # 委托查询按「流程定义 name」（此处 py-simple，content name=simple）：apply 节点不受诱饵影响
+        apply116 = [t for t in await repo.find_history_tasks(iid116) if t.taskName == "apply"][0]
+        check("⑮ 按流程定义 name 查委托：诱饵（content name）不追加到 apply 参与者",
+              await repo.find_task_actors(apply116.id) == ["zhangsan"],
+              str(await repo.find_task_actors(apply116.id)))
+
+        # ⑮.6 未配置扩展仓储：建单不被打断（缺仓储属正常部署形态，不得抛"未配置扩展仓储"）
+        eng_noext = EngineImpl(repo, TestUserProv(), TestIDGen())
+        facade_noext = JeeflowFacade(eng_noext, repo, None)
+        r_no = await facade_noext.flow("processInstance/startAndExecute",
+                                       {"processDefineId": DEFINE_ID, "operator": "zhangsan"})
+        check("⑮ 未配扩展仓储建单成功（不打断）", r_no["code"] == 0, str(r_no))
+        _t_no = [t for t in await repo.find_doing_tasks(int(r_no["data"]["processInstanceId"]))
+                 if t.taskName == "task1"][0]
+        check("⑮ 缺仓储时参与者原样（无委托应用）",
+              await repo.find_task_actors(_t_no.id) == ["leader"],
+              str(await repo.find_task_actors(_t_no.id)))
+        # 引擎级异常兜底：数据源抛错也不打断建单（委托是增强能力）
+        class _BoomExt:
+            async def get_surrogate(self, *a, **kw):
+                raise RuntimeError("模拟扩展仓储不可用")
+
+        eng_boom = EngineImpl(repo, TestUserProv(), TestIDGen())
+        eng_boom.set_extensions(EngineExtensions(ext_repository=_BoomExt()))
+        r_boom = await eng_boom.start_process_instance_by_id(
+            DEFINE_ID, "zhangsan", {"BUSINESS_NO": f"BIZ-{DB}-boom"})
+        doing_boom = [t for t in await repo.find_doing_tasks(r_boom.id) if t.taskName == "apply"]
+        check("⑮ 扩展仓储抛错时建单不被打断（异常只记录不外溢，参与者原样）",
+              len(doing_boom) == 1 and await repo.find_task_actors(doing_boom[0].id) == ["zhangsan"],
+              str([t.taskName for t in doing_boom]))
+
+        # ⑮.7 显式关闭：① 配置开关（已接入的扩展仓储须跨 set_extensions 保留）
+        eng.set_extensions(EngineExtensions(surrogate_enabled=False))
+        check("⑮ set_extensions 保留门面接入的扩展仓储", eng.ext.ext_repository is ext_repo)
+        r_off = await facade_srg.flow("processInstance/startAndExecute",
+                                      {"processDefineId": DEFINE_ID, "operator": "zhangsan"})
+        check("⑮ 开关关闭后建单成功", r_off["code"] == 0, str(r_off))
+        _t_off = [t for t in await repo.find_doing_tasks(int(r_off["data"]["processInstanceId"]))
+                  if t.taskName == "task1"][0]
+        check("⑮ 开关关闭 → 回到仅台账（代理人不进参与者）",
+              await repo.find_task_actors(_t_off.id) == ["leader"],
+              str(await repo.find_task_actors(_t_off.id)))
+        rows_pg, total_pg = await ext_repo.page_surrogates(filters={"operator": "leader"})
+        check("⑮ 关闭的是运行期应用，台账照旧查得到", total_pg == 4,
+              f"total={total_pg} rows={[r.surrogate for r in rows_pg]}")
+        # ⑮.7b 显式关闭：② 注册空实现
+        eng.set_extensions(EngineExtensions(ext_repository=ext_repo,
+                                            surrogate_applier=NullSurrogateApplier()))
+        r_null = await facade_srg.flow("processInstance/startAndExecute",
+                                       {"processDefineId": DEFINE_ID, "operator": "zhangsan"})
+        _t_null = [t for t in await repo.find_doing_tasks(int(r_null["data"]["processInstanceId"]))
+                   if t.taskName == "task1"][0]
+        check("⑮ 注册空实现同样回到仅台账", await repo.find_task_actors(_t_null.id) == ["leader"],
+              str(await repo.find_task_actors(_t_null.id)))
+
+        # 清理本轮委托台账行（按显式 id，不碰别人的数据）
+        conn = await adapter.acquire()
+        try:
+            for sid in srg_ids:
+                await conn.execute(sql_of(adapter, "DELETE FROM wf_process_surrogate WHERE id = ?"),
+                                   [sid])
+        finally:
+            await adapter.release(conn)
+        left = 0
+        for sid in srg_ids:
+            left += int(await raw_count(adapter,
+                                        "SELECT COUNT(*) FROM wf_process_surrogate WHERE id = ?",
+                                        [sid]))
+        check("⑮ 委托台账行按 id 清理完毕（零残留）", left == 0, f"残留 {left} 行 / 本轮 {len(srg_ids)} 行")
+
         # 清理测试残留
         await cleanup(adapter)
         conn = await adapter.acquire()

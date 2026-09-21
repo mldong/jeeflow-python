@@ -11,8 +11,9 @@ from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowI
 from jeeflow.engine import KEY_AUTO_GEN_TITLE
 from jeeflow.facade import JeeflowFacade
 from jeeflow.memory import MemoryExtRepository
+from jeeflow.surrogate import NullSurrogateApplier, surrogate_enabled_on, to_datetime
 from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance,
-                           ProcessTask, TaskState, InstanceState, UserInfo)
+                           ProcessSurrogate, ProcessTask, TaskState, InstanceState, UserInfo)
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 
 import flows_resolver
@@ -2766,4 +2767,274 @@ async def test_transfer_never_overwrites_operator_column_done_list_clean():
         ids = [t["id"] for t in rd["data"]["rows"]]
         assert str(tid) not in ids and tid not in ids, \
             f"转办→撤回后 {who} 的「我已办」冒入该单（他从没办过）: {ids}"
+
+
+# ═══ 批次 D · issues/116：委托代理运行期自动生效（引擎内置 · 默认开启 · 可显式关闭）═══
+# 契约：06-facade §4.5「运行期语义」六条 + 05-spi「SurrogateInterceptor」+ 08-compliance 用例 26/27
+
+def _win(days_before: int = 1, days_after: int = 1) -> tuple[str, str]:
+    """相对「今天」的时间窗（用例不随日历过期）"""
+    now = datetime.now()
+    return ((now - timedelta(days=days_before)).strftime("%Y-%m-%d %H:%M:%S"),
+            (now + timedelta(days=days_after)).strftime("%Y-%m-%d %H:%M:%S"))
+
+
+@pytest.mark.asyncio
+async def test_surrogate_runtime_appends_agent_into_persisted_actors():
+    """用例 26 正向：窗口内配 leader→lisi，新单到达 task1 时**代理人真进参与者表**
+    （断言落在读回的持久值上，不是返回码）；授权人那一行保留（任一可办）。
+    ⚠️ 反例形态：Java 首版靠"事后 add_task_actor 补写"且打在未分配的 taskId 上静默无效，
+    本用例的 find_task_actors 读回值正是该缺陷的照妖镜。"""
+    eng, repo = setup()
+    ext = MemoryExtRepository()
+    facade = JeeflowFacade(eng, repo, ext)  # 零配置：传了扩展仓储即默认生效
+    start, end = _win()
+    r = await facade.flow("processSurrogate/save",
+                          {"operator": "leader", "surrogate": "lisi", "processName": "simple",
+                           "startTime": start, "endTime": end})
+    assert r["code"] == 0, r
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+
+    task1 = (await repo.find_doing_tasks(iid))[0]
+    assert task1.taskName == "task1", task1.taskName
+    actors = await repo.find_task_actors(task1.id)
+    assert actors == ["leader", "lisi"], f"代理人应随任务一起进参与者集合（原人保留在后）: {actors}"
+    # 任务行的主办理人不被代理人顶掉（issues/115 同口径：actor_id 列恒无值，参与者以 actor 表为准）
+    stored = await repo.find_task_by_id(task1.id)
+    assert stored.actorId in ("", None), f"追加代理人不得覆写 actor_id: {stored.actorId!r}"
+    # 双方待办都看得到这单（任一可办）
+    for who in ("leader", "lisi"):
+        rt = await facade.flow("processTask/todoList", {"operator": who})
+        assert [t["id"] for t in rt["data"]["rows"]] == [str(task1.id)], f"{who} 待办: {rt['data']['rows']}"
+    # 台账不受运行期影响（仍是那条委托）
+    rp = await facade.flow("processSurrogate/page", {"operator": "leader"})
+    assert rp["data"]["recordCount"] == 1, rp["data"]
+
+
+@pytest.mark.asyncio
+async def test_surrogate_applier_dedupe_and_empty_guard():
+    """内置应用器：代理人已是参与者 → 不重复；空参与者/空代理人 → 原样返回"""
+    eng, repo = setup()
+    ext = MemoryExtRepository()
+    facade = JeeflowFacade(eng, repo, ext)
+    start, end = _win()
+    assert (await facade.flow("processSurrogate/save",
+                              {"operator": "leader", "surrogate": "lisi", "processName": "simple",
+                               "startTime": start, "endTime": end}))["code"] == 0
+    assert (await facade.flow("processSurrogate/save",
+                              {"operator": "zhangsan", "surrogate": "  ", "processName": "simple",
+                               "startTime": start, "endTime": end}))["code"] == 0
+    applier = ext_repo_applier(ext)
+    # 代理人已在名单 → 不重复插行
+    assert await applier.expand(["leader", "lisi"], "simple") == ["leader", "lisi"]
+    # 未命中 → 原样；空集合 → 空
+    assert await applier.expand(["leader"], "other-flow-none") == ["leader"]
+    assert await applier.expand([], "simple") == []
+    # 代理人为空白串 → 不追加（引擎侧兜住脏数据，不往参与者表插空行）
+    assert await applier.expand(["zhangsan"], "simple") == ["zhangsan"]
+    # 正常追加：原人在前、代理人在后（授权人保留）
+    assert await applier.expand(["leader"], "simple") == ["leader", "lisi"]
+    # 引擎建单同样不重复：task1 参与者恰好两行
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    actors = await repo.find_task_actors((await repo.find_doing_tasks(iid))[0].id)
+    assert actors == ["leader", "lisi"], actors
+
+
+def ext_repo_applier(ext):
+    from jeeflow.surrogate import ExtRepositorySurrogateApplier
+    return ExtRepositorySurrogateApplier(ext)
+
+
+@pytest.mark.asyncio
+async def test_surrogate_runtime_negative_window_disabled_self():
+    """用例 26 负向：窗外 / enabled=0 / 代理人为空 → 代理人**不**进参与者集合"""
+    now = datetime.now()
+    fmt = "%Y-%m-%d %H:%M:%S"
+    cases = [
+        ("窗外-未开始", {"startTime": (now + timedelta(days=2)).strftime(fmt),
+                         "endTime": (now + timedelta(days=3)).strftime(fmt)}),
+        ("窗外-已过期", {"startTime": "2020-01-01 00:00:00", "endTime": "2020-12-31 23:59:59"}),
+        ("enabled=0", {"startTime": now.strftime(fmt), "endTime": (now + timedelta(days=1)).strftime(fmt),
+                       "enabled": 0}),
+        ("代理人为空", {"startTime": now.strftime(fmt), "endTime": (now + timedelta(days=1)).strftime(fmt),
+                       "surrogate": ""}),
+    ]
+    for label, extra in cases:
+        eng, repo = setup()
+        ext = MemoryExtRepository()
+        facade = JeeflowFacade(eng, repo, ext)
+        args = {"operator": "leader", "surrogate": "lisi", "processName": "simple"}
+        args.update(extra)
+        r = await facade.flow("processSurrogate/save", args)
+        assert r["code"] == 0, (label, r)
+        define_id = await _deploy(facade, "01-simple.json")
+        iid = await _start(facade, define_id, "zhangsan")
+        task1 = (await repo.find_doing_tasks(iid))[0]
+        actors = await repo.find_task_actors(task1.id)
+        assert actors == ["leader"], f"{label}：代理人不该收到这单，实测参与者 {actors}"
+        rt = await facade.flow("processTask/todoList", {"operator": "lisi"})
+        assert rt["data"]["rows"] == [], f"{label}：lisi 待办应为空 {rt['data']['rows']}"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_runtime_without_ext_repo_does_not_break_start():
+    """用例 26：未配置 IProcessExtRepository → 建单不被打断（静默跳过，不得抛"未配置扩展仓储"）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, None)  # 无扩展仓储
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")  # _start 内部断言 code==0
+    task1 = (await repo.find_doing_tasks(iid))[0]
+    assert await repo.find_task_actors(task1.id) == ["leader"], "缺仓储时参与者原样"
+    assert eng.ext is None or eng.ext.ext_repository is None, "未传扩展仓储不应凭空造数据源"
+    # 委托类 action 仍按原契约明确报错（运行期静默 ≠ 门面静默）
+    assert (await facade.flow("processSurrogate/page", {}))["code"] == 99999999
+
+
+@pytest.mark.asyncio
+async def test_surrogate_runtime_explicit_disable_two_routes():
+    """用例 26：显式关闭 → 回到"仅台账"。两条关闭路都要有效：
+    ① 配置开关 EngineExtensions(surrogate_enabled=False)
+    ② 注册空实现 EngineExtensions(surrogate_applier=NullSurrogateApplier())"""
+    start, end = _win()
+
+    # ① 开关关闭：在门面构造**之后**设扩展体（验证已接入的扩展仓储跨 set_extensions 保留）
+    eng, repo = setup()
+    ext = MemoryExtRepository()
+    facade = JeeflowFacade(eng, repo, ext)
+    assert (await facade.flow("processSurrogate/save",
+                              {"operator": "leader", "surrogate": "lisi", "processName": "simple",
+                               "startTime": start, "endTime": end}))["code"] == 0
+    eng.set_extensions(EngineExtensions(surrogate_enabled=False))
+    assert eng.ext.ext_repository is ext, "set_extensions 须保留门面已接入的扩展仓储"
+    iid = await _start(facade, await _deploy(facade, "01-simple.json"), "zhangsan")
+    task1 = (await repo.find_doing_tasks(iid))[0]
+    assert await repo.find_task_actors(task1.id) == ["leader"], "关闭后代理人不得进参与者集合"
+    assert await ext.get_surrogate("leader", "simple") is not None, "关闭的是运行期应用，台账仍在"
+
+    # ② 注册空实现
+    eng2, repo2 = setup()
+    ext2 = MemoryExtRepository()
+    facade2 = JeeflowFacade(eng2, repo2, ext2)
+    assert (await facade2.flow("processSurrogate/save",
+                               {"operator": "leader", "surrogate": "lisi", "processName": "simple",
+                                "startTime": start, "endTime": end}))["code"] == 0
+    eng2.set_extensions(EngineExtensions(ext_repository=ext2, surrogate_applier=NullSurrogateApplier()))
+    iid2 = await _start(facade2, await _deploy(facade2, "01-simple.json"), "zhangsan")
+    task2 = (await repo2.find_doing_tasks(iid2))[0]
+    assert await repo2.find_task_actors(task2.id) == ["leader"], "空实现注册后不应用委托"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_runtime_engine_direct_and_full_flow_fallback():
+    """引擎直用（不经门面）也内置生效：attach_ext_repository + 判据① 空 processName 全流程兜底。
+    同时验证代理人自身不再级联委托（A→B、B→C 时 C 不收到）。"""
+    eng, repo = setup()
+    ext = MemoryExtRepository()
+    now = datetime.now()
+    await ext.save_surrogate(ProcessSurrogate(operator="leader", surrogate="lisi", processName="",
+                                              startTime=now - timedelta(days=1), endTime=now + timedelta(days=1)))
+    await ext.save_surrogate(ProcessSurrogate(operator="lisi", surrogate="wangwu", processName="", enabled=1))
+    eng.attach_ext_repository(ext)
+    df = load_flow(repo, "01-simple.json")  # 定义 name=文件名，委托走空 processName 兜底
+    inst = await _start_and_execute(eng, repo, df.id, "zhangsan")
+    task1 = (await repo.find_doing_tasks(inst.id))[0]
+    actors = await repo.find_task_actors(task1.id)
+    assert actors == ["leader", "lisi"], f"兜底委托应命中且代理人不级联: {actors}"
+
+    # 关掉开关（引擎直用形态）
+    eng.ext.surrogate_enabled = False
+    inst2 = await _start_and_execute(eng, repo, df.id, "zhangsan")
+    task2 = (await repo.find_doing_tasks(inst2.id))[0]
+    assert await repo.find_task_actors(task2.id) == ["leader"], "关闭后回到仅台账"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_query_four_criteria_memory_repo():
+    """用例 27 内存仓侧：四判据须与 SQL 仓（jdbc_test ⑮）同答案。
+    此前内存仓缺判据③ 自委托过滤、判据④ 用 `!= 1` 松判、多条命中取首条（SQL 取最新）→ 同栈两仓分叉。"""
+    ext = MemoryExtRepository()
+    now = datetime.now()
+
+    async def add(pn, sur, start=None, end=None, enabled=1, op="boss"):
+        s = ProcessSurrogate(operator=op, surrogate=sur, processName=pn,
+                             startTime=start, endTime=end, enabled=enabled)
+        await ext.save_surrogate(s)
+        return s
+
+    # ① 精确优先 → 未命中回落空 processName 兜底（各组用独立授权人，免被兜底行串味）
+    await add("", "g1", op="c1")
+    hit = await ext.get_surrogate("c1", "any-flow")
+    assert hit is not None and hit.surrogate == "g1", "① 空 processName 兜底"
+    await add("leave", "exact", op="c1")
+    hit = await ext.get_surrogate("c1", "leave")
+    assert hit.surrogate == "exact", "① 精确命中优先于兜底"
+    assert (await ext.get_surrogate("c1", "")).surrogate in ("g1", "exact"), "① 传空名走兜底"
+
+    # ① 多条兜底命中 → 取 id 最大（对齐 SQL ORDER BY id DESC LIMIT 1）
+    await add("", "g-new", op="c1")
+    hit = await ext.get_surrogate("c1", "other-flow")
+    assert hit.surrogate == "g-new", f"多条命中应取最新一条（与 SQL 仓同答案）: {hit.surrogate}"
+
+    # ② 时间窗：任一侧 None = 该侧不限；两侧都越界则不生效
+    await add("win", "future", start=now + timedelta(days=2), end=now + timedelta(days=3), op="c2")
+    assert await ext.get_surrogate("c2", "win") is None, "② 未到窗"
+    await add("win2", "past", start=now - timedelta(days=5), end=now - timedelta(days=4), op="c2")
+    assert await ext.get_surrogate("c2", "win2") is None, "② 已过窗"
+    await add("win3", "open-end", start=now - timedelta(days=1), op="c2")
+    assert (await ext.get_surrogate("c2", "win3")).surrogate == "open-end", "② end 不限"
+    await add("win4", "open-start", end=now + timedelta(days=1), op="c2")
+    assert (await ext.get_surrogate("c2", "win4")).surrogate == "open-start", "② start 不限"
+    await add("win5", "text-window", op="c2",
+              start=(now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+              end=(now + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert (await ext.get_surrogate("c2", "win5")).surrogate == "text-window", "② 文本窗同样判定"
+    await add("win6", "text-out", start="2020-01-01 00:00:00", end="2020-12-31 23:59:59", op="c2")
+    assert await ext.get_surrogate("c2", "win6") is None, "② 文本窗越界不生效"
+
+    # ③ 自委托过滤（同栈此前只有 SQL 仓有该过滤，内存仓漏 → 同数据两仓不同答案）
+    await add("self", "c3", op="c3")
+    assert await ext.get_surrogate("c3", "self") is None, "③ 精确路径自己委托给自己不生效"
+    await add("", "c3", op="c3")  # 全流程自委托：兜底路径也必须过滤
+    assert await ext.get_surrogate("c3", "any-flow") is None, "③ 兜底路径同样过滤自委托"
+
+    # ④ enabled 只认 1（脏值不得当启用；SQL 列 INT 存不进文本，两仓同答案口径）
+    for dirty, why in ((0, "零停用"), (None, "NULL非启用"), ("abc", "脏值"), (2, "非1整数")):
+        await add("en-" + why, "agent", enabled=dirty, op="c4")
+        assert await ext.get_surrogate("c4", "en-" + why) is None, f"④ {why} 不得生效"
+    await add("en-str", "agent", enabled="1", op="c4")
+    assert (await ext.get_surrogate("c4", "en-str")).surrogate == "agent", '④ "1" 等价启用'
+    assert surrogate_enabled_on("abc") is False and surrogate_enabled_on(1) is True
+    assert to_datetime("2026-13-45") is None, "不可解析时间 = 该侧不限"
+
+
+@pytest.mark.asyncio
+async def test_facade_surrogate_save_dirty_enabled_is_off():
+    """判据④ 写入侧：显式传脏值（"abc"）→ 停用；未传 → 契约默认 1（两者不得同解）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    r = await facade.flow("processSurrogate/save",
+                          {"operator": "boss", "surrogate": "agent", "processName": "leave",
+                           "enabled": "abc"})
+    assert r["code"] == 0, r
+    s = await facade._ext.find_surrogate_by_id(int(r["data"]["id"]))
+    assert s.enabled == 0, f'脏值 enabled="abc" 不得当启用，实测落库 {s.enabled}'
+    assert await facade._ext.get_surrogate("boss", "leave") is None, "脏值委托不生效"
+
+    r2 = await facade.flow("processSurrogate/save",
+                           {"operator": "boss2", "surrogate": "agent2", "processName": "leave"})
+    s2 = await facade._ext.find_surrogate_by_id(int(r2["data"]["id"]))
+    assert s2.enabled == 1, f"未传 enabled 按契约默认 1: {s2.enabled}"
+    assert (await facade._ext.get_surrogate("boss2", "leave")).surrogate == "agent2"
+
+    # 边界：显式 "1" 字符串等价 1；空串按未传（对齐 Java toIntDef 默认）
+    r3 = await facade.flow("processSurrogate/save",
+                           {"operator": "boss3", "surrogate": "agent3", "processName": "leave",
+                            "enabled": "1"})
+    assert (await facade._ext.find_surrogate_by_id(int(r3["data"]["id"]))).enabled == 1
+    r4 = await facade.flow("processSurrogate/save",
+                           {"operator": "boss4", "surrogate": "agent4", "processName": "leave",
+                            "enabled": ""})
+    assert (await facade._ext.find_surrogate_by_id(int(r4["data"]["id"]))).enabled == 1
 

@@ -1,8 +1,10 @@
-"""扩展体系——拦截器、事件、HandlerRegistry"""
+"""扩展体系——拦截器、事件、HandlerRegistry、委托代理运行期应用（issues/116）"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional, Union, Awaitable
+
+from .surrogate import ExtRepositorySurrogateApplier, SurrogateApplier
 
 
 class EventType(Enum):
@@ -94,3 +96,26 @@ class EngineExtensions:
     decision_handler: Optional[DecisionHandler] = None
     event_listener: Optional[Callable[[ProcessEvent], Awaitable[None]]] = None
     registry: Optional[HandlerRegistry] = None
+    # ── 委托代理运行期自动生效（issues/116 批次 D：引擎内置、默认开启、可显式关闭）──
+    # 委托查询数据源（可选 ProcessExtRepository）；None → 建任务时静默跳过，不得抛错打断建单
+    ext_repository: Optional[Any] = None
+    # 关闭路①（配置开关）：False → 引擎不应用委托，回到"仅台账"行为
+    surrogate_enabled: bool = True
+    # 关闭路②（注册空实现 NullSurrogateApplier）/ 自定义数据源：None → 用内置实现查 ext_repository
+    surrogate_applier: Optional[SurrogateApplier] = None
+
+    def resolve_surrogate_applier(self) -> Optional[SurrogateApplier]:
+        """解析建任务时生效的委托应用器（issues/116 06 §4.5 条款 3/4）：
+
+        - 开关关闭（``surrogate_enabled=False``）→ ``None``（静默跳过）
+        - 显式注册实现（含 ``NullSurrogateApplier`` 空实现）→ 用它
+        - 未注册但已接入扩展仓储 → 内置 ``ExtRepositorySurrogateApplier``
+        - 未接入扩展仓储 → ``None``（缺仓储属正常部署形态，静默跳过）
+        """
+        if not self.surrogate_enabled:
+            return None
+        if self.surrogate_applier is not None:
+            return self.surrogate_applier
+        if self.ext_repository is None:
+            return None
+        return ExtRepositorySurrogateApplier(self.ext_repository)

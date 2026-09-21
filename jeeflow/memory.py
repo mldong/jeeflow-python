@@ -7,6 +7,7 @@ from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, Inst
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate,
                     InstanceStatsRow, TaskStatsRow)
 from .spi import ProcessRepository, ProcessExtRepository
+from .surrogate import surrogate_enabled_on, to_datetime
 
 class MemoryRepository(ProcessRepository):
     def __init__(self):
@@ -582,113 +583,42 @@ class MemoryExtRepository(ProcessExtRepository):
         return rows, len(rows)
 
     async def get_surrogate(self, operator: str, process_name: str, at=None):
-        at = at or datetime.now()
-        fallback = None
+        """生效委托查询——四判据与 SQL 仓 ``JdbcProcessExtRepository.get_surrogate`` **同答案**
+        （issues/116 批次 D / 06 §4.5 条款 6：同栈两仓对同一份数据结论不同即缺陷）：
+
+        ① 先按 processName 精确查，未命中回落空 processName（全流程兜底）；
+        ② 时间窗 ``start <= at <= end``，任一侧 None/空 = 该侧不限；
+        ③ 自委托过滤 ``surrogate <> operator``（自己委托给自己不生效）；
+        ④ ``enabled`` 只认整数 1，脏值不当启用（``surrogate_enabled_on``）。
+
+        多条命中取 **id 最大者**（对齐 SQL 侧 ``ORDER BY id DESC LIMIT 1``——此前内存侧取
+        首条命中，同栈两仓在"命中哪一条"上分叉）。
+        """
+        at = to_datetime(at) or datetime.now()
+        hit = self._pick_surrogate(operator, at,
+                                   lambda s: bool(process_name) and (s.processName or "") == process_name)
+        if hit is not None:
+            return hit
+        return self._pick_surrogate(operator, at, lambda s: not (s.processName or ""))
+
+    def _pick_surrogate(self, operator: str, at: datetime, name_match) -> Optional[ProcessSurrogate]:
+        """按四判据筛委托记录，返回 id 最大的一条（无命中 None）"""
+        best = None
         for s in self._surrogates.values():
-            if s.operator != operator or s.enabled != 1:
+            if s.operator != operator or s.surrogate == operator:  # 判据③
                 continue
-            if s.startTime and s.startTime > at:
+            if not surrogate_enabled_on(s.enabled):  # 判据④
                 continue
-            if s.endTime and s.endTime < at:
+            start, end = to_datetime(s.startTime), to_datetime(s.endTime)  # 判据②
+            if start is not None and start > at:
                 continue
-            if s.processName == process_name and process_name:
-                return deepcopy(s)
-            if (not s.processName or s.processName == process_name) and fallback is None:
-                fallback = s
-        return deepcopy(fallback) if fallback else None
-
-class MemoryExtRepository(ProcessExtRepository):
-    """扩展仓储内存实现（v1.1.0，测试/演示用）"""
-
-    def __init__(self):
-        self._designs: dict[int, ProcessDesign] = {}
-        self._designHis: dict[int, list[ProcessDesignHis]] = {}
-        self._surrogates: dict[int, ProcessSurrogate] = {}
-        self._seq = 1
-
-    # ── 流程设计 ──
-
-    async def find_design_by_id(self, id): return deepcopy(self._designs.get(id))
-
-    async def save_design(self, d: ProcessDesign):
-        d.id = d.id or self._seq; self._seq += 1
-        now = datetime.now()
-        d.createTime = d.createTime or now
-        d.updateTime = d.updateTime or now
-        self._designs[d.id] = deepcopy(d)
-
-    async def update_design(self, d: ProcessDesign):
-        d.updateTime = datetime.now()
-        self._designs[d.id] = deepcopy(d)
-
-    async def remove_design(self, id: int):
-        self._designs.pop(id, None)
-        self._designHis.pop(id, None)
-
-    async def page_designs(self, page_num=1, page_size=10, filters=None, conditions=None):
-        rows = [d for d in self._designs.values()
-                if _match_conditions(conditions, _pick_fields(d, _DESIGN_FIELDS))]
-        return rows, len(rows)
-
-    # ── 设计历史 ──
-
-    async def save_design_his(self, his: ProcessDesignHis):
-        his.id = his.id or self._seq; self._seq += 1
-        his.createTime = his.createTime or datetime.now()
-        self._designHis.setdefault(his.processDesignId, []).insert(0, deepcopy(his))
-
-    async def list_design_his(self, design_id: int):
-        return [deepcopy(h) for h in self._designHis.get(design_id, [])]
-
-    # ── 委托代理 ──
-
-    async def find_surrogate_by_id(self, id): return deepcopy(self._surrogates.get(id))
-
-    async def save_surrogate(self, s: ProcessSurrogate):
-        s.id = s.id or self._seq; self._seq += 1
-        now = datetime.now()
-        s.createTime = s.createTime or now
-        s.updateTime = s.updateTime or now
-        # 显式 enabled=0 是合法值（停用委托）；缺省由门面处理（对齐 Java/Go，issues/82-7）
-        self._surrogates[s.id] = deepcopy(s)
-
-    async def update_surrogate(self, s: ProcessSurrogate):
-        s.updateTime = datetime.now()
-        self._surrogates[s.id] = deepcopy(s)
-
-    async def remove_surrogate(self, id: int):
-        self._surrogates.pop(id, None)
-
-    async def page_surrogates(self, page_num=1, page_size=10, filters=None, conditions=None):
-        rows = []
-        for s in self._surrogates.values():
-            ok = True
-            for col, val in (filters or {}).items():
-                if val is None or val == "":
-                    continue
-                key = "processName" if col == "process_name" else col
-                if str(getattr(s, key, "")) != str(val):
-                    ok = False
-                    break
-            if ok and _match_conditions(conditions, _pick_fields(s, _SURROGATE_FIELDS)):
-                rows.append(deepcopy(s))
-        return rows, len(rows)
-
-    async def get_surrogate(self, operator: str, process_name: str, at=None):
-        at = at or datetime.now()
-        fallback = None
-        for s in self._surrogates.values():
-            if s.operator != operator or s.enabled != 1:
+            if end is not None and end < at:
                 continue
-            if s.startTime and s.startTime > at:
+            if not name_match(s):  # 判据①（调用方给精确/兜底两种口径）
                 continue
-            if s.endTime and s.endTime < at:
-                continue
-            if s.processName == process_name and process_name:
-                return deepcopy(s)
-            if (not s.processName or s.processName == process_name) and fallback is None:
-                fallback = s
-        return deepcopy(fallback) if fallback else None
+            if best is None or (s.id or 0) > (best.id or 0):
+                best = s
+        return deepcopy(best) if best else None
 
     # ── 核心表分页（v1.5.0）──
 

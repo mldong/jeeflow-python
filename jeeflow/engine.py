@@ -83,8 +83,9 @@ class EngineImpl(Engine):
         def_ = await self.repo.find_define_by_id(define_id)
         if not def_: raise ValueError(f"define not found: {define_id}")
         flow = parse_flow_model(json.loads(def_.content))
-        # 委托查询按「流程定义 name」（05-spi 生效规则），定义表 name 优先于 content name
-        flow.name = def_.name or flow.name
+        # 委托查询按「流程模型 name」（spec 06 §4.5 条款 1.1：迁移基线用 processModel.getName()），
+        # 模型未带 name 才回落定义行 name。deploy 有 def.setName(model.getName()) 不变量，两者恒等。
+        flow.name = flow.name or def_.name
         vars_ = {**(args or {})}
         await self._add_user_info(operator, vars_)
         self._add_auto_gen_title(def_.displayName, vars_)
@@ -221,8 +222,8 @@ class EngineImpl(Engine):
         # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
         def_ = await self.repo.find_define_by_id(inst.defineId)
         flow = parse_flow_model(json.loads(def_.content))
-        # 委托查询按「流程定义 name」（同上，05-spi 生效规则）
-        flow.name = def_.name or flow.name
+        # 委托查询按「流程模型 name」（同上，spec 06 §4.5 条款 1.1），缺失才回落定义行 name
+        flow.name = flow.name or def_.name
         args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
         # issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
         # 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。

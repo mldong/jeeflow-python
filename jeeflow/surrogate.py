@@ -83,7 +83,7 @@ class SurrogateApplier(ABC):
 
     @abstractmethod
     async def expand(self, actors: list[str], process_name: str, task: Any = None) -> list[str]:
-        """actors: 已解析的任务参与者；process_name: 流程定义 name；task: 待落库任务对象（只读上下文）"""
+        """actors: 已解析的任务参与者；process_name: 流程模型 name（缺失回落定义行 name，spec 06 §4.5 条款 1.1）；task: 待落库任务对象（只读上下文）"""
         ...
 
 

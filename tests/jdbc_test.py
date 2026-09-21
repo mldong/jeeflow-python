@@ -726,12 +726,12 @@ async def main():
 
         # ⑮.5 运行期自动生效：一条正例 + 三条同 operator 的负例同时压在 task1 参与者上
         win_start, win_end = now_dt - timedelta(hours=1), now_dt + timedelta(hours=1)
-        await add_srg("py-simple", "leader", "py-agent", start=win_start, end=win_end)      # 正例
-        await add_srg("py-simple", "leader", "py-off", enabled=0)                          # 负例：停用
-        await add_srg("py-simple", "leader", "py-future", start=now_dt + timedelta(days=2),
+        await add_srg("simple", "leader", "py-agent", start=win_start, end=win_end)      # 正例（键=流程模型 name）
+        await add_srg("simple", "leader", "py-off", enabled=0)                             # 负例：停用
+        await add_srg("simple", "leader", "py-future", start=now_dt + timedelta(days=2),
                       end=now_dt + timedelta(days=3))                                       # 负例：窗外
-        await add_srg("py-simple", "leader", "leader")                                      # 负例：自委托
-        await add_srg("simple", "zhangsan", "py-decoy")  # 诱饵：content name ≠ 流程定义 name
+        await add_srg("simple", "leader", "leader")                                          # 负例：自委托
+        await add_srg("py-simple", "zhangsan", "py-decoy")  # 诱饵：流程定义 name ≠ 模型 name（键取模型 name，故不命中）
         r116 = await facade_srg.flow("processInstance/startAndExecute",
                                      {"processDefineId": DEFINE_ID, "operator": "zhangsan"})
         check("⑮ 配好委托后建单成功", r116["code"] == 0, str(r116))
@@ -754,16 +754,16 @@ async def main():
         n_decoy = await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_task_actor"
                                            " WHERE process_task_id = ? AND actor_id = ?",
                                   [task116.id, "py-decoy"])
-        check("⑮ 停用/窗外/自委托/诱饵名 四者均无 actor 行", int(n_decoy) == 0, str(n_decoy))
+        check("⑮ 停用/窗外/自委托/诱饵名(define name) 四者均无 actor 行", int(n_decoy) == 0, str(n_decoy))
         rows_agent, _ = await repo.page_todo_tasks(1, 100, "py-agent")
         check("⑮ 代理人待办分页读得到该单", task116.id in [t.id for t in rows_agent],
               str([t.id for t in rows_agent]))
         rows_leader, _ = await repo.page_todo_tasks(1, 100, "leader")
         check("⑮ 授权人待办分页仍在（未被顶掉）", task116.id in [t.id for t in rows_leader],
               str([t.id for t in rows_leader]))
-        # 委托查询按「流程定义 name」（此处 py-simple，content name=simple）：apply 节点不受诱饵影响
+        # 委托查询按「流程模型 name」（此处 simple，define name=py-simple）：apply 节点不受诱饵影响
         apply116 = [t for t in await repo.find_history_tasks(iid116) if t.taskName == "apply"][0]
-        check("⑮ 按流程定义 name 查委托：诱饵（content name）不追加到 apply 参与者",
+        check("⑮ 按流程模型 name 查委托：诱饵（define name）不追加到 apply 参与者",
               await repo.find_task_actors(apply116.id) == ["zhangsan"],
               str(await repo.find_task_actors(apply116.id)))
 

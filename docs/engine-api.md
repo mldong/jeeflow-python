@@ -21,7 +21,7 @@ engine = EngineImpl(repo, user_prov, idgen, expr_eval)
 | `start_process_instance_by_id(define_id, operator, args=None)` | 启动流程实例（args 为流程变量） |
 | `execute_process_task(task_id, operator, args=None)` | 执行任务（同意/发起/会签拒绝等） |
 | `execute_and_jump_to_end(task_id, operator, args=None)` | 拒绝（REJECT=2）→ 跳结束，实例→45 |
-| `execute_and_jump_task(task_id, operator, args, target_task_name=None)` | 跳转（JUMP=4）/ 退回上一步（ROLLBACK=3） |
+| `execute_and_jump_task(task_id, operator, args, target_task_name=None)` | 跳转（JUMP=4）/ 退回上一步（ROLLBACK=3，血缘版：复活血缘前驱行，见规范 04） |
 | `execute_and_jump_to_first_task_node(task_id, operator, args=None)` | 退回发起人（ROLLBACK_TO_OPERATOR=6）→ 第一个任务节点重执行，参与者=发起人 |
 
 ```python

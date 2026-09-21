@@ -3028,7 +3028,8 @@ async def test_facade_surrogate_save_dirty_enabled_is_off():
     assert s2.enabled == 1, f"未传 enabled 按契约默认 1: {s2.enabled}"
     assert (await facade._ext.get_surrogate("boss2", "leave")).surrogate == "agent2"
 
-    # 边界：显式 "1" 字符串等价 1；空串按未传（对齐 Java toIntDef 默认）
+    # 边界：显式 "1" 字符串等价 1；**空串属脏值 → 0**（契约 06 §4.5 条款 5 写侧新措辞，
+    # 此前本栈把空串当未传落 1，与 Java/PHP/C# 反向）
     r3 = await facade.flow("processSurrogate/save",
                            {"operator": "boss3", "surrogate": "agent3", "processName": "leave",
                             "enabled": "1"})
@@ -3036,5 +3037,14 @@ async def test_facade_surrogate_save_dirty_enabled_is_off():
     r4 = await facade.flow("processSurrogate/save",
                            {"operator": "boss4", "surrogate": "agent4", "processName": "leave",
                             "enabled": ""})
-    assert (await facade._ext.find_surrogate_by_id(int(r4["data"]["id"]))).enabled == 1
+    s4 = await facade._ext.find_surrogate_by_id(int(r4["data"]["id"]))
+    assert s4.enabled == 0, f'空串 enabled 属脏值，不得当启用（实测落 {s4.enabled}）'
+    assert await facade._ext.get_surrogate("boss4", "leave") is None, "空串委托不生效"
+    # 布尔入参按 true→1 / false→0（跨栈同形，不得抛错）
+    for flag, want in ((True, 1), (False, 0)):
+        rb = await facade.flow("processSurrogate/save",
+                               {"operator": "bossb", "surrogate": "agentb", "processName": "leave",
+                                "enabled": flag})
+        assert rb["code"] == 0, rb
+        assert (await facade._ext.find_surrogate_by_id(int(rb["data"]["id"]))).enabled == want,             f"布尔 {flag!r} 应落 {want}"
 

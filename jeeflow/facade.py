@@ -678,8 +678,9 @@ class JeeflowFacade:
         s.startTime = JeeflowFacade._parse_surrogate_time(args.get("startTime"))
         s.endTime = JeeflowFacade._parse_surrogate_time(args.get("endTime"))
         enabled = args.get("enabled", None)
-        if enabled is None or (isinstance(enabled, str) and not enabled.strip()):
-            s.enabled = 1  # 未传/空串 = 契约默认值（06 §4.5 save 参数表：enabled 默认 1）
+        if enabled is None:
+            s.enabled = 1  # 仅"键缺失"才吃契约默认 1（06 §4.5 save 参数表）；
+            # 空串属脏值 → 走下面的 else 落 0（读写两侧口径见 06 §4.5 条款 5）
         else:
             parsed = JeeflowFacade._to_int(enabled)
             # 显式 0 不得被 or 1 吞掉（对齐 Java/Go toIntDef）；

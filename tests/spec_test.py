@@ -3408,7 +3408,7 @@ async def test_i121_p2_rollback_lineage_and_negatives():
         await eng.execute_and_jump_task(apply.id, "applicant", None, "")
         assert False, "无血缘必须报错，不得静默不建单"
     except ValueError as e:
-        assert "20010007" in str(e), f"错码应在 msg：{e}"
+        assert "上一步任务ID为空，无法驳回至上一步处理" in str(e) and "2001000" not in str(e), f"msg 应为固定文案且不含内部码：{e}"
 
     # 老行形状：parent=None
     old = apply
@@ -3418,7 +3418,7 @@ async def test_i121_p2_rollback_lineage_and_negatives():
         await eng.execute_and_jump_task(apply.id, "applicant", None, "")
         assert False, "parent=None 必须报 20010007"
     except ValueError as e:
-        assert "20010007" in str(e), f"实得：{e}"
+        assert "上一步任务ID为空，无法驳回至上一步处理" in str(e) and "2001000" not in str(e), f"实得：{e}"
 
     # ② fork 分支行退到 fork 之前的节点
     eng2, repo2 = setup()
@@ -3434,5 +3434,5 @@ async def test_i121_p2_rollback_lineage_and_negatives():
         await eng2.execute_and_jump_task(branch.id, branch.actorIds[0], None, "")
         assert False, "血缘前驱跨不过 fork 时必须报 20010008"
     except ValueError as e:
-        assert "20010008" in str(e), f"实得：{e}"
+        assert "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务" in str(e) and "2001000" not in str(e), f"实得：{e}"
 

@@ -290,9 +290,9 @@ class EngineImpl(Engine):
     async def _rollback_to_parent(self, flow: FlowModel, inst: ProcessInstance,
                                    task: ProcessTask, operator: str) -> ProcessTask:
         """退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parentTaskId，
-        复活那条历史行；不按模型入边拓扑推。错码写在异常 msg 前缀（出口统一 99999999）。"""
-        NO_LINEAGE = "20010007: 上一步任务ID为空，无法驳回至上一步处理"
-        GUARD = "20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+        复活那条历史行；不按模型入边拓扑推。对外 msg 用固定中文文案、不含引擎内部码（出口统一 99999999）。"""
+        NO_LINEAGE = "上一步任务ID为空，无法驳回至上一步处理"
+        GUARD = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
         parent_id = getattr(task, "parentTaskId", None)
         if not parent_id:
             raise ValueError(NO_LINEAGE)

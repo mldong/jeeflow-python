@@ -218,6 +218,8 @@ class ProcessExtRepository(ABC):
                               filters: Optional[dict] = None,
                               conditions: Optional[list[QueryCondition]] = None) -> tuple[list[ProcessSurrogate], int]: ...
 
-    # GetSurrogate 查询指定时间生效中的委托（enabled=1 + 时间窗内；processName 精确优先，空值全流程兜底）
+    # GetSurrogate 查询指定时间生效中的委托：各作用域（processName 精确优先，空值全流程兜底）
+    # 先按 id 取**最新一条**，再交 ProcessSurrogate.is_effective 裁决这一条（06 §4.5 条款 1.4；
+    # 不得"先按 enabled/时间窗/自委托过滤、再从剩下的取最新"——见 issues/123）
     @abstractmethod
     async def get_surrogate(self, operator: str, process_name: str, at=None) -> Optional[ProcessSurrogate]: ...

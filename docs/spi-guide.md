@@ -196,8 +196,16 @@ engine.set_extensions(EngineExtensions(ext_repository=ext_repo,
 查询本身报错也只记日志不外溢（委托是增强能力，不得打断建单）。
 
 委托查询四判据（内存仓 `MemoryExtRepository` 与 SQL 仓 `JdbcProcessExtRepository` 同答案）：
-空 `processName` 全流程兜底（先精确后兜底，多条命中取 id 最大者）、时间窗任一侧 NULL=不限、
-`surrogate <> operator` 自委托过滤、`enabled` 只认整数 1（脏值按停用，写入侧见 `processSurrogate/save`）。
+空 `processName` 全流程兜底、时间窗任一侧 NULL=不限、`surrogate <> operator` 自委托过滤、
+`enabled` 只认整数 1（脏值按停用，写入侧见 `processSurrogate/save`）。判据本体收口成**单条裁决**
+`ProcessSurrogate.is_effective(operator, at)`（对齐 Java 参考实现 jeeflow-java `6feeae6`）。
+
+⚠️ **取数顺序本身是契约**（spec 06 §4.5 条款 1.4，issues/123）：每个作用域**先按主键 id 取最新的
+一条**（SQL 侧 `ORDER BY id DESC LIMIT 1`，不带 `enabled = 1` / 时间窗 / `surrogate <> ?` 谓词），
+再把这一条交 `is_effective` 裁决；精确作用域判否后**仍要看**全流程作用域的最新一条（跨层兜底）。
+反过来写（先按判据滤掉不生效的、剩下的才取最新）等于"历史上留过一条窗内委托就永久生效"——
+用户随后改停用 / 改到未来 / 改成自委托全都判不动它。窗口比较与写入侧同一把尺子
+（`datetime.now()` 宿主本地时间的 naive 时刻，spec 条款 5 / issues/120），不得拿 UTC 比本地时间戳。
 
 **查询用的流程名取值口径**（spec 06 §4.5 条款 1.1，单点实现 `EngineImpl._surrogate_process_name`）：
 以**流程模型的 `name`** 为准（对齐内置版迁移基线 `processModel.getName()`），模型未带

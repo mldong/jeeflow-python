@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Optional
 
+from .surrogate import surrogate_enabled_on, to_datetime
+
 # ─── LogicFlow JSON Types ──────────────────────────────────────────────────────
 
 @dataclass
@@ -275,7 +277,13 @@ class ProcessDesignHis:
 
 @dataclass
 class ProcessSurrogate:
-    """流程委托代理（v1.1.0，wf_process_surrogate）——授权人把待办委托给代理人"""
+    """流程委托代理（v1.1.0，wf_process_surrogate）——授权人把待办委托给代理人
+
+    生效规则见 ``is_effective``（四判据）：``enabled`` 严格只认 1、被委托人非空且非授权人本人、
+    时间窗覆盖判定时刻（起止为空 = 该侧不限）；``processName`` 为空 = 全部流程。
+    多条并存时由仓储按主键 id **取最新一条再交本方法裁决**
+    （规范 06 §4.5 条款 1.4；不得"先滤生效再取最新"，见 issues/123）。
+    """
     id: int = 0
     processName: str = ""
     operator: str = ""
@@ -287,6 +295,32 @@ class ProcessSurrogate:
     createUser: str = ""
     updateTime: Any = None
     updateUser: str = ""
+
+    def is_effective(self, operator: Optional[str], at: Any = None) -> bool:
+        """四判据（规范 06 §4.5 条款 3/4 ＋ issues/123 §1）：本条委托此刻对该授权人是否生效。
+
+        调用方必须先按 id 选出「该作用域内最新的一条」再问本方法——本方法只裁决单条，不做多条择优。
+        SQL 仓与内存仓必须走同一份判据（08-compliance 用例 27 要求双仓同答案）。
+
+        :param operator: 授权人（判自委托：被委托人等于授权人 ⇒ 不新增、不重复）
+        :param at: 判定时刻；传 ``None`` 表示不做窗口比较（引擎建单路径恒有值）。
+            时刻基准与本栈写入侧同一把尺子（``datetime.now()`` 宿主本地时区的 naive 时间，
+            规范 06 §4.5 条款 5 / issues/120），不得拿 UTC 去比库里的本地时间戳。
+        """
+        if not surrogate_enabled_on(self.enabled):        # 只认 1；0 / 2 / None / 脏值一律不生效
+            return False
+        agent = (self.surrogate or "").strip()
+        if not agent:                                     # 被委托人为空/纯空白 ⇒ 不生效
+            return False
+        if operator is not None and agent == operator:     # 自委托：不新增、不重复
+            return False
+        time = to_datetime(at)
+        if time is None:                                  # 不传判定时刻 ⇒ 不比窗
+            return True
+        start, end = to_datetime(self.startTime), to_datetime(self.endTime)
+        if start is not None and start > time:            # 未到窗
+            return False
+        return end is None or end >= time                 # 起止为 NULL = 该侧不限
 
 @dataclass
 class UserInfo:

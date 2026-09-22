@@ -10,6 +10,7 @@ from typing import Any, Optional, Sequence
 
 from ..model import ProcessDesign, ProcessDesignHis, ProcessSurrogate
 from ..spi import IDGenerator, ProcessExtRepository, QueryCondition
+from ..surrogate import to_datetime   # 判定时刻归一（与内存仓同一把尺子，条款 6 双仓同答案）
 from .base import SqlAdapter, TsIDGenerator, convert_placeholder, _tx_conn_var, _user_str
 
 
@@ -228,24 +229,33 @@ class JdbcProcessExtRepository(ProcessExtRepository):
         return [self._map_surrogate(r) for r in rows], total
 
     async def get_surrogate(self, operator: str, process_name: str, at=None) -> Optional[ProcessSurrogate]:
-        at = at or datetime.now()
-        hit = await self._query_surrogate(operator, process_name, at)
-        if hit:
-            return hit
-        return await self._query_surrogate(operator, "", at)
+        """生效委托查询——与内存仓 ``MemoryExtRepository.get_surrogate`` 同形同答案（06 §4.5 条款 6）。
 
-    async def _query_surrogate(self, operator: str, process_name: str, at) -> Optional[ProcessSurrogate]:
-        sql = f"SELECT {self._SURROGATE_COLS} FROM wf_process_surrogate" \
-              " WHERE operator = ? AND enabled = 1 AND surrogate <> ?"
-        args: list[Any] = [operator, operator]
+        条款 1.4：多条同时命中时按主键 id 取**最新一条**，再交 ``ProcessSurrogate.is_effective``
+        裁决。反过来写（SQL 先把 enabled/窗口/自委托滤掉、剩下的才排序）等价于"历史上出现过一条
+        窗内委托就永久生效"——用户随后改停用、改到未来都不算数，这就是 issues/123 的成因。
+        两个作用域各取自己最新的一条、各自裁决：精确作用域那条判否时仍要看全流程作用域的最新一条
+        （"精确已过期 → 兜底全流程委托"是既有钉住的行为，不得改成判否即止）。
+        """
+        if operator is None:
+            return None
+        at = to_datetime(at) or datetime.now()   # 引擎钟：与写入侧同一把尺子（条款 5 / issues/120）
+        exact = await self._query_newest_surrogate(operator, process_name)
+        if exact is not None and exact.is_effective(operator, at):
+            return exact
+        global_ = await self._query_newest_surrogate(operator, "")
+        return global_ if global_ is not None and global_.is_effective(operator, at) else None
+
+    async def _query_newest_surrogate(self, operator: str, process_name: str) -> Optional[ProcessSurrogate]:
+        """取该授权人在指定流程作用域内**最新的一条**委托；只排序取首行，**不带任何生效判据过滤**
+        （``enabled = 1`` / 时间窗 / ``surrogate <> ?`` 三条谓词已撤，判据落在读出后的单条裁决里）。"""
+        sql = f"SELECT {self._SURROGATE_COLS} FROM wf_process_surrogate WHERE operator = ?"
+        args: list[Any] = [operator]
         if not process_name:
             sql += " AND (process_name IS NULL OR process_name = '')"
         else:
             sql += " AND process_name = ?"
             args.append(process_name)
-        if at is not None:
-            sql += " AND (start_time IS NULL OR start_time <= ?) AND (end_time IS NULL OR end_time >= ?)"
-            args.extend([at, at])
         sql += " ORDER BY id DESC LIMIT 1"
         async with self._conn() as conn:
             rows = await conn.fetchall(self._sql(sql), args)

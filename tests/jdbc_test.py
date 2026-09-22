@@ -725,12 +725,16 @@ async def main():
         check("⑮-④脏值委托查询不生效", await ext_repo.get_surrogate("py-c4", "en-dirty") is None)
 
         # ⑮.5 运行期自动生效：一条正例 + 三条同 operator 的负例同时压在 task1 参与者上
+        # ⚠️ 插入顺序是**刻意的**（issues/123 / 06 §4.5 条款 1.4）：三条负例先插、正例最后插 ⇒
+        #   该作用域的"最新一条"就是那条窗内 + enabled=1 的正例。反过来（正例在最旧）在
+        #   条款 1.4 的新顺序下会被最新那条无效记录裁决成"不生效"，正例格子就成了假红；
+        #   "最新一条无效 ⇒ 压过旧的窗内有效记录"这一形另有 ⑮.5b 与 ⑯ 的 veto 组各钉一遍。
         win_start, win_end = now_dt - timedelta(hours=1), now_dt + timedelta(hours=1)
-        await add_srg("simple", "leader", "py-agent", start=win_start, end=win_end)      # 正例（键=流程模型 name）
         await add_srg("simple", "leader", "py-off", enabled=0)                             # 负例：停用
         await add_srg("simple", "leader", "py-future", start=now_dt + timedelta(days=2),
                       end=now_dt + timedelta(days=3))                                       # 负例：窗外
         await add_srg("simple", "leader", "leader")                                          # 负例：自委托
+        await add_srg("simple", "leader", "py-agent", start=win_start, end=win_end)      # 正例（最新一条，键=流程模型 name）
         await add_srg("py-simple", "zhangsan", "py-decoy")  # 诱饵：流程定义 name ≠ 模型 name（键取模型 name，故不命中）
         r116 = await facade_srg.flow("processInstance/startAndExecute",
                                      {"processDefineId": DEFINE_ID, "operator": "zhangsan"})
@@ -766,6 +770,23 @@ async def main():
         check("⑮ 按流程模型 name 查委托：诱饵（define name）不追加到 apply 参与者",
               await repo.find_task_actors(apply116.id) == ["zhangsan"],
               str(await repo.find_task_actors(apply116.id)))
+
+        # ⑮.5b issues/123 条款 1.4（SQL 仓侧运行期 veto）：在同一 (operator, 流程名) 作用域再压
+        #   一条更"新"的停用记录 ⇒ 旧的窗内有效记录 py-agent **不得被复活**，新单参与者只剩授权人。
+        #   旧形状（SQL 先滤 enabled/窗口/自委托，剩下的才 ORDER BY id DESC）会把 py-agent 捞回来 ⇒ 红。
+        #   查完按 id 删掉，⑮.5 的正例形状与 ⑮.7 的"台账 4 条"计数都不被带坏。
+        veto_row = await add_srg("simple", "leader", "py-veto-off", enabled=0)
+        r_veto = await facade_srg.flow("processInstance/startAndExecute",
+                                       {"processDefineId": DEFINE_ID, "operator": "zhangsan"})
+        check("⑮.5b 压上停用那条后建单成功", r_veto["code"] == 0, str(r_veto))
+        _t_veto = [t for t in await repo.find_doing_tasks(int(r_veto["data"]["processInstanceId"]))
+                   if t.taskName == "task1"][0]
+        actors_veto = await repo.find_task_actors(_t_veto.id)
+        check("⑮.5b 最新一条不生效 ⇒ 压过旧的窗内有效委托（SQL 仓侧不得复活 py-agent）",
+              actors_veto == ["leader"], str(actors_veto))
+        await ext_repo.remove_surrogate(veto_row.id)
+        check("⑮.5b veto 行按 id 清掉（回到 ⑮.5 正例形状）",
+              await ext_repo.find_surrogate_by_id(veto_row.id) is None)
 
         # ⑮.6 未配置扩展仓储：建单不被打断（缺仓储属正常部署形态，不得抛"未配置扩展仓储"）
         eng_noext = EngineImpl(repo, TestUserProv(), TestIDGen())

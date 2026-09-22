@@ -3343,6 +3343,77 @@ async def test_surrogate_query_shuffled_id_parity_memory():
     assert not failures, "内存仓与共用期望表不一致：\n  " + "\n  ".join(failures)
 
 
+# ─── issues/123 · 条款 1.4「取最新一条再裁决」：运行期四形 veto（形状照 Java 6feeae6）────
+#
+# Java 参考实现的 SurrogateAutoApplyTest 新增 4 格在这里同形复刻：
+# **同一作用域内**先配一条「窗内 + enabled=1」的有效旧记录，再配一条更"新"的不生效记录，
+# 断言代理人**不并入**、且旧的那条不得被复活。
+# 旧形状（先按判据滤掉不生效的、再从剩下的取最新）在这四格上必然把旧记录捞回来 ⇒ 红；
+# 变异对照实测见本轮收口记录（改回旧形状：恰好这 4 格红，其余全绿）。
+
+async def _actors_after_newest_row(op: str, **newest) -> list[str]:
+    """夹具：先插窗内有效的**旧**记录，再插一条由 ``newest`` 描述的**新**记录，
+    发起一单后读回 t1 的**持久参与者行**（不看内存对象、不看待办列表空不空）。"""
+    pname = f"surr123-{op}"
+    content = _flow_json([("t1", op)], name=pname)
+    eng, repo, ext, def_id = _surr_harness(pname, content)
+    now = datetime.now()
+    await ext.save_surrogate(ProcessSurrogate(
+        operator=op, surrogate=f"{op}-older-agent", processName=pname,   # 旧：窗内 + enabled=1
+        startTime=now - timedelta(days=1), endTime=now + timedelta(days=1), enabled=1))
+    await ext.save_surrogate(ProcessSurrogate(                            # 新：由它裁决
+        operator=op, surrogate=newest.get("surrogate", f"{op}-new-agent"), processName=pname,
+        startTime=newest.get("start", now - timedelta(days=1)),
+        endTime=newest.get("end", now + timedelta(days=1)),
+        enabled=newest.get("enabled", 1)))
+    # 种子自证：两条台账确实都在（否则"不并入"会因为"根本没数据"空转通过，issues/113 教训）
+    assert len(ext._surrogates) == 2, f"夹具应有 2 条委托台账，实测 {len(ext._surrogates)}"
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    return await _doing_actors(repo, inst.id, "t1")
+
+
+async def _assert_newest_invalid(op: str, why: str, **newest) -> None:
+    actors = await _actors_after_newest_row(op, **newest)
+    assert actors == [op], \
+        f"{why} ⇒ 最新一条不生效时不得并入代理人，更不得复活更旧的那条有效委托：读回 {actors}"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_newest_out_of_window_beats_older_effective_one():
+    """窗外（未到窗）：最新一条把窗口推到未来 ⇒ 旧的那条窗内委托不得再替用户做主。"""
+    now = datetime.now()
+    await _assert_newest_invalid("v123-future", "最新一条窗外",
+                                 start=now + timedelta(days=1), end=now + timedelta(days=2))
+
+
+@pytest.mark.asyncio
+async def test_surrogate_newest_disabled_beats_older_effective_one():
+    """enabled=0：用户把委托停用后，历史上那条窗内委托不得继续生效。"""
+    await _assert_newest_invalid("v123-off", "最新一条 enabled=0", enabled=0)
+
+
+@pytest.mark.asyncio
+async def test_surrogate_newest_dirty_enabled_beats_older_effective_one():
+    """enabled 脏值 2：契约只认 1（06 §4.5 条款 5 读侧白名单式判定），脏值同样判否。"""
+    await _assert_newest_invalid("v123-dirty", "最新一条 enabled 脏值 2（契约：只认 1）", enabled=2)
+
+
+@pytest.mark.asyncio
+async def test_surrogate_newest_self_delegation_beats_older_effective_one():
+    """自委托：自己委托给自己不新增、不重复，也不得让旧的有效委托复活。"""
+    await _assert_newest_invalid("v123-self", "最新一条是自己委托给自己", surrogate="v123-self")
+
+
+@pytest.mark.asyncio
+async def test_surrogate_newest_effective_applies_and_keeps_original():
+    """正向对照（同一夹具）：最新一条 = 窗内 + enabled=1 ⇒ 代理人并入、原人保留；
+    且并入的是**最新那条**的代理人（更旧那条不再参与择优）。"""
+    op = "v123-valid"
+    actors = await _actors_after_newest_row(op)
+    assert actors == [op, f"{op}-new-agent"], \
+        f"最新一条有效时须并入其代理人并保留授权人（不取更旧那条）：读回 {actors}"
+
+
 
 
 # ─── Test 121-P1: 建单不变量 task_parent_id 与行级 isFirstTaskNode ────────────────

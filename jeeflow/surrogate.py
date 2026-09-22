@@ -18,7 +18,9 @@
    建单流程零影响（缺仓储属正常部署形态）。
 
 另含**委托查询四判据**的 Python 侧共用谓词（``surrogate_enabled_on`` / ``to_datetime``），
-供内存仓与门面复用——内存仓与 SQL 仓必须对同一份数据给出同一结论（06 §4.5 条款 6）。
+由 ``model.ProcessSurrogate#is_effective`` 这一条裁决函数复用——四判据只此一处，
+内存仓与 SQL 仓都取「本作用域最新一条 → 交 is_effective 裁决」同一形状，
+必须对同一份数据给出同一结论（06 §4.5 条款 6；顺序本身是条款 1.4 的硬约束，见 issues/123）。
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ __all__ = [
     "ExtRepositorySurrogateApplier",
     "NullSurrogateApplier",
     "surrogate_enabled_on",
+    "surrogate_is_effective",
     "to_datetime",
 ]
 
@@ -72,6 +75,31 @@ def surrogate_enabled_on(value: Any) -> bool:
         return False
 
 
+def surrogate_is_effective(surrogate_row: Any, operator: str, at: Any = None) -> bool:
+    """**单条裁决**（06 §4.5 条款 5 四判据 + issues/123）：这一行委托此刻对该授权人生效吗。
+
+    ⚠️ 调用方必须**先**按主键 id 选出「该授权人在该流程作用域内的最新一条」再问本函数
+    （条款 1.4 + issues/123）——本函数只裁决单条，不做多条择优，也**不回落**。
+    反过来写（先用判据把记录滤掉，剩下的才取最新）等于"历史上留过一条窗内 ``enabled=1``
+    的记录就永久生效"，用户随后新建的窗外 / ``enabled=0`` / 脏值 / 自委托记录全都判不动它
+    ——issues/123 里 13 栈 L2-17/L2-18 全红的病灶。
+
+    判据本体只有 **``ProcessSurrogate.is_effective``** 一处（对齐 Java 参考实现
+    jeeflow-java `6feeae6` 的 ``ProcessSurrogate#isEffective``）；本函数是它的 None 安全包装，
+    供拿不到行对象 / 传入可能为 None 的调用方使用。⚠️ 不要再在这里另写一份四判据——
+    两份判据各自漂移正是 issues/116 §5 / 123 抓过的病灶（内存仓与 SQL 仓必须同答案，条款 6）。
+
+    :param surrogate_row: ``ProcessSurrogate`` 或 None（该作用域内没有记录）
+    :param operator: 授权人（判自委托：被委托人等于授权人 ⇒ 不新增、不重复）
+    :param at: 判定时刻；``None``（或不可解析的文本）= 不做窗口比较。
+               注：两仓的 ``get_surrogate`` 都把"调用方没给时刻"解析成"当前时间"
+               （Python 栈既有入参语义），所以这里的 None 分支只在直接传行裁决时可达。
+    """
+    if surrogate_row is None:
+        return False
+    return surrogate_row.is_effective(operator, at)
+
+
 # ─── 委托应用扩展点 ─────────────────────────────────────────────────────────────
 
 class SurrogateApplier(ABC):
@@ -97,7 +125,8 @@ class NullSurrogateApplier(SurrogateApplier):
 
 
 class ExtRepositorySurrogateApplier(SurrogateApplier):
-    """内置默认实现：逐个参与者查 ``IProcessExtRepository.get_surrogate``（判据①②③④ 由仓储保证）。
+    """内置默认实现：逐个参与者查 ``IProcessExtRepository.get_surrogate``
+    （判据①②③④ 由仓储保证：各作用域先取 id 最新一条，再交 ``ProcessSurrogate#is_effective`` 裁决）。
 
     命中即把代理人（``surrogate``）追加到参与者集合尾部，已存在则去重跳过；
     参与者按**快照**遍历，代理人自身不再级联委托（一单一查，避免 A→B→C 连锁）。
@@ -110,6 +139,8 @@ class ExtRepositorySurrogateApplier(SurrogateApplier):
         result: list[str] = [a for a in (actors or [])]
         if not result:
             return result
+        # 判定时刻 = 引擎钟（naive 本地时间，与本栈写 create_time 同一把尺子，06 §4.5 条款 5 /
+        # issues/120）：窗口比较不得另起 UTC 钟，否则与库里的本地时间戳差整小时数错判窗内窗外。
         now = datetime.now()
         # 入参 process_name 已由引擎侧单点 trim（条款 1.1）；此处**故意不再二次 trim**——
         # 否则引擎回归（把未 trim 的名字传下来）会被这里掩盖，用例捕获不到真实入参。

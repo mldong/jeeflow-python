@@ -7,7 +7,7 @@ from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, Inst
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate,
                     InstanceStatsRow, TaskStatsRow)
 from .spi import ProcessRepository, ProcessExtRepository
-from .surrogate import surrogate_enabled_on, to_datetime
+from .surrogate import to_datetime   # 判据本身已收口到 ProcessSurrogate.is_effective（issues/123）
 
 class MemoryRepository(ProcessRepository):
     def __init__(self):
@@ -583,42 +583,38 @@ class MemoryExtRepository(ProcessExtRepository):
         return rows, len(rows)
 
     async def get_surrogate(self, operator: str, process_name: str, at=None):
-        """生效委托查询——四判据与 SQL 仓 ``JdbcProcessExtRepository.get_surrogate`` **同答案**
-        （issues/116 批次 D / 06 §4.5 条款 6：同栈两仓对同一份数据结论不同即缺陷）：
+        """生效委托查询——与 SQL 仓 ``JdbcProcessExtRepository.get_surrogate`` **同形同答案**
+        （issues/116 批次 D / 06 §4.5 条款 6：同栈两仓对同一份数据结论不同即缺陷）。
 
-        ① 先按 processName 精确查，未命中回落空 processName（全流程兜底）；
-        ② 时间窗 ``start <= at <= end``，任一侧 None/空 = 该侧不限；
-        ③ 自委托过滤 ``surrogate <> operator``（自己委托给自己不生效）；
-        ④ ``enabled`` 只认整数 1，脏值不当启用（``surrogate_enabled_on``）。
+        顺序是契约的一部分（06 §4.5 条款 1.4 / issues/123）：
+        **先在指定流程作用域内按 id 取最新一条**，交 ``ProcessSurrogate.is_effective`` 裁决这一条；
+        该作用域判否（或没有记录）才看"全流程"作用域（各自取自己作用域里最新的一条）。
+        反过来写（先按判据②③④过滤、再从剩下的取 id 最大）等价于"上一条窗内委托把用户后续
+        改停用 / 改到未来 / 改成自委托的设置永久盖掉"⇒ 委托永久生效，正是 issues/123 的成因。
 
-        多条命中取 **id 最大者**（对齐 SQL 侧 ``ORDER BY id DESC LIMIT 1``——此前内存侧取
-        首条命中，同栈两仓在"命中哪一条"上分叉）。
+        四判据本身见 ``ProcessSurrogate.is_effective``（判据① 作用域在本方法这一层）。
         """
-        at = to_datetime(at) or datetime.now()
-        hit = self._pick_surrogate(operator, at,
-                                   lambda s: bool(process_name) and (s.processName or "") == process_name)
-        if hit is not None:
-            return hit
-        return self._pick_surrogate(operator, at, lambda s: not (s.processName or ""))
+        if operator is None:
+            return None
+        at = to_datetime(at) or datetime.now()    # 引擎钟：与写入侧同一把尺子（条款 5 / issues/120）
+        exact = self._newest_surrogate(
+            operator, lambda s: bool(process_name) and (s.processName or "") == process_name)
+        if exact is not None and exact.is_effective(operator, at):
+            return deepcopy(exact)
+        # 精确作用域判否 ≠ 判否即止：全流程作用域的最新一条仍要单独裁决（条款 1.4 尾注）
+        global_ = self._newest_surrogate(operator, lambda s: not (s.processName or ""))
+        return deepcopy(global_) if global_ is not None and global_.is_effective(operator, at) else None
 
-    def _pick_surrogate(self, operator: str, at: datetime, name_match) -> Optional[ProcessSurrogate]:
-        """按四判据筛委托记录，返回 id 最大的一条（无命中 None）"""
+    def _newest_surrogate(self, operator: str, scope_match) -> Optional[ProcessSurrogate]:
+        """取该授权人在指定作用域内 **id 最大的一条**（对齐 SQL 侧 ``ORDER BY id DESC LIMIT 1``）；
+        只择优、不带任何生效判据过滤（判据在 ``is_effective`` 里）。该作用域无记录返回 ``None``。"""
         best = None
         for s in self._surrogates.values():
-            if s.operator != operator or s.surrogate == operator:  # 判据③
-                continue
-            if not surrogate_enabled_on(s.enabled):  # 判据④
-                continue
-            start, end = to_datetime(s.startTime), to_datetime(s.endTime)  # 判据②
-            if start is not None and start > at:
-                continue
-            if end is not None and end < at:
-                continue
-            if not name_match(s):  # 判据①（调用方给精确/兜底两种口径）
+            if s.operator != operator or not scope_match(s):
                 continue
             if best is None or (s.id or 0) > (best.id or 0):
                 best = s
-        return deepcopy(best) if best else None
+        return best
 
     # ── 核心表分页（v1.5.0）──
 

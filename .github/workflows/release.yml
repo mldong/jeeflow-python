@@ -23,3 +23,27 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 
+      # CI 绿必须等于"用户真拉得到"：twine 退 0 只代表 PyPI 收下了包，索引/分发还有一段尾。
+      # 与 jeeflow-java 的 verify-maven-central.sh 同姿势——轮询公网 JSON 到 200 才算发出去。
+      - name: Verify pullable from PyPI
+        env:
+          VER: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          v="${VER#v}"
+          url="https://pypi.org/pypi/jeeflow/${v}/json"
+          deadline=$(( $(date +%s) + 1500 ))   # 25 min
+          while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ]; then echo "✅ jeeflow ${v} 公网可拉（$url）"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::超时 25min 仍 HTTP $code — jeeflow ${v} 在 PyPI 上拉不到，别当已发版"
+              exit 1
+            fi
+            echo "等待 PyPI 分发（当前 $code，剩余 $(( (deadline - $(date +%s)) / 60 ))min）"
+            sleep 30
+          done
+          pip install --disable-pip-version-check --no-cache-dir --pre "jeeflow==${v}" \
+            --index-url https://pypi.org/simple/ \
+            && python -c "import jeeflow, importlib.metadata as m; print('✅ import 成功，版本', m.version('jeeflow'))"
+

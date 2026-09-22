@@ -44,6 +44,8 @@ jobs:
             sleep 30
           done
           pip install --disable-pip-version-check --no-cache-dir --pre "jeeflow==${v}" \
-            --index-url https://pypi.org/simple/ \
-            && python -c "import jeeflow, importlib.metadata as m; print('✅ import 成功，版本', m.version('jeeflow'))"
+            --index-url https://pypi.org/simple/ 2>/dev/null \
+            || { sleep 30; pip install --disable-pip-version-check --no-cache-dir --pre "jeeflow==${v}" \
+                 --index-url https://pypi.org/simple/; }   # JSON 已 200 仍可能差一轮索引同步，重试一次
+          python -c "import jeeflow, importlib.metadata as m; print('✅ import 成功，版本', m.version('jeeflow'))"
 

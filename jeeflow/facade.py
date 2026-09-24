@@ -137,7 +137,7 @@ class JeeflowFacade:
             "id": inst.id, "parentId": inst.parentId, "processDefineId": inst.defineId,
             "state": inst.state, "parentNodeName": inst.parentNodeName,
             "businessNo": inst.businessNo, "operator": inst.operator,
-            "variables": inst.variables,
+            "ext": inst.variables or {},  # issues/124：变量唯一对外出口，空变量出 {} 而非 null
             "formData": self._form_data_of(inst.variables, "f_"),  # issues/15
             "createTime": inst.createTime, "createUser": inst.createUser,
             "jsonObject": graph,
@@ -874,8 +874,7 @@ class JeeflowFacade:
             "performType": int(t.performType) if t.performType is not None else None,
             "taskState": int(t.taskState) if t.taskState is not None else None,
             "operator": t.actorId, "finishTime": self._fmt_time(t.finishTime),
-            "variable": t.variables,
-            "ext": t.variables,  # issues/15：前端读 ext.tf_approvalComment
+            "ext": t.variables,  # issues/15：前端读 ext.tf_approvalComment；issues/124 variable 原串出口下线
         } for t in his]
 
     async def _processInstance_getAssigneeTextData(self, args: dict) -> dict:
@@ -948,6 +947,7 @@ class JeeflowFacade:
             "operator": task.actorId, "formKey": task.formKey,
             "taskActorIdList": actors, "executable": task.is_allowed(operator),
             "ext": t_ext,
+            "taskFormData": self._form_data_of(task.variables, "tf_"),  # issues/15 + 对齐 java 顶层出口（issues/124 G4）
         }
         # taskModel：流程定义中对应节点
         inst = await self._repo.find_instance_by_id(task.processInstanceId)
@@ -1280,17 +1280,12 @@ class JeeflowFacade:
     @staticmethod
     def _task_vo(t) -> dict:
         """任务 VO（instanceDetail 任务列表用，对齐 Java taskVo）"""
-        import json as _json
-        try:
-            variable = _json.dumps(t.variables, ensure_ascii=False) if t.variables else None
-        except Exception:
-            variable = None
         return {
             "id": t.id, "processInstanceId": t.processInstanceId, "taskName": t.taskName,
             "displayName": t.displayName, "taskType": t.taskType, "performType": t.performType,
             "taskState": t.taskState, "operator": t.actorId, "finishTime": t.finishTime,
             "expireTime": t.expireTime, "formKey": t.formKey, "taskParentId": t.parentTaskId,
-            "variable": variable, "createTime": t.createTime, "createUser": t.createUser,
+            "createTime": t.createTime, "createUser": t.createUser,
             "updateTime": t.updateTime, "updateUser": t.updateUser, "taskActorIdList": t.actorIds,
             "taskFormData": JeeflowFacade._form_data_of(t.variables, "tf_"),  # issues/15（_task_vo 无 self，走类名调用）
         }
@@ -1544,7 +1539,7 @@ class JeeflowFacade:
         return {"id": r.id, "parentId": r.parentId, "processDefineId": r.defineId,
                 "state": int(r.state) if r.state is not None else None,
                 "parentNodeName": r.parentNodeName, "businessNo": r.businessNo, "operator": r.operator,
-                "expireTime": self._fmt_time(r.expireTime), "variable": r.variables,
+                "expireTime": self._fmt_time(r.expireTime),
                 "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
                 "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
                 "processDefineName": r.defineName, "processDefineDisplayName": r.defineDisplayName,
@@ -1556,7 +1551,7 @@ class JeeflowFacade:
             "id": r.id, "parentId": r.parentId, "processDefineId": r.defineId,
             "state": int(r.state) if r.state is not None else None,
             "parentNodeName": r.parentNodeName, "businessNo": r.businessNo, "operator": r.operator,
-            "expireTime": self._fmt_time(r.expireTime), "variable": r.variables,
+            "expireTime": self._fmt_time(r.expireTime),
             "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
             "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
             "processDefineName": r.defineName, "processDefineDisplayName": r.defineDisplayName,
@@ -1580,12 +1575,11 @@ class JeeflowFacade:
                 "taskState": int(r.taskState) if r.taskState is not None else None,
                 "operator": r.operator, "finishTime": self._fmt_time(r.finishTime),
                 "expireTime": self._fmt_time(r.expireTime), "formKey": r.formKey,
-                "taskParentId": r.taskParentId, "variable": r.variables,
+                "taskParentId": r.taskParentId,
                 "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
                 "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
                 "processDefineName": r.processDefineName,
                 "processDefineDisplayName": r.processDefineDisplayName,
-                "instanceVariable": r.instanceVariable,
                 "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
                 "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion,
                 "taskFormData": self._form_data_of(ext, "tf_")}  # issues/15

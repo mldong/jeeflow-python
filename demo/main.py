@@ -165,7 +165,7 @@ def _inst_vo(inst: ProcessInstance, def_: ProcessDefine = None) -> dict:
         "id": inst.id, "parentId": inst.parentId, "processDefineId": inst.defineId,
         "state": inst.state, "parentNodeName": inst.parentNodeName,
         "businessNo": inst.businessNo, "operator": inst.operator,
-        "expireTime": _fmt_time(inst.expireTime), "variable": json.dumps(inst.variables, ensure_ascii=False),
+        "expireTime": _fmt_time(inst.expireTime),
         "createTime": _fmt_time(inst.createTime), "createUser": inst.createUser,
         "updateTime": _fmt_time(inst.updateTime), "updateUser": inst.updateUser,
     }
@@ -187,7 +187,6 @@ def _task_vo(t: ProcessTask, inst: ProcessInstance = None, def_: ProcessDefine =
         "taskState": t.taskState, "operator": t.actorId,
         "finishTime": _fmt_time(t.finishTime), "expireTime": _fmt_time(t.expireTime),
         "formKey": t.formKey, "taskParentId": t.parentTaskId,
-        "variable": json.dumps(t.variables, ensure_ascii=False),
         "createTime": _fmt_time(t.createTime), "createUser": t.createUser,
         "updateTime": _fmt_time(t.updateTime), "updateUser": t.updateUser,
     }

@@ -107,7 +107,7 @@ class JeeflowFacade:
         """我发起的流程实例分页（operator 过滤，v1.5.0 补齐）"""
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         rows, total = await self._repo.page_instances(page_num, page_size, operator, self._parse_m_query(args))
         return self._page_data([self._instance_row_to_dict(r) for r in rows], total, page_num, page_size)
 
@@ -158,7 +158,7 @@ class JeeflowFacade:
         define_id = self._to_int(args.get("processDefineId"))
         if not define_id:
             raise ValueError("processDefineId 缺失或非法")
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         flow_args = {k: v for k, v in args.items() if k not in ("processDefineId", "operator")}
         inst = await self._engine.start_process_instance_by_id(define_id, operator, flow_args)
         # issues/56 E28：发起时抄送（f_ccActors）创建 cc 实例（对齐 Java enableCcActors 语义）
@@ -323,7 +323,7 @@ class JeeflowFacade:
         """我的待办分页（operator 作为待办人过滤，v1.5.0 补齐）"""
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
-        actor_id = str(args.get("operator", "user1"))
+        actor_id = self._operator_arg(args)
         rows, total = await self._repo.page_todo_tasks(page_num, page_size, actor_id, self._parse_m_query(args))
         return self._page_data([self._task_row_to_dict(r) for r in rows], total, page_num, page_size)
 
@@ -331,7 +331,7 @@ class JeeflowFacade:
         """我的已办分页（operator 过滤，v1.5.0 补齐）"""
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         rows, total = await self._repo.page_done_tasks(page_num, page_size, operator, self._parse_m_query(args))
         return self._page_data([self._task_row_to_dict(r) for r in rows], total, page_num, page_size)
 
@@ -339,7 +339,7 @@ class JeeflowFacade:
         task_id = self._to_int(args.get("processTaskId"))
         if not task_id:
             raise ValueError("processTaskId 缺失或非法")
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         submit_type = self._to_int(args.get("submitType")) or SUBMIT_AGREE
         flow_args = {k: v for k, v in args.items() if k not in ("processTaskId", "operator")}
         flow_args["submitType"] = submit_type
@@ -414,7 +414,7 @@ class JeeflowFacade:
 
     async def _processDesign_save(self, args: dict) -> dict:
         ext = self._ext_repo()
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         design_id = self._to_int(args.get("id"))
         if not design_id:
             design = ProcessDesign(name=str(args.get("name", "")),
@@ -630,7 +630,7 @@ class JeeflowFacade:
 
     async def _processSurrogate_save(self, args: dict) -> dict:
         ext = self._ext_repo()
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         surrogate_id = self._to_int(args.get("id"))
         if not surrogate_id:
             surrogate = ProcessSurrogate(operator=operator,  # 授权人 = 操作人（新建必有）
@@ -654,7 +654,7 @@ class JeeflowFacade:
         surrogate = await ext.find_surrogate_by_id(surrogate_id)
         if not surrogate:
             raise ValueError("委托记录不存在")
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         self._apply_surrogate_fields(surrogate, args, operator)
         await ext.update_surrogate(surrogate)
         return {"id": surrogate.id}
@@ -895,7 +895,7 @@ class JeeflowFacade:
 
     async def _processInstance_createCCInstance(self, args: dict) -> dict:
         instance_id = self._to_int(args.get("processInstanceId"))
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         actor_ids = self._to_str_list(args.get("actorIds"))
         if not instance_id or not actor_ids:
             raise ValueError("processInstanceId/actorIds 缺失")
@@ -908,7 +908,7 @@ class JeeflowFacade:
 
     async def _processInstance_updateCCStatus(self, args: dict) -> dict:
         instance_id = self._to_int(args.get("processInstanceId"))
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         if not instance_id:
             raise ValueError("processInstanceId 缺失或非法")
         await self._repo.update_cc_status(instance_id, operator)
@@ -918,13 +918,13 @@ class JeeflowFacade:
         """我的抄送分页（v1.3.0）：operator 作为抄送人过滤"""
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
-        actor_id = str(args.get("operator", "user1"))
+        actor_id = self._operator_arg(args)
         rows, total = await self._repo.page_cc_instances(page_num, page_size, actor_id, self._parse_m_query(args))
         return self._page_data([self._cc_row_to_dict(r) for r in rows], total, page_num, page_size)
 
     async def _processTask_detail(self, args: dict) -> dict:
         task_id = self._to_int(args.get("id"))
-        operator = str(args.get("operator", "user1"))
+        operator = self._operator_arg(args)
         if not task_id:
             raise ValueError("id 缺失或非法")
         task = await self._repo.find_task_by_id(task_id)
@@ -1158,6 +1158,21 @@ class JeeflowFacade:
         return {"id": t.id, "taskName": t.taskName, "displayName": t.displayName,
                 "taskState": int(t.taskState) if t.taskState is not None else None,
                 "operator": t.actorId}
+
+    def _operator_arg(self, args: dict) -> str:
+        """归属/操作人入参归一化（issues/129 案 A · spec 06-facade.md:100 补句）。
+
+        空串与**缺键同档**：传 ""（或全空白）视同未传，一并回落 demo 缺省 user1。
+        修前是 `operator = str(args.get(… , "user1"))`——`get` 的缺省只在**键不存在**时生效，
+        显式空串原样穿过落进归属谓词；内存仓储的 `if operator and ...` 又把空串折成
+        "这次不过滤" ⇒ 我的列表读出全库（160 python demo 实测空串档 25 行 vs user1 档 4 行）。
+        门面归一化是第一层，仓储的归属兜底是第二层（memory.py / repository/base.py），两层都要在。
+        """
+        raw = args.get("operator", None)
+        if raw is None:
+            return "user1"
+        s = str(raw)
+        return s if s.strip() else "user1"
 
     @staticmethod
     def _to_str_list(v) -> list:

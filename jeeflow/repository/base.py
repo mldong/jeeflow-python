@@ -108,6 +108,12 @@ _CC_WHITELIST = {
     "cc.actor_id", "cc.state",
 }
 
+# 归属谓词列（issues/129）：这几列定义"这条记录属于谁"，空值绝不能等于"不过滤"。
+# 与门面 _operator_arg 的归属落点（page_instances/done→t.operator、todo→pta.actor_id、
+# cc→cc.actor_id）以及任务分页 join 出来的实例发起人列 pi.operator 一一对齐。
+_OWNERSHIP_COLUMNS = {"t.operator", "pi.operator", "pta.actor_id", "cc.actor_id"}
+
+
 _DEFINE_WHITELIST = {
     "t.id", "t.name", "t.display_name", "t.type", "t.state", "t.version",
     "t.create_time", "t.update_time",
@@ -125,6 +131,13 @@ class JdbcRepository(ProcessRepository):
             if c.column not in whitelist:
                 continue  # 不在白名单，丢弃
             val = c.value
+            # issues/129 案 A 第二层：归属谓词列拿到空值 ⇒ 空页，而不是"这条条件不加"。
+            # 只收归属列——下面那句"空值当作没填"是 m_LIKE_* 等**可选过滤**的通用放行，
+            # 照字面改成"空值即空页"会把可选过滤一起改坏（同 java JdbcProcessRepository.buildWhere）。
+            blank_val = val is None or (isinstance(val, str) and not val.strip())
+            if blank_val and c.operator.upper() == "EQ" and c.column in _OWNERSHIP_COLUMNS:
+                sql += " AND 1=0"
+                continue
             if val is None or val == "":
                 continue
             op = c.operator.upper()

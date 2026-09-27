@@ -101,6 +101,8 @@ class MemoryRepository(ProcessRepository):
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None,
                                 conditions=None):
         """我的抄送分页（v1.3.0）：按抄送人 actor_id 过滤，join 实例 + 定义"""
+        if _ownership_blank(actor_id):
+            return [], 0  # issues/129：cc.actor_id 空串 ⇒ 空页，不得退化成"不过滤=读全库"
         rows = []
         for inst_id, actors in self._cc.items():
             if actor_id and actor_id not in actors:
@@ -147,6 +149,8 @@ class MemoryRepository(ProcessRepository):
 
     async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
                              conditions=None):
+        if _ownership_blank(operator):
+            return [], 0  # issues/129：t.operator 空串 ⇒ 空页（原先 `if operator and` 把空串折成"读全库"）
         rows = []
         for inst in self._instances.values():
             if operator and inst.operator != operator:
@@ -168,6 +172,8 @@ class MemoryRepository(ProcessRepository):
 
     async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None,
                               conditions=None):
+        if _ownership_blank(actor_id):
+            return [], 0  # issues/129：pta.actor_id 空串 ⇒ 空页
         rows = []
         for t in self._tasks.values():
             if t.taskState != TaskState.DOING:
@@ -183,6 +189,8 @@ class MemoryRepository(ProcessRepository):
 
     async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
                               conditions=None):
+        if _ownership_blank(operator):
+            return [], 0  # issues/129：t.operator 空串 ⇒ 空页
         rows = []
         for t in self._tasks.values():
             if t.taskState == TaskState.DOING:
@@ -460,6 +468,16 @@ def _eq_value(v, expect) -> bool:
     return str(v) == str(expect)
 
 
+def _ownership_blank(v) -> bool:
+    """归属谓词拿到空串（含全空白）——issues/129 案 A 第二层的判据。
+
+    None 不算空：内存仓储这些分页方法的 `operator/actor_id` 是**专用入参**，
+    None 是既有 SPI 语义"本次不带归属过滤"，把 None 也判成空会让不带该参的既有调用整体变空页。
+    只有"显式传了个空串"才是本 issue 的病灶（门面第一层已归一化，这一层防绕过门面的调用方）。
+    """
+    return v is not None and isinstance(v, str) and not v.strip()
+
+
 def _match_conditions(conditions, fields: dict) -> bool:
     """条件全匹配（操作符对齐 JDBC buildWhere；列不在字段中则跳过）"""
     for c in conditions or []:
@@ -630,6 +648,8 @@ class MemoryExtRepository(ProcessExtRepository):
 
     async def page_instances(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
                              conditions=None):
+        if _ownership_blank(operator):
+            return [], 0  # issues/129：t.operator 空串 ⇒ 空页（原先 `if operator and` 把空串折成"读全库"）
         rows = []
         for inst in self._instances.values():
             if operator and inst.operator != operator:
@@ -651,6 +671,8 @@ class MemoryExtRepository(ProcessExtRepository):
 
     async def page_todo_tasks(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None,
                               conditions=None):
+        if _ownership_blank(actor_id):
+            return [], 0  # issues/129：pta.actor_id 空串 ⇒ 空页
         rows = []
         for t in self._tasks.values():
             if t.taskState != TaskState.DOING:
@@ -666,6 +688,8 @@ class MemoryExtRepository(ProcessExtRepository):
 
     async def page_done_tasks(self, page_num: int = 1, page_size: int = 10, operator: Optional[str] = None,
                               conditions=None):
+        if _ownership_blank(operator):
+            return [], 0  # issues/129：t.operator 空串 ⇒ 空页
         rows = []
         for t in self._tasks.values():
             if t.taskState == TaskState.DOING:

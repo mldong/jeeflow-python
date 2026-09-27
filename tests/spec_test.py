@@ -882,6 +882,124 @@ async def test_m_query_params():
     assert row["icon"] == "icon-echo", f"designPage icon 应回显保存值: {row.get('icon')}"
 
 
+# ─── issues/129：空串 operator 与缺键同档，归属谓词空值不得读全库 ───────────────────
+
+async def _rows_of(facade, action, args):
+    """走门面的分页出口取行数（code 非 0 直接红）"""
+    r = await facade.flow(action, args)
+    assert r["code"] == 0, (action, args, r)
+    return r["data"]["rows"]
+
+
+async def _seed_two_users(eng, repo, facade):
+    """造"user1 有自己的行 + zhangsan 也有自己的行"——空串档若折成不过滤，两者行数立刻不同"""
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        c1 = f.read()
+    await facade.flow("processDefine/deploy", {"content": c1})
+    d1 = await repo.find_define_by_name("simple")
+    await facade.flow("processInstance/startAndExecute", {"processDefineId": d1.id, "operator": "user1"})
+    r = await facade.flow("processInstance/startAndExecute", {"processDefineId": d1.id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    await facade.flow("processInstance/createCCInstance", {
+        "processInstanceId": r["data"]["processInstanceId"],
+        "operator": "zhangsan", "actorIds": ["user1", "zhangsan"]})
+
+
+async def test_facade_empty_operator_is_same_as_absent_key():
+    """issues/129 案 A 第一层：`{"operator":""}`（含全空白）视同未传，一并回落 demo 缺省 user1。
+
+    修前 `str(args.get("operator", "user1"))` 的缺省只在**键不存在**时生效 ⇒ 空串原样穿过；
+    内存仓储 `if operator and ...` 又把空串折成"这次不过滤" ⇒ 我的列表读全库
+    （160 python demo 实测：空串档 25 行 vs user1 档 4 行，行上是别人的 operator）。
+    """
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    await _seed_two_users(eng, repo, facade)
+
+    # 正向对照：user1 档非空，否则下面"三档相等"是 0==0 的自等假绿
+    assert len(await _rows_of(facade, "processInstance/page", {"operator": "user1"})) == 1
+    assert len(await _rows_of(facade, "processInstance/ccList", {"operator": "user1"})) == 1
+    assert len(await _rows_of(facade, "processTask/doneList", {"operator": "user1"})) >= 1
+    assert len(await _rows_of(facade, "processTask/todoList", {"operator": "leader"})) >= 1
+
+    for action in ("processInstance/page", "processTask/todoList",
+                   "processTask/doneList", "processInstance/ccList"):
+        empty = len(await _rows_of(facade, action, {"operator": ""}))
+        blank = len(await _rows_of(facade, action, {"operator": "   "}))
+        absent = len(await _rows_of(facade, action, {}))
+        as_user1 = len(await _rows_of(facade, action, {"operator": "user1"}))
+        assert empty == absent, f"{action} 空串档应＝缺键档: empty={empty} absent={absent}"
+        assert empty == as_user1, f"{action} 空串档应＝显式 user1 档: empty={empty} user1={as_user1}"
+        assert empty == blank, f"{action} 全空白应与空串同档: empty={empty} blank={blank}"
+
+    # 反向哨兵：待办在 leader 手里，user1 档 0 行。谁把"空值"实现成"不加条件"（本 issue 的生产
+    # 症状），空串档就会读出 leader 那条 ⇒ 这两格挡的是"假修"。
+    assert len(await _rows_of(facade, "processTask/todoList", {"operator": ""})) == 0
+    assert len(await _rows_of(facade, "processTask/todoList", {"operator": "leader"})) >= 1
+
+
+async def test_memory_repo_blank_ownership_yields_empty_page():
+    """issues/129 案 A 第二层（内存仓储）：绕过门面直接传空串归属值 ⇒ 空页。
+
+    同时钉住既有 SPI：`None` 是"本次不带归属过滤"（与 java 里"压根没加这条条件"同形），
+    不动它——只有"显式传了个空串"才是病灶。
+    """
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    await _seed_two_users(eng, repo, facade)
+
+    for blank in ("", "   ", "\t"):
+        rows, total = await repo.page_instances(1, 50, blank)
+        assert (len(rows), total) == (0, 0), f"实例归属列空串应得空页，实得 {len(rows)}/{total}: {blank!r}"
+        rows, total = await repo.page_todo_tasks(1, 50, blank)
+        assert (len(rows), total) == (0, 0), f"待办归属列空串应得空页，实得 {len(rows)}/{total}: {blank!r}"
+        rows, total = await repo.page_done_tasks(1, 50, blank)
+        assert (len(rows), total) == (0, 0), f"已办归属列空串应得空页，实得 {len(rows)}/{total}: {blank!r}"
+        rows, total = await repo.page_cc_instances(1, 50, blank)
+        assert (len(rows), total) == (0, 0), f"抄送归属列空串应得空页，实得 {len(rows)}/{total}: {blank!r}"
+
+    # 正向对照：真值命中，"恒 0"不是假绿
+    rows, total = await repo.page_instances(1, 50, "user1")
+    assert (len(rows), total) == (1, 1), (len(rows), total)
+    rows, total = await repo.page_cc_instances(1, 50, "user1")
+    assert (len(rows), total) == (1, 1), (len(rows), total)
+    # 既有 SPI 语义回归：None＝不带归属过滤（两单都回来）
+    rows, total = await repo.page_instances(1, 50, None)
+    assert total == 2, f"None 仍应是不带归属过滤（本栈既有语义）: {total}"
+
+
+def test_jdbc_build_where_ownership_blank_is_empty_page():
+    """issues/129 案 A 第二层（SQL 仓储）：m_ 条件里归属列拿空值 ⇒ `AND 1=0` 而非"这条不加"。
+
+    只验拼出的 WHERE 文本，不连库（JDBC 套的真实读写在 tests/jdbc_test.py，本机无 MySQL 时跳过）。
+    同时留一格改动面哨兵：**非归属列**的空值仍走通用放行（可选过滤不许改成空页）。
+    """
+    from jeeflow.repository.base import JdbcRepository
+    from jeeflow.spi import QueryCondition
+
+    repo = JdbcRepository.__new__(JdbcRepository)  # _build_where 不碰 self/连接，纯拼串
+    inst_wl = {"t.operator", "t.business_no", "pd.name"}
+
+    for val in ("", "   ", None):
+        sql, args = repo._build_where([QueryCondition("t.operator", "EQ", val)], inst_wl)
+        assert sql == " AND 1=0", f"归属列空值应拼成空页条件，实得 {sql!r}: {val!r}"
+        assert args == (), f"空页条件不该带绑定参数: {args}"
+
+    # 非归属列空值：通用放行保持原样（整条不加）
+    sql, args = repo._build_where([QueryCondition("t.business_no", "LIKE", "")], inst_wl)
+    assert sql == "", f"可选过滤的空值仍应被忽略，实得 {sql!r}"
+    # 非归属列空值 + 归属列真值：归属照常生效，可选那条被忽略
+    sql, args = repo._build_where(
+        [QueryCondition("t.operator", "EQ", "user1"), QueryCondition("t.business_no", "LIKE", "")], inst_wl)
+    assert sql == " AND t.operator = ?" and args == ("user1",), (sql, args)
+    # 归属列的**非空值**不受影响
+    sql, args = repo._build_where([QueryCondition("t.operator", "EQ", "user1")], inst_wl)
+    assert sql == " AND t.operator = ?" and args == ("user1",), (sql, args)
+    # 归属列走非 EQ 操作符时不接管（本 issue 只收 EQ 归属谓词）
+    sql, args = repo._build_where([QueryCondition("t.operator", "LIKE", "")], inst_wl)
+    assert sql == "", f"LIKE 空值仍走通用放行，实得 {sql!r}"
+
+
 @pytest.mark.asyncio
 async def test_design_deploy_redeploy_is_deployed():
     """issues/08：部署/重新部署/设计稿变更的 is_deployed 状态同步"""

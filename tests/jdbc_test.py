@@ -146,12 +146,18 @@ def load_flow(name):
         return f.read()
 
 
+# _STACK_SEQ：本栈 T1 测试 id 的栈位（issues/118 §2.5）。三栈并行连同一台 160 MySQL 时，
+# 旧式 ts_ms*1000+序号 会在同一毫秒生成完全相同的 id ⇒ 主键冲突随机复现。
+# 统一公式 id = ts_ms*4000 + 栈位*1000 + 序号（序号 <1000）；python=1 / node=2 / go=3。
+_STACK_SEQ = 1
+
+
 class TestIDGen(IDGenerator):
     """时间戳 + 序号（避免与数据库已有 ID 冲突）"""
 
     def __init__(self):
         import time
-        self.base = int(time.time() * 1000) * 1000
+        self.base = int(time.time() * 1000) * 4000 + _STACK_SEQ * 1000
         self.n = 0
 
     def next_id(self):

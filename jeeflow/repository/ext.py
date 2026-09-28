@@ -10,7 +10,8 @@ from typing import Any, Optional, Sequence
 
 from ..model import ProcessDesign, ProcessDesignHis, ProcessSurrogate
 from ..spi import IDGenerator, ProcessExtRepository, QueryCondition
-from ..surrogate import to_datetime   # 判定时刻归一（与内存仓同一把尺子，条款 6 双仓同答案）
+from ..surrogate import hydrate_enabled, to_datetime   # 判定时刻归一（与内存仓同一把尺子，条款 6 双仓同答案）
+# hydrate_enabled：驱动把 INT 列回读成字符串时的**边界类型还原**（issues/130 案 A），只在装行处调用
 from .base import SqlAdapter, TsIDGenerator, convert_placeholder, _tx_conn_var, _user_str
 
 
@@ -236,6 +237,10 @@ class JdbcProcessExtRepository(ProcessExtRepository):
         窗内委托就永久生效"——用户随后改停用、改到未来都不算数，这就是 issues/123 的成因。
         两个作用域各取自己最新的一条、各自裁决：精确作用域那条判否时仍要看全流程作用域的最新一条
         （"精确已过期 → 兜底全流程委托"是既有钉住的行为，不得改成判否即止）。
+
+        判据④只认整数 1（issues/130 案 A）；INT 列被驱动回读成字符串时在**装行处**还原
+        （`_map_surrogate` → `surrogate.hydrate_enabled`），判据本身不吃串，这类驱动的宿主上
+        委托也不会再被静默判废。
         """
         if operator is None:
             return None
@@ -271,8 +276,16 @@ class JdbcProcessExtRepository(ProcessExtRepository):
 
     @staticmethod
     def _map_surrogate(r: Sequence[Any]) -> ProcessSurrogate:
+        # issues/130 案 A：读侧判据④只认整数 1，而 `enabled` 是 INT 列（schema: enabled INT NULL DEFAULT 1）。
+        # 宿主拿到的是 1 还是 '1' 由驱动/接入层决定：本栈 aiomysql/asyncpg 默认按列类型转换成 int，
+        # 但文本协议经代理/网关（列类型被报成 VAR_STRING）、列类型漂移与遗留 VARCHAR 台账都会交出 '1'
+        # （PHP 同栈已由 PDO 缓冲查询实证，jeeflow-php cf93d8f）。类型还原是**驱动边界**的活
+        # （Java rs.getInt / Go Scan(&int) / C# GetFieldValue<int> 同理），不在装行处做就会让这类宿主
+        # 的委托整体判废且零告警。
+        # ⚠️ 只规范整数串被还原（'abc' / '1.0' / ' 1' / '01' 原样交判据 ⇒ 停用），不是把宽的接受集合放回去；
+        # 台账读回（page/detail）同样在这里拿回 int，前端不会被驱动类型漏出的字符串打到。
         return ProcessSurrogate(id=r[0], processName=r[1], operator=r[2], surrogate=r[3],
-                                startTime=r[4], endTime=r[5], enabled=r[6], createTime=r[7],
+                                startTime=r[4], endTime=r[5], enabled=hydrate_enabled(r[6]), createTime=r[7],
                                 createUser=_user_str(r[8]), updateTime=r[9], updateUser=_user_str(r[10]))
 
 

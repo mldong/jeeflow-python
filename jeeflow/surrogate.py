@@ -21,9 +21,14 @@
 由 ``model.ProcessSurrogate#is_effective`` 这一条裁决函数复用——四判据只此一处，
 内存仓与 SQL 仓都取「本作用域最新一条 → 交 is_effective 裁决」同一形状，
 必须对同一份数据给出同一结论（06 §4.5 条款 6；顺序本身是条款 1.4 的硬约束，见 issues/123）。
+
+判据④自 issues/130 案 A 起**只认整数 1**（``'1'`` / ``1.0`` / ``True`` 等等价写法一律停用）。
+整数列被驱动回读成字符串属**边界事实**，由 ``hydrate_enabled`` 在内置 SQL 仓储装行处还原后再交判据，
+判据本身不为此放宽；内存仓无驱动，故不还原（Python 对象类型即列值类型）。
 """
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Optional
@@ -32,6 +37,7 @@ __all__ = [
     "SurrogateApplier",
     "ExtRepositorySurrogateApplier",
     "NullSurrogateApplier",
+    "hydrate_enabled",
     "surrogate_enabled_on",
     "surrogate_is_effective",
     "to_datetime",
@@ -39,6 +45,9 @@ __all__ = [
 
 # 时间文本格式（06 §4.5 契约格式 yyyy-MM-dd HH:mm:ss，另兼容 ISO T 与纯日期，对齐门面 _parse_surrogate_time）
 _TIME_LAYOUTS = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d")
+
+# 规范十进制整数串（issues/130 案 A 读侧边界还原的唯一接受形状）：无空格、无前导零、无小数点、无正号
+_CANONICAL_INT = re.compile(r"^-?(0|[1-9]\d*)$")
 
 
 # ─── 四判据共用谓词（内存仓 / SQL 仓同答案的 Python 侧保证）────────────────────
@@ -60,19 +69,56 @@ def to_datetime(value: Any) -> Optional[datetime]:
 
 
 def surrogate_enabled_on(value: Any) -> bool:
-    """判据④：``enabled`` **只有 1 生效**；脏值不得当启用。
+    """判据④：``enabled`` **只认整数 1**，其余一律停用（issues/130 案 A，owner 2026-09-28
+    「我习惯用 1 和 0，和 java 版保持一致」）。
 
-    - ``None`` / ``0`` / 其它整数（含 2）→ 停用；
-    - 不可解析为整数的脏值（``"abc"`` / ``""``）→ 停用（各栈脏值默认方向必须一致，
-      05-spi 明列 PHP ``(int)'abc'``→0 停用为正确方向、C# 回落 1 启用为相反默认）；
-    - 等价写法 ``"1"`` / ``1.0`` / ``True`` 按启用处理（对齐 SQL 侧 ``enabled = 1`` 的隐式转换）。
+    严形状对齐 Java 参考实现 ``ProcessSurrogate#isEffective`` 的
+    ``Integer.valueOf(1).equals(enabled)``：类型必须是整数**且**值必须是 1。
+    故 ``"1"`` / ``1.0`` / ``True`` / ``2`` / ``-1`` / ``"x"`` / ``None`` / ``""`` 全判**停用**
+    （``True`` 在 Python 里 ``== 1`` 恒成立，须显式排除 ``bool``）。
+
+    ⚠️ 本判据**刻意不"等价"于** SQL 侧 ``enabled = 1`` 的隐式转换——MySQL 会把 ``'1'`` / ``1.0``
+    折成 1 判启用，两条判据的宽严并不一致；那句"与隐式转换等价"正是 issues/130 的病灶来源
+    （php / python / node 三栈由它漂成宽，java / go / rust / moon / csharp 五栈一直是严）。
+    脏值默认方向各栈必须一致（05-spi：不可解析脏值 → 停用是正确方向，回落 1 启用是相反默认）。
+
+    ⚠️ 收窄只影响**自定义 SPI 仓储**直传非整数 ``enabled`` 的路径（issues/130 §2）：
+    内置 SQL 仓储该列是 INT 列（``tests/schema/schema-mysql.sql``: ``enabled INT NULL DEFAULT 1``），
+    门面写入侧 ``processSurrogate/save`` 另有 ``_to_int`` 归一（显式脏值落 0、键缺失落契约默认 1），
+    两条路八栈同结论，L2-17/L2-18 不受影响。
+    ⚠️ **整数列被读回成字符串**（驱动边界事实，见下）**不在这里放行**——那是边界的活，
+    见 hydrate_enabled；判据本身不吃串。
     """
-    if value is None:
-        return False
-    try:
-        return int(float(value)) == 1
-    except (TypeError, ValueError):
-        return False
+    return isinstance(value, int) and not isinstance(value, bool) and value == 1
+
+
+def hydrate_enabled(value: Any) -> Any:
+    """**驱动边界**还原：把整数列被读回成字符串的形态换回 ``int``，再交 surrogate_enabled_on
+    裁决（issues/130 案 A 的读侧另一半；owner 2026-09-28 定案第 2 条）。
+
+    为什么需要：``enabled`` 在现网是 INT 列，而"宿主语言拿到的到底是 ``1`` 还是 ``'1'``"是
+    **驱动/接入层**决定的，不由引擎负责：PHP 同栈已由 PDO 实证（缓冲查询
+    ``ATTR_EMULATE_PREPARES`` / ``ATTR_STRINGIFY_FETCHES`` 把数值列一律回读成字符串 ``'1'``，
+    见 jeeflow-php ``cf93d8f``）；Python 侧 ``aiomysql`` / ``asyncpg`` 默认在客户端按列类型转换
+    （给 ``1``），但**并不保证**——文本协议经代理/网关把列类型报成 VAR_STRING、ORM 列类型漂移
+    （SQLite 无类型/TEXT 声明的列、遗留 VARCHAR 台账）、以及业务方自定义 SPI 仓储自己拼行，
+    都会交出 ``'1'``。判据④自案 A 起只认整数，缺这一层还原时这类宿主的委托会
+    **整体静默判废且零告警**（Java ``rs.getInt``、Go ``Scan(&int)``、C# ``GetFieldValue<int>``
+    干的是同一件事：类型还原属于边界，不属于判据）。
+
+    ⚠️ 这**不是**把接受集合放宽回去：只认**规范整数串** ``-?(0|[1-9]\\d*)``（无空格、无前导零、
+    无小数点、无正号），``'1.0'`` / ``' 1'`` / ``'01'`` / ``'1abc'`` / ``'abc'`` / ``''`` 以及
+    ``True`` / ``1.0`` 一律原样返回，由判据④判停用。特别地 ``'2'`` 会被还原成整数 ``2``——
+    还原只补类型，值不是 1 照样停用，可见"还原"与"判宽"是两回事。
+    ⚠️ 调用点只允许在**内置 SQL 仓储装行处**（``repository/ext.JdbcProcessExtRepository._map_surrogate``）；
+    内存仓 ``MemoryExtRepository`` **刻意不还原**——它没有驱动，Python 对象类型就是列值本身，
+    在此还原等于伪造 INT 列的类型事实，也就废掉了 issues/130 §2 那条"SPI 直传脏值即停用"
+    的判别力（``tests/spec_test.py`` 的脏值矩阵正钉在这上面）。业务方自定义 SPI 仓储读出非整数
+    属 §2 的分叉源，按案 A 由实现侧自行还原（``hydrate_enabled`` 即为此导出）。
+    """
+    if isinstance(value, str) and _CANONICAL_INT.match(value):
+        return int(value)
+    return value
 
 
 def surrogate_is_effective(surrogate_row: Any, operator: str, at: Any = None) -> bool:

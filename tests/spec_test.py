@@ -1,6 +1,7 @@
 """jeeflow SPEC 合规测试 — Python 版（boot2 兼容）"""
 import json
 import os
+import sqlite3
 import sys
 import pytest
 from datetime import datetime, timedelta
@@ -11,7 +12,9 @@ from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowI
 from jeeflow.engine import KEY_AUTO_GEN_TITLE
 from jeeflow.facade import JeeflowFacade
 from jeeflow.memory import MemoryExtRepository
-from jeeflow.surrogate import NullSurrogateApplier, surrogate_enabled_on, to_datetime
+from jeeflow.repository.ext import JdbcProcessExtRepository
+from jeeflow.surrogate import (NullSurrogateApplier, hydrate_enabled, surrogate_enabled_on,
+                               to_datetime)
 from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance,
                            ProcessSurrogate, ProcessTask, TaskState, InstanceState, UserInfo)
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
@@ -3077,12 +3080,29 @@ async def test_surrogate_query_four_criteria_memory_repo():
     此前内存仓缺判据③ 自委托过滤、判据④ 用 `!= 1` 松判、多条命中取首条（SQL 取最新）→ 同栈两仓分叉。"""
     ext = MemoryExtRepository()
     now = datetime.now()
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, ext)
 
     async def add(pn, sur, start=None, end=None, enabled=1, op="boss"):
         s = ProcessSurrogate(operator=op, surrogate=sur, processName=pn,
                              startTime=start, endTime=end, enabled=enabled)
         await ext.save_surrogate(s)
         return s
+
+    async def add_api(pn, sur, enabled=1, op="boss"):
+        """同 `add`，但**经门面写侧**（API 形状 `processSurrogate/save`）。
+
+        写侧 `_to_int` 在落库前把 `"1"` / `True` 归一成整数 1、把 `""` / `"abc"` 落成 0，
+        而 `add` 走的是 SPI 仓储 `save_surrogate` 原值直存（库里存什么形状就是什么形状）。
+        判据④自 issues/130 案 A 起只认整数 1，内存仓**刻意不做**驱动边界还原
+        （`surrogate.hydrate_enabled` 只挂在内置 SQL 仓装行处），所以"④ `"1"` 等价启用"
+        这一档只能由**写侧门面**兑现 —— 用它做断言却不走门面，漏的就是 helper 这一层。
+        """
+        r = await facade.flow("processSurrogate/save",
+                              {"operator": op, "surrogate": sur, "processName": pn,
+                               "enabled": enabled})
+        assert r["code"] == 0, r
+        return r
 
     # ① 精确优先 → 未命中回落空 processName 兜底（各组用独立授权人，免被兜底行串味）
     await add("", "g1", op="c1")
@@ -3124,10 +3144,333 @@ async def test_surrogate_query_four_criteria_memory_repo():
     for dirty, why in ((0, "零停用"), (None, "NULL非启用"), ("abc", "脏值"), (2, "非1整数")):
         await add("en-" + why, "agent", enabled=dirty, op="c4")
         assert await ext.get_surrogate("c4", "en-" + why) is None, f"④ {why} 不得生效"
-    await add("en-str", "agent", enabled="1", op="c4")
+    # "1" 等价启用属**写侧门面**语义（案 A：判据只认整数，门面 _to_int 先把 "1" 折成整数 1 再落库）；
+    # 原值直存 SPI 仓储的 "1" 一律停用，见 test_surrogate_enabled_strict_integer_one_dirty_matrix。
+    await add_api("en-str", "agent", enabled="1", op="c4")
     assert (await ext.get_surrogate("c4", "en-str")).surrogate == "agent", '④ "1" 等价启用'
     assert surrogate_enabled_on("abc") is False and surrogate_enabled_on(1) is True
     assert to_datetime("2026-13-45") is None, "不可解析时间 = 该侧不限"
+
+
+# ─── issues/130 案 A：判据④「只认整数 1」的脏值矩阵（owner 2026-09-28 拍板）─────────
+
+_DIRTY_ENABLED = [
+    ("整数 2（非 1 值）", 2),
+    ("字符串 '1'（本案收窄的分叉点）", "1"),
+    ("浮点 1.0（同上）", 1.0),
+    ("布尔 True（Python 里 True == 1 恒成立）", True),
+    ("不可解析文本 'x'", "x"),
+    ("None（NULL）", None),
+    ("空串 ''", ""),
+    ("负整数 -1", -1),
+    # 边界还原只认规范整数串 `-?(0|[1-9]\d*)`：下面三档看着"接近 1"，`int()`/浮点转换都会折成 1，
+    # 但按案 A 既不还原也不生效（内存仓没有驱动，原值就是这些字符串；SQL 仓的还原规则见
+    # test_surrogate_hydrate_enabled_boundary_rules / …_sql_driver_stringified_…）
+    ("字符串 '1.0'（带小数点，非规范整数串）", "1.0"),
+    ("字符串 ' 1'（带空格，非规范整数串）", " 1"),
+    ("字符串 '01'（前导零，非规范整数串）", "01"),
+]
+
+
+async def _row_and_start(enabled):
+    """按给定 ``enabled`` **原值**直存一条窗内委托，发起一单。
+
+    刻意走 ``ext.save_surrogate``（SPI 仓储边界），**不经**门面 ``processSurrogate/save``
+    的 ``_to_int`` 归一——130 §2 说清了：脏值只在自定义 SPI 仓储直传时才显形；
+    走门面的话 `"1"` 早在写入侧被折成整数 1，矩阵就测不到判据本身了。
+    """
+    eng, repo = setup()
+    ext = MemoryExtRepository()
+    facade = JeeflowFacade(eng, repo, ext)
+    now = datetime.now()
+    await ext.save_surrogate(ProcessSurrogate(
+        operator="leader", surrogate="lisi", processName="simple",
+        startTime=now - timedelta(days=1), endTime=now + timedelta(days=1), enabled=enabled))
+    iid = await _start(facade, await _deploy(facade, "01-simple.json"), "zhangsan")
+    return repo, ext, facade, (await repo.find_doing_tasks(iid))[0]
+
+
+@pytest.mark.asyncio
+async def test_surrogate_enabled_strict_integer_one_dirty_matrix():
+    """issues/130 案 A：``enabled`` 只认**整数 1**，脏值矩阵逐档断"委托不生效"。
+
+    ⚠️ 判据打在**委托是否命中**的行为上（三处读数），不打在 ``surrogate_enabled_on`` 的返回值上：
+    ① 建单后读回**持久化的参与者集合**——代理人真没混进 actor 表才算数（issues/116 首版正是
+       只在内存里绿了、落库静默无效）；② 代理人待办列表为空；③ 台账查询 ``get_surrogate`` 判否。
+    正向整数 1 单独一档把这三处断言**反向**钉一遍，证明负向档不是"根本没数据"的空转。
+    """
+    for label, dirty in _DIRTY_ENABLED + [("整数 0（契约停用值）", 0)]:
+        repo, ext, facade, task1 = await _row_and_start(dirty)
+        actors = await repo.find_task_actors(task1.id)
+        assert actors == ["leader"], f"{label}：代理人不得进参与者集合，实测 {actors}"
+        assert await ext.get_surrogate("leader", "simple") is None, f"{label}：台账查询不得命中"
+        rt = await facade.flow("processTask/todoList", {"operator": "lisi"})
+        assert rt["data"]["rows"] == [], f"{label}：lisi 待办应为空 {rt['data']['rows']}"
+        # 停用 ≠ 删档；且原值得是原判据的那个形状（否则矩阵被写入侧偷偷归一了）
+        rows, total = await ext.page_surrogates(1, 10, {"operator": "leader"})
+        assert total == 1, f"{label}：台账行须还在（判据只判生效，不判存在）"
+        assert type(rows[0].enabled) is type(dirty) and rows[0].enabled == dirty, \
+            f"{label}：SPI 仓储存的原值被改写了，实测 {rows[0].enabled!r}"
+
+    # 正向对照：整数 1 → 三处读数全部反向成立
+    repo, ext, facade, task1 = await _row_and_start(1)
+    actors = await repo.find_task_actors(task1.id)
+    assert actors == ["leader", "lisi"], f"整数 1 必须生效，实测 {actors}"
+    hit = await ext.get_surrogate("leader", "simple")
+    assert hit is not None and hit.surrogate == "lisi", f"整数 1 台账应命中: {hit}"
+    rt = await facade.flow("processTask/todoList", {"operator": "lisi"})
+    assert [t["id"] for t in rt["data"]["rows"]] == [str(task1.id)], f"lisi 待办: {rt['data']['rows']}"
+
+    # 谓词本体档位收口（辅助层：行为三处已各自钉过，这里只钉"接受集合 = {整数 1}"本身）
+    for dirty in (2, "1", 1.0, True, "x", None, "", -1, 0):
+        assert surrogate_enabled_on(dirty) is False, f"判据④：{dirty!r} 不得算启用"
+    assert surrogate_enabled_on(1) is True, "判据④：只有整数 1 算启用"
+
+
+# ─── issues/130 案 A 的**读侧另一半**：驱动串化在仓储边界还原（对齐 php cf93d8f）────────
+
+# 建表列类型对齐 tests/schema/schema-mysql.sql:113-128（`enabled INT NULL DEFAULT 1`）：
+# 刻意用 INTEGER 声明 enabled，让 SQLite 的列亲和性与 MySQL INT 列同形（数字文本入库折成整数，
+# 'abc' 这类存不进去的原样留文本）——"驱动把整数列回读成字符串"才是本节的唯一变量。
+_SURROGATE_DDL = ("CREATE TABLE wf_process_surrogate ("
+                  " id INTEGER PRIMARY KEY, process_name TEXT, operator TEXT, surrogate TEXT,"
+                  " start_time TEXT, end_time TEXT, enabled INTEGER DEFAULT 1, create_time TEXT,"
+                  " create_user TEXT, update_time TEXT, update_user TEXT)")
+
+
+class _SqliteConn:
+    """`repository.base.SqlConnection` 的 sqlite3 实现（同步驱动套 async 壳，与 MysqlConnection 同形状）。
+
+    时间列一律用契约文本 `yyyy-MM-dd HH:mm:ss` 绑定（调用方显式给 createTime/updateTime），
+    不依赖 sqlite3 的 datetime 默认适配器（Python 3.12 起已标记弃用、后续版本会移除），
+    免得本格变成版本红。
+    """
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    async def execute(self, sql, args):
+        self._raw.execute(sql, tuple(args))
+        self._raw.commit()
+
+    async def fetchone(self, sql, args):
+        return self._raw.execute(sql, tuple(args)).fetchone()
+
+    async def fetchall(self, sql, args):
+        return self._raw.execute(sql, tuple(args)).fetchall()
+
+    async def begin(self):
+        pass    # autocommit 语义（与 aiomysql pool autocommit=True 同），事务由 with_tx 显式控制
+
+    async def commit(self):
+        self._raw.commit()
+
+    async def rollback(self):
+        pass
+
+
+class _SqliteAdapter:
+    """委托表单表适配器（placeholder `?` = 核心 SQL 原生风格，无需转换）"""
+
+    placeholder = "?"
+
+    def __init__(self, raw):
+        self._conn = _SqliteConn(raw)
+
+    async def acquire(self):
+        return self._conn
+
+    async def release(self, conn):
+        pass
+
+
+class _StringifyDriverConn:
+    """**假驱动层**：把委托行里 `enabled` 那一列换成**字符串**回读——复现"整数列到宿主手里成了 `'1'`"
+    这一类驱动/接入层边界事实（PHP 同栈实证：PDO 缓冲查询 `ATTR_EMULATE_PREPARES` /
+    `ATTR_STRINGIFY_FETCHES` 把数值列一律回读成字符串；Python 侧 aiomysql/asyncpg 默认按列类型转成 int，
+    但文本协议经代理/网关把列类型报成 VAR_STRING、列类型漂移、遗留 VARCHAR 台账、业务方自己拼行都给出 `'1'`）。
+
+    刻意只串化 `enabled` 一列（`_SURROGATE_COLS` 第 7 列）：id 精度、时间列类型那些是别的驱动议题，
+    混进来会让本节的变异信号失真（摘掉 `hydrate_enabled` 时只有委托这格红）。
+    """
+
+    _ENABLED_INDEX = 6      # id, process_name, operator, surrogate, start_time, end_time, **enabled**, ...
+    _SURROGATE_WIDTH = 11   # COUNT(*) 等窄行原样放行
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    @classmethod
+    def _wire_row(cls, sql, row):
+        if row is None or len(row) != cls._SURROGATE_WIDTH or "wf_process_surrogate" not in sql:
+            return row
+        v = row[cls._ENABLED_INDEX]
+        if isinstance(v, bool) or not isinstance(v, int):
+            return row
+        out = list(row)
+        out[cls._ENABLED_INDEX] = str(v)
+        return tuple(out)
+
+    async def execute(self, sql, args):
+        return await self._inner.execute(sql, args)
+
+    async def fetchone(self, sql, args):
+        return self._wire_row(sql, await self._inner.fetchone(sql, args))
+
+    async def fetchall(self, sql, args):
+        return [self._wire_row(sql, r) for r in await self._inner.fetchall(sql, args)]
+
+    async def begin(self):
+        await self._inner.begin()
+
+    async def commit(self):
+        await self._inner.commit()
+
+    async def rollback(self):
+        await self._inner.rollback()
+
+
+class _StringifyDriverAdapter:
+    placeholder = "?"
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def acquire(self):
+        return _StringifyDriverConn(await self._inner.acquire())
+
+    async def release(self, conn):
+        await self._inner.release(conn._inner)
+
+
+def _surrogate_sql_ext(stringify_driver: bool) -> tuple:
+    """真 SQLite + 真 `JdbcProcessExtRepository` SQL；`stringify_driver=True` 时中间插一层假驱动。"""
+    raw = sqlite3.connect(":memory:")
+    raw.execute(_SURROGATE_DDL)
+    base = _SqliteAdapter(raw)
+    adapter = _StringifyDriverAdapter(base) if stringify_driver else base
+    return raw, JdbcProcessExtRepository(adapter, _TestIDGen())
+
+
+def test_surrogate_hydrate_enabled_boundary_rules():
+    """**边界还原纯函数**判据（案 A 的另一半）：只把**规范整数串**换回 int，判据本身不吃串。
+
+    与"判据放宽"的分界就在这里：`'2'` 被还原成整数 `2`，判据④照样停用——还原只补**类型**、不放**值**；
+    而 `'1.0'` / `' 1'` / `'01'` / `'1abc'` 不是规范整数串，原样返回 ⇒ 停用（`int()` 强转换个地方做
+    就会把它们全折成 1，那才是把 `(int)` 搬个家的假修复）。
+    """
+    # ① 还原：规范整数串 → int（值不变，只是类型回来）
+    for text, want in (("1", 1), ("0", 0), ("2", 2), ("-1", -1), ("10", 10), ("1234567890123", 1234567890123)):
+        got = hydrate_enabled(text)
+        assert got == want and type(got) is int, f"边界还原：{text!r} 应换回整数 {want}，实测 {got!r}"
+
+    # ② 不还原：非规范整数串 + 非字符串一律原样返回（连类型都不动）
+    for keep in ("1.0", " 1", "1 ", "01", "+1", "1abc", "abc", "", " ", ".", "0x1", "١"):
+        got = hydrate_enabled(keep)
+        assert got == keep and type(got) is str, f"边界不还原：{keep!r} 须原样返回，实测 {got!r}"
+    for keep in (1, 0, 2, -1, 1.0, 0.0, True, False, None, [1], {"enabled": 1}):
+        got = hydrate_enabled(keep)
+        assert got is keep or got == keep and type(got) is type(keep), \
+            f"边界只动字符串列值：{keep!r} 被改写成 {got!r}"
+
+    # ③ 还原 + 判据④的连携：交判据前完成，判据本身一个字不吃串
+    assert surrogate_enabled_on(hydrate_enabled("1")) is True, "驱动串化的整数 1 在边界还原后必须算启用"
+    for dirty in ("2", "0", "-1", "1.0", " 1", "01", "abc", "", "1abc"):
+        assert surrogate_enabled_on(hydrate_enabled(dirty)) is False, \
+            f"边界还原不得把 {dirty!r} 变成启用（判据④只认整数 1）"
+    for non_str in (1.0, True, None, [1]):
+        assert surrogate_enabled_on(hydrate_enabled(non_str)) is False, \
+            f"边界还原不吃 {non_str!r}，判据④同样停用"
+
+    # ④ SPI 实现侧义务（issues/130 §2）：自定义仓储传非整数按停用，要生效得自己先还原
+    row = ProcessSurrogate(operator="boss", surrogate="lisi", enabled="1")
+    assert row.is_effective("boss") is False, "判据不吃串：自定义 SPI 仓储原样传 '1' 就是停用"
+    row.enabled = hydrate_enabled(row.enabled)
+    assert row.is_effective("boss") is True, "实现侧在装行处先还原，才交得出'与内置 SQL 仓同答案'"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_sql_driver_stringified_enabled_is_hydrated_at_boundary():
+    """案 A 读侧的**驱动边界格**：SQL 路整数列被驱动回读成字符串 `'1'` 时，委托必须照常命中。
+
+    为什么用"真 SQLite + 假驱动层"而不是真库：本栈 pytest 不落真 MySQL（`tests/jdbc_test.py` 要
+    160 那台机，本机恒不可用），而"INT 列回读成字符串"是**驱动层**事实、不是 SQL 事实——
+    所以 SQL 与行映射全程真跑（含 `ORDER BY id DESC LIMIT 1`），只在取回行后把 `enabled` 换成字符串，
+    等价复现 PHP 侧 `ATTR_STRINGIFY_FETCHES` 的形态。⚠️ 变异对照（本格的判别力自证，已实测）：摘掉
+    `repository/ext._map_surrogate` 里的 `hydrate_enabled` → ① 当场翻红（该用例其后的档随之中断），
+    而脏值矩阵与其余各档全绿；只收窄判据不补边界还原，这类驱动的宿主上委托会**整体静默判废且零告警**。
+    """
+    # ① 真表落整数 1 → 驱动给 '1' → 仍须命中（判据前已在边界还原）
+    raw, ext = _surrogate_sql_ext(stringify_driver=True)
+    s = ProcessSurrogate(operator="opOne", surrogate="agentOne", processName="flowOne", enabled=1,
+                         createTime="2026-01-01 00:00:00", updateTime="2026-01-01 00:00:00")
+    await ext.save_surrogate(s)
+    seed = raw.execute("SELECT typeof(enabled), enabled FROM wf_process_surrogate WHERE id=?",
+                       (s.id,)).fetchone()
+    assert seed == ("integer", 1), f"种子自证：真表列值须是整数 1（驱动串化才是唯一变量），实测 {seed}"
+    hit = await ext.get_surrogate("opOne", "flowOne")
+    assert hit is not None and hit.surrogate == "agentOne", \
+        "驱动把 INT 列回读成字符串 '1' 时 SQL 路仍须命中（案 A 的驱动边界还原，漏做＝这类宿主的委托整体判废）"
+    assert type(hit.enabled) is int and hit.enabled == 1, \
+        f"交判据④之前，行里的 enabled 须已在仓储边界还原成整数，实测 {hit.enabled!r}"
+
+    # ② 台账读回同一条路：装行处补类型，'1' 不得漏进门面 detail/page 的 JSON
+    back = await ext.find_surrogate_by_id(s.id)
+    assert type(back.enabled) is int, f"find_surrogate_by_id 装行须还原成 int，实测 {back.enabled!r}"
+    rows, total = await ext.page_surrogates(1, 10, {"operator": "opOne"})
+    assert total == 1 and type(rows[0].enabled) is int, \
+        f"page_surrogates 装行须还原成 int（否则前端拿到字符串），实测 total={total} {rows and rows[0].enabled!r}"
+
+    # ③ 还原只补类型不放值：驱动给 '2' → 整数 2 → 判据④照样停用
+    s2 = ProcessSurrogate(id=900002, operator="opTwo", surrogate="agentTwo", processName="flowTwo",
+                          enabled=2, createTime="2026-01-01 00:00:00", updateTime="2026-01-01 00:00:00")
+    await ext.save_surrogate(s2)
+    assert raw.execute("SELECT typeof(enabled) FROM wf_process_surrogate WHERE id=900002").fetchone()[0] \
+        == "integer", "种子自证：③ 那行真表是整数 2（驱动给 '2'）"
+    assert await ext.get_surrogate("opTwo", "flowTwo") is None, \
+        "边界还原不是把 (int) 强转换个地方做：'2' 还原成整数 2 后判据④仍停用"
+
+    # ④ 真表列值是文本脏值：边界原样交判据 ⇒ 停用
+    raw.execute("INSERT INTO wf_process_surrogate (id, process_name, operator, surrogate, enabled)"
+                " VALUES (900001, 'flowTxt', 'opTxt', 'agentTxt', 'abc')")
+    txt_seed = raw.execute("SELECT typeof(enabled), enabled FROM wf_process_surrogate WHERE id=900001").fetchone()
+    assert txt_seed == ("text", "abc"), f"种子自证：INT 列存不进 'abc'，真表里就是文本，实测 {txt_seed}"
+    assert await ext.get_surrogate("opTxt", "flowTxt") is None, \
+        "边界只认规范整数串：真表列值是文本 'abc' 仍判停用"
+
+    # ⑤ 双仓同答案（用例 27 / 06 §4.5 条款 6）不因收窄 + 边界还原而破：同一个列值两仓同一个结论
+    mem = MemoryExtRepository()
+    await mem.save_surrogate(ProcessSurrogate(operator="opOne", surrogate="agentOne",
+                                              processName="flowOne", enabled=1))
+    mem_hit = await mem.get_surrogate("opOne", "flowOne")
+    assert mem_hit is not None and mem_hit.surrogate == hit.surrogate, \
+        f"同一份「整数 1」列值，内存仓与串化驱动的 SQL 仓必须同结论：SQL={hit} 内存={mem_hit}"
+
+    # ⑥ 说明性一格（不是判据放宽，是**列类型事实**）：SPI 直传 "1" 进 INT 列，入库即被折成整数 1，
+    #    于是 SQL 路命中、内存路停用（内存仓没有列亲和性，原值就是 '1'）。两仓对同一个**列值**同答案，
+    #    对同一个 **Python 入参**可以不同答案——这正是脏值矩阵留在内存仓、边界还原留在 SQL 仓的理由。
+    s3 = ProcessSurrogate(id=900003, operator="opCoerce", surrogate="agentCoerce",
+                         processName="flowCoerce", enabled="1",
+                         createTime="2026-01-01 00:00:00", updateTime="2026-01-01 00:00:00")
+    await ext.save_surrogate(s3)     # 绕过门面，与原值直存
+    coerced = raw.execute("SELECT typeof(enabled), enabled FROM wf_process_surrogate WHERE id=900003").fetchone()
+    assert coerced == ("integer", 1), f"列亲和性自证：INT 列把 '1' 折成整数 1，实测 {coerced}"
+    assert (await ext.get_surrogate("opCoerce", "flowCoerce")).surrogate == "agentCoerce", \
+        "列里真是整数 1 就必须生效（不管它是写侧归一还是列亲和性折出来的）"
+    mem_raw = MemoryExtRepository()
+    await mem_raw.save_surrogate(s3)
+    assert await mem_raw.get_surrogate("opCoerce", "flowCoerce") is None, \
+        "内存仓存的是原值字符串 '1'（没有列亲和性）⇒ 判据④停用，脏值矩阵那格同样成立"
+
+    # ⑦ 对照组：同一套 SQL、同一份列值，只是**不插**假驱动层（＝本栈 aiomysql/asyncpg 的默认形态）
+    #    也必须命中 ⇒ 证明 ① 那格的唯一变量就是"驱动给串"，而不是假驱动层自带了生效能力。
+    _, ext_plain = _surrogate_sql_ext(stringify_driver=False)
+    p = ProcessSurrogate(id=900004, operator="opPlain", surrogate="agentPlain", processName="flowPlain",
+                         enabled=1, createTime="2026-01-01 00:00:00", updateTime="2026-01-01 00:00:00")
+    await ext_plain.save_surrogate(p)
+    plain_hit = await ext_plain.get_surrogate("opPlain", "flowPlain")
+    assert plain_hit is not None and type(plain_hit.enabled) is int and plain_hit.surrogate == "agentPlain", \
+        f"原生类型驱动那侧同样命中且列值仍是整数（两形态同答案）: {plain_hit}"
 
 
 @pytest.mark.asyncio

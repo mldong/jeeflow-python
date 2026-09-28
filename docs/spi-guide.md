@@ -200,6 +200,13 @@ engine.set_extensions(EngineExtensions(ext_repository=ext_repo,
 `enabled` 只认整数 1（脏值按停用，写入侧见 `processSurrogate/save`）。判据本体收口成**单条裁决**
 `ProcessSurrogate.is_effective(operator, at)`（对齐 Java 参考实现 jeeflow-java `6feeae6`）。
 
+⚠️ **判据④只认整数，不吃"等价写法"**（issues/130 案 A，与 Java `Integer.valueOf(1).equals(enabled)` 同阵营）：
+`'1'` / `1.0` / `True` 与 `0` / `2` / 脏值 / `None` 一律不生效。整数列被读回成字符串（`enabled` 建表是
+`INT`；文本协议经代理/网关、列类型漂移、遗留 VARCHAR 台账，PHP 同栈已由 PDO 缓冲查询实证）属**边界事实**，
+由 `surrogate.hydrate_enabled()` 在内置 SQL 仓装行处（`JdbcProcessExtRepository._map_surrogate`）还原后再交判据 ——
+只认规范整数串 `-?(0|[1-9]\d*)`，`'abc'` / `'1.0'` / `' 1'` / `'01'` 不还原，**不是**把 `(int)` 强转换个地方做。
+内存仓没有驱动，**刻意不还原**；业务方自定义 SPI 仓储传非整数按停用，需要生效就实现侧自己还原。
+
 ⚠️ **取数顺序本身是契约**（spec 06 §4.5 条款 1.4，issues/123）：每个作用域**先按主键 id 取最新的
 一条**（SQL 侧 `ORDER BY id DESC LIMIT 1`，不带 `enabled = 1` / 时间窗 / `surrogate <> ?` 谓词），
 再把这一条交 `is_effective` 裁决；精确作用域判否后**仍要看**全流程作用域的最新一条（跨层兜底）。

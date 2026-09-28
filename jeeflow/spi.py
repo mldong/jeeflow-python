@@ -221,5 +221,9 @@ class ProcessExtRepository(ABC):
     # GetSurrogate 查询指定时间生效中的委托：各作用域（processName 精确优先，空值全流程兜底）
     # 先按 id 取**最新一条**，再交 ProcessSurrogate.is_effective 裁决这一条（06 §4.5 条款 1.4；
     # 不得"先按 enabled/时间窗/自委托过滤、再从剩下的取最新"——见 issues/123）
+    # 判据④ enabled **只认整数 1**（issues/130 案 A，对齐 Java Integer.valueOf(1).equals(enabled)）：
+    # '1' / 1.0 / True 这类等价写法与 0 / 2 / 脏值 / None 一律不生效。整数列被驱动回读成字符串
+    # 要在**实现侧**装行处先还原（内置 SQL 仓走 surrogate.hydrate_enabled，只认规范整数串），
+    # 引擎读侧不再做宽松转换；自定义 SPI 仓储传非整数即按停用。
     @abstractmethod
     async def get_surrogate(self, operator: str, process_name: str, at=None) -> Optional[ProcessSurrogate]: ...

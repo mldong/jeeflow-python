@@ -611,6 +611,12 @@ class MemoryExtRepository(ProcessExtRepository):
         改停用 / 改到未来 / 改成自委托的设置永久盖掉"⇒ 委托永久生效，正是 issues/123 的成因。
 
         四判据本身见 ``ProcessSurrogate.is_effective``（判据① 作用域在本方法这一层）。
+
+        ⚠️ 本仓**不做** issues/130 案 A 的读侧类型还原（``surrogate.hydrate_enabled`` 只在内置 SQL
+        仓装行处调用）：内存仓没有驱动，存进来的 Python 类型就是"列值类型"本身，在这里把 ``'1'``
+        折成 ``1`` 等于伪造 INT 列的类型事实，也就废掉"SPI 直传脏值即停用"的判别力
+        （``tests/spec_test.py`` 脏值矩阵钉的正是这一条）。要 ``'1'`` 生效请走门面写侧
+        （``processSurrogate/save`` 的 ``_to_int`` 归一，落库存的就是整数 1）。
         """
         if operator is None:
             return None

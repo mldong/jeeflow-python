@@ -3625,3 +3625,276 @@ async def test_i121_p2_rollback_lineage_and_negatives():
     except ValueError as e:
         assert "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务" in str(e) and "2001000" not in str(e), f"实得：{e}"
 
+
+# ─── issues/126 案 A · 任务行 expire_time 由**建单路径**按节点到期表达式真算 ───────
+#
+# 基准＝boot2 内置版的三处写（ProcessTaskServiceImpl:213 普通建单 / :386 回退新建 /
+# :524 会签建单——:524 那处**串行推进也回调它**，故会签首位与推进出的下一位是两次写）
+# + jeeflow 多出的会签并行分支，共**五处**同一把尺子（卡面 §1.8 更正：五处不是四处）；
+# Java 参考实现是 jeeflow-java d9e9397 的 ProcessInstance.applyExpireTime + FlowUtil.processTime，
+# 第五处由 cb541d4 的 applyNodeExpireTime 补上。
+# 本栈原形状是**一句都不赋**（engine 建单只写 createTime，expire_time 恒 NULL）
+# ⇒ 配了到期表达式的节点在逾期统计里永不逾期，且跨栈各给一个答案（本案病灶）。
+#
+# ⚠️ 判据是**同一行内 expire − create ≈ 表达式偏移**，不是"这一列非空"——
+#    只判非空就会被 now() 占位写法蒙过（建单即逾期，差值≈0），那正是病灶的形状。
+
+def _expire_flow(specs, name: str = "expire126") -> str:
+    """线性流程 start → specs… → end。
+    spec = (节点 id, assignee, 到期表达式[, 会签类型])；
+    到期表达式传 ``_MISSING`` = **不写 expireTime 键**（"节点没配"的第一档），
+    传 ``""`` = 写了空串（第二档），其余原样进 properties（设计器 JSON 同位置）。"""
+    nodes = [{'id': 'start', 'type': 'snaker:start', 'properties': {}, 'text': {'value': '开始'}}]
+    edges = []
+    prev = 'start'
+    for spec in specs:
+        tid, assignee, expr = spec[0], spec[1], spec[2]
+        cs = spec[3] if len(spec) > 3 else ""
+        props = {"assignee": assignee, "taskType": 0, "performType": "1" if cs else 0}
+        if cs:
+            props["countersignType"] = cs
+        if expr is not _MISSING:
+            props["expireTime"] = expr
+        nodes.append({'id': tid, 'type': 'snaker:task', 'properties': props, 'text': {'value': tid}})
+        edges.append({'id': f"e_{prev}_{tid}", 'sourceNodeId': prev, 'targetNodeId': tid,
+                      'properties': {}})
+        prev = tid
+    nodes.append({'id': 'end', 'type': 'snaker:end', 'properties': {}, 'text': {'value': '结束'}})
+    edges.append({'id': f"e_{prev}_end", 'sourceNodeId': prev, 'targetNodeId': 'end',
+                  'properties': {}})
+    return json.dumps({"name": name, "displayName": "到期时间测试", "type": "approval",
+                       "nodes": nodes, "edges": edges}, ensure_ascii=False)
+
+
+def _expire_harness(content: str, define_name: str = "expire126", user_prov=None):
+    """引擎直用 + 直接落定义行（到期表达式只在本组用例里出现，flows/ 副本一律不配）"""
+    repo = MemoryRepository()
+    eng = EngineImpl(repo, user_prov or _TestUserProv(), _TestIDGen(), _TestExprEval())
+    return eng, repo, _seed_define(repo, define_name, content)
+
+
+async def _row(repo, inst_id: int, node: str, want_tasks: int = 1):
+    doing = [t for t in await repo.find_doing_tasks(inst_id) if t.taskName == node]
+    assert len(doing) == want_tasks, f"节点 {node} 进行中任务数 = {len(doing)}, want {want_tasks}"
+    return doing[0]
+
+
+def _assert_expire_after_create(row, want_seconds: int, why: str) -> float:
+    """同行差值判据（不拿 now 当基准）。带宽 [N−5s, N+60s] 同 Java 用例：
+    Java 的 toLocalDateTime(Date) 落在**秒级**而行上 createTime 带毫秒 ⇒ 实测 7199.x s；
+    本栈反过来（process_time 里的 now() 晚于建单那一刻的 now）⇒ 差值略大于 N。
+    带宽只用来夹住量纲，**绝不用来放过 now() 占位**（那种写法差值≈0）。"""
+    assert row.expireTime is not None, f"{why}：配了到期表达式的行必须带 expire_time"
+    create, expire = to_datetime(row.createTime), to_datetime(row.expireTime)
+    assert create is not None and expire is not None, \
+        f"{why}：行上的时间列读不回（create={row.createTime!r} expire={row.expireTime!r}）"
+    delta = (expire - create).total_seconds()
+    assert want_seconds - 5 <= delta <= want_seconds + 60, \
+        f"{why}：同行 expire − create = {delta}s，want ≈{want_seconds}s；差值≈0 就是 now() 占位（建单即逾期）"
+    return delta
+
+
+@pytest.mark.asyncio
+async def test_i126_relative_expression_applies_at_creation():
+    """正向①/写点①「普通建单」：节点配 "2h" ⇒ 到期时间＝建单那一刻 + 2 小时。
+    四档后缀全喂一遍（s/m/h/d），d 档钉的是"日历加天"而不是乘 86400 秒。"""
+    for expr, seconds in (("2h", 2 * 3600), ("90s", 90), ("30m", 1800), ("1d", 86400)):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]))
+        inst = await eng.start_process_instance_by_id(def_id, "applicant")
+        _assert_expire_after_create(await _row(repo, inst.id, "approve"), seconds,
+                                    f'普通建单配 "{expr}"')
+
+
+@pytest.mark.asyncio
+async def test_i126_expression_naming_a_variable_takes_its_value():
+    """正向②：表达式是个变量名 ⇒ 取**实例变量**里该变量的值当到期时间（process_time 档①）。
+    这格同时钉住建单三处的变量源＝实例变量：写错成行上那份的话这里读不到 dueAt，
+    差值判据会直接报"没带 expire_time"。"""
+    eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", "dueAt")]))
+    inst = await eng.start_process_instance_by_id(def_id, "applicant",
+                                                  {"dueAt": "2026-12-31 10:00:00"})
+    row = await _row(repo, inst.id, "approve")
+    assert to_datetime(row.expireTime) == datetime(2026, 12, 31, 10, 0, 0), \
+        f"变量档取的是实例变量里那份值，实得 {row.expireTime!r}"
+
+
+@pytest.mark.asyncio
+async def test_i126_variable_tier_accepts_three_value_shapes():
+    """档①的三种值形状（Java 的 Date / Long / String 三档）：datetime 对象、毫秒时间戳、
+    契约格式文本必须给出**同一时刻**；本栈写时间用 naive 本地钟，与 datetime 同档。"""
+    want = datetime(2026, 12, 31, 10, 0, 0)
+    content = _expire_flow([("approve", "leader", "due")])
+    for label, value in (("datetime 对象", want),
+                         ("毫秒时间戳", int(want.timestamp() * 1000)),
+                         ("契约格式文本", "2026-12-31 10:00:00")):
+        eng, repo, def_id = _expire_harness(content)
+        inst = await eng.start_process_instance_by_id(def_id, "applicant", {"due": value})
+        got = to_datetime((await _row(repo, inst.id, "approve")).expireTime)
+        assert got is not None and abs((got - want).total_seconds()) < 1, \
+            f"{label} 档应解析成 {want}，实得 {got!r}"
+
+
+@pytest.mark.asyncio
+async def test_i126_variable_tier_beats_relative_tier():
+    """易错点②：变量档**优先于**相对档 —— args 里真有个键叫 "2h" 时取的是变量值，
+    不是 now+2h（把两档顺序写反的栈会在这格报红）。"""
+    eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", "2h")]))
+    inst = await eng.start_process_instance_by_id(def_id, "applicant",
+                                                  {"2h": "2030-01-01 00:00:00"})
+    got = to_datetime((await _row(repo, inst.id, "approve")).expireTime)
+    assert got == datetime(2030, 1, 1, 0, 0, 0), f"变量档应压过相对档，实得 {got!r}"
+
+
+@pytest.mark.asyncio
+async def test_i126_unknown_variable_value_type_falls_through():
+    """易错点①「落穿」：变量存在但值类型不认识（list / float）⇒ **继续**走相对档，
+    不是提前 return None（Java/C# 都是落穿；改成提前返回的栈这两格都红）。"""
+    for expr, value, seconds in (("2h", ["not-a-time"], 2 * 3600),
+                                 ("3h", 7200.5, 3 * 3600)):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]))
+        inst = await eng.start_process_instance_by_id(def_id, "applicant", {expr: value})
+        _assert_expire_after_create(await _row(repo, inst.id, "approve"), seconds,
+                                    f"值类型 {type(value).__name__} 应落穿到相对档 {expr}")
+
+
+@pytest.mark.asyncio
+async def test_i126_unconfigured_node_keeps_column_null():
+    """负向①：节点没配 ⇒ 这一列必须留 NULL，不许造默认值（含不许写 now()）。
+    三档形状都要判：键缺失、空串、纯空白（空白串 Java 也不当"没配"，而是交给
+    processTime 求值 ⇒ 解析不出 ⇒ 同样是 NULL，出口形状一致）。"""
+    for label, expr in (("键缺失", _MISSING), ("空串", ""), ("纯空白", "   ")):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]))
+        inst = await eng.start_process_instance_by_id(def_id, "applicant")
+        row = await _row(repo, inst.id, "approve")
+        assert row.expireTime is None, f"{label} 这一档不得被赋任何时间，实得 {row.expireTime!r}"
+
+
+@pytest.mark.asyncio
+async def test_i126_unparsable_expression_stays_null():
+    """负向②：表达式解析不出来 ⇒ NULL，而不是退回 now()（那等于静默造一个"建单即逾期"的值）。
+    逐档喂与 Java 同款拒收形状：非时间串、相对档前缀不是整数（"xh"）、只到日、ISO 带 T、
+    复合相对串（"2h30m"）。"""
+    for expr in ("not-a-time", "xh", "2026-12-31", "2026-12-31T10:00:00", "2h30m"):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]))
+        inst = await eng.start_process_instance_by_id(def_id, "applicant", {"dueAt": "x"})
+        row = await _row(repo, inst.id, "approve")
+        assert row.expireTime is None, f"表达式 {expr!r} 解析不出必须 NULL，实得 {row.expireTime!r}"
+
+
+@pytest.mark.asyncio
+async def test_i126_parallel_countersign_applies_to_every_member():
+    """写点③「并行会签全员」：Java 的并行循环是**每位成员**都算，不是只算首位。
+    同一流程里没配的 apply 行同时充当对照——配了才有，不是一律赋。"""
+    eng, repo, def_id = _expire_harness(_expire_flow(
+        [("apply", "applicant", _MISSING), ("cs", "userA,userB,userC", "2h", "PARALLEL")]))
+    inst = await eng.start_process_instance_by_id(def_id, "applicant")
+    apply = await _row(repo, inst.id, "apply")
+    assert apply.expireTime is None, "对照：未配的 apply 行必须 NULL"
+    await eng.execute_process_task(apply.id, "applicant")
+    members = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "cs"]
+    assert [t.actorIds for t in members] == [["userA"], ["userB"], ["userC"]], \
+        "前置：并行会签应全员建行（行上 actorIds 即参与者）"
+    for t in members:
+        _assert_expire_after_create(t, 2 * 3600, f"并行会签成员 {t.actorIds}")
+
+
+@pytest.mark.asyncio
+async def test_i126_sequential_first_and_advanced_member_both_get_expire():
+    """写点②「串行会签首位成员」＋写点⑤「推进出的下一位成员」：两行都按节点表达式算。
+    判据＝首成员与第二成员各自**同一行内** expire − create ≈ 2h（带宽 [2h−5s, 2h+60s]）。
+
+    ⚠️ 本格的期望是**被参考实现改过来的**（原来钉的是"推进档留 NULL"），不是为了让测试变绿：
+       基准侧 boot2 的串行推进是**回调** createCountersignTask（ProcessTaskServiceImpl:485，
+       内含 :524 那处到期写）⇒ 第二、三位成员同样带到期时间；java 同批把这一支补上第五处写点
+       （commit cb541d4，绕过 createTask 直建 ⇒ 聚合根开 applyNodeExpireTime 上同一把尺子，
+       用例形状同款：首成员与推进第二成员都带到期）。
+       卡面 §1.8「写点是五处，不是四处」即此。留 NULL 才是跨栈分叉。"""
+    eng, repo, def_id = _expire_harness(_expire_flow(
+        [("apply", "applicant", _MISSING), ("cs", "userA,userB", "2h", "SEQUENTIAL")]))
+    inst = await eng.start_process_instance_by_id(def_id, "applicant")
+    apply = await _row(repo, inst.id, "apply")
+    await eng.execute_process_task(apply.id, "applicant")
+    first = await _row(repo, inst.id, "cs")          # 先断"行读到了"
+    assert first.actorIds == ["userA"]
+    _assert_expire_after_create(first, 2 * 3600, "串行会签首位成员")
+    await eng.execute_process_task(first.id, "userA")
+    second = await _row(repo, inst.id, "cs")         # 先断"推进出的那一行读到了"
+    assert second.actorIds == ["userB"], "前置：串行会签应推进到下一位"
+    _assert_expire_after_create(second, 2 * 3600, "串行会签推进出的第二成员")
+
+
+@pytest.mark.asyncio
+async def test_i126_sequential_without_expression_leaves_both_rows_null():
+    """上一格的负向同夹具（去掉 expireTime）：首成员与推进出的第二成员**都**留空，
+    即写点⑤不得为"没配的节点"造任何默认值。
+    ⚠️ "行没读到"与"值为空"分开断：行由 :func:`_row` 断（数不对就报"进行中任务数 = 0"），
+       值由 expireTime is None 断。合成一句的话推进本身坏掉这格也会恒真。"""
+    eng, repo, def_id = _expire_harness(_expire_flow(
+        [("apply", "applicant", _MISSING),
+         ("cs", "userA,userB", _MISSING, "SEQUENTIAL")]))
+    inst = await eng.start_process_instance_by_id(def_id, "applicant")
+    apply = await _row(repo, inst.id, "apply")
+    await eng.execute_process_task(apply.id, "applicant")
+    first = await _row(repo, inst.id, "cs", want_tasks=1)
+    assert first.actorIds == ["userA"], "前置：首位成员建行"
+    assert first.expireTime is None, f"未配的节点不得造默认值，实得 {first.expireTime!r}"
+    await eng.execute_process_task(first.id, "userA")
+    second = await _row(repo, inst.id, "cs", want_tasks=1)
+    assert second.actorIds == ["userB"], "前置：串行会签应推进到下一位"
+    assert second.expireTime is None, f"推进档同理留空，实得 {second.expireTime!r}"
+
+
+@pytest.mark.asyncio
+async def test_i126_rollback_new_row_gets_expire_from_node_expression():
+    """写点④「回退/跳转新建」：复活的那一行按**被回退掉的节点**（＝prev）的表达式重算。"""
+    eng, repo, def_id = _expire_harness(
+        _expire_flow([("b1", "rbk-zhang", "2h"), ("b2", "rbk-wang", _MISSING)], "expire126rbk"))
+    inst = await eng.start_process_instance_by_id(def_id, "applicant")
+    b1 = await _row(repo, inst.id, "b1")
+    await eng.execute_process_task(b1.id, "rbk-zhang")
+    b2 = await _row(repo, inst.id, "b2")
+    assert b2.expireTime is None, "对照：b2 没配 ⇒ NULL"
+    await eng.execute_and_jump_task(b2.id, "rbk-wang", None, "")
+    revived = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b1"
+               and t.id != b1.id]
+    assert len(revived) == 1, f"前置：回退应新建恰好一条 b1 行，实得 {len(revived)}"
+    _assert_expire_after_create(revived[0], 2 * 3600, "回退新建")
+
+
+class _TimeNamedUserProv(_TestUserProv):
+    """把指定用户的 realName 造成"合法时刻文本"。u_* 只落在**行上**（实例变量写回按
+    issues/97 排除 u_*），所以它是一对天然的可区分探针：拿它当到期表达式，
+    读随行那份变量 ⇒ 得到那个时刻；误读实例变量 ⇒ 得到发起人的 realName（解析不出 ⇒ NULL）。"""
+    TIME_NAMES = {"rbk-op": "2027-01-15 09:00:00"}
+
+    async def get_user(self, user_id: str):
+        u = await super().get_user(user_id)
+        if user_id in self.TIME_NAMES:
+            u.realName = self.TIME_NAMES[user_id]
+        return u
+
+
+@pytest.mark.asyncio
+async def test_i126_rollback_uses_row_variables_not_instance_variables():
+    """卡面 §1「变量源两档」的判别格：回退新建用**随行拷贝那份**变量（boot2 的 hisVariable），
+    建单三处用**实例变量**。探针 u_realName 只在行上有效 ⇒
+    两档写反就在"回退新建拿到 NULL"这一侧直接报红。"""
+    content = _expire_flow([("b1", "rbk-op", "u_realName"), ("b2", "rbk-wang", _MISSING)],
+                           "expire126src")
+    eng, repo, def_id = _expire_harness(content, "expire126src", user_prov=_TimeNamedUserProv())
+    inst = await eng.start_process_instance_by_id(def_id, "applicant")
+    b1 = await _row(repo, inst.id, "b1")
+    assert b1.expireTime is None, \
+        "起点自证：建单那一刻实例变量里的 u_realName 是发起人的（解析不出 ⇒ NULL）"
+    await eng.execute_process_task(b1.id, "rbk-op")
+    b2 = await _row(repo, inst.id, "b2")
+    await eng.execute_and_jump_task(b2.id, "rbk-wang", None, "")
+    inst_after = await repo.find_instance_by_id(inst.id)
+    assert inst_after.variables.get("u_realName") != "2027-01-15 09:00:00", \
+        "前置：探针必须只活在行上，否则这格没有判别力"
+    revived = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b1"
+               and t.id != b1.id]
+    assert len(revived) == 1, f"前置：回退应新建恰好一条 b1 行，实得 {len(revived)}"
+    assert to_datetime(revived[0].expireTime) == datetime(2027, 1, 15, 9, 0, 0), \
+        f"回退新建必须按随行那份变量取值，实得 {revived[0].expireTime!r}"
+

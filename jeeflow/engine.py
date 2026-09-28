@@ -1,7 +1,7 @@
 """引擎核心——对标 Java EngineImpl"""
 import logging
-import json, time, random
-from datetime import datetime
+import json, re, time, random
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from .model import (
     FlowModel, FlowNode, FlowEdge,
@@ -181,6 +181,14 @@ class EngineImpl(Engine):
                                               task.id, self._is_first_task_node(flow, cur_node), 1)
                         nt.variables |= {f"operatorList_{cur_node.id}": actors, f"loopCounter_{cur_node.id}": lc + 1,
                                         f"nrOfInstances_{cur_node.id}": len(actors)}
+                        # 写点⑤「串行会签推进出的下一位成员」——这一支绕过 _create_tasks 直建任务行，
+                        # 必须显式上同一把尺子。基准依据：boot2 的串行推进是**回调**
+                        # createCountersignTask（ProcessTaskServiceImpl:485，内含 :524 那处到期写）
+                        # ⇒ 推进出的第二、三位成员同样带到期时间；java 同批补在 CountersignHandler.
+                        # createNextCountersignTask（commit cb541d4，入口 ProcessInstance.applyNodeExpireTime）。
+                        # 变量源＝实例变量（与写点①②③同档，boot2 的 execution.getArgs()；
+                        # 只有写点④回退新建用随行那份 hisVariable）。
+                        _apply_expire_time(nt, (cur_node.properties or {}).get("expireTime"), inst.variables)
                         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
                         await self.repo.save_task(nt)
                         # TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
@@ -319,6 +327,10 @@ class EngineImpl(Engine):
         # 复活行只带数据类键（tf_*/csv_*/submitType/taskName/会签簿记都是上次提交的残留）
         nt.variables = _lineage_vars(his.variables)
         nt.variables["isFirstTaskNode"] = is_first
+        # 写点④「退回/跳转新建」（Java rejectTask 本轮并入同一个 applyExpireTime）：到期时间按
+        # 被复活的那个节点（prev）的表达式重算，变量源＝新建行随行那份（boot2 的 hisVariable），
+        # **不是实例变量**——两档混了，"表达式是变量名"这一档就会跨栈给出不同答案。
+        _apply_expire_time(nt, (prev.properties or {}).get("expireTime"), nt.variables)
         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
         await self.repo.save_task(nt)
         await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, prev.id, operator))
@@ -490,16 +502,25 @@ class EngineImpl(Engine):
         ct = node.properties.get("countersignType", "")
         now = datetime.now()
         form = node.properties.get("form", "")
+        # issues/126 案 A：节点到期表达式（可能没配）；变量源＝实例变量（boot2 execution.getArgs()）
+        expire_expr = node.properties.get("expireTime")
         if perform_type == 1 and ct:
             if ct == "PARALLEL":
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
+                    # 写点③「并行会签全员」：每位成员各算一次（Java createCountersignTasks 并行循环）
+                    _apply_expire_time(nt, expire_expr, inst.variables)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     # TASK_CREATE：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
             elif ct == "SEQUENTIAL":
                 nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
+                # 写点②「串行会签首位成员」（Java createCountersignTasks SEQUENTIAL 分支）。
+                # 串行会签**推进**出的下一位成员是第五处写点（execute_process_task 的 SEQUENTIAL 分支
+                # 里另有一次 _apply_expire_time）：基准侧 boot2 推进时回调 createCountersignTask
+                # （ProcessTaskServiceImpl:485/:524）⇒ 首成员与推进出的成员都带到期，不是只有首位。
+                _apply_expire_time(nt, expire_expr, inst.variables)
                 nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
@@ -507,12 +528,16 @@ class EngineImpl(Engine):
             else:
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
+                    # 未知/比例会签档（RATIO_* 等）＝ Java 的"非 SEQUENTIAL 一律并行全员"循环
+                    _apply_expire_time(nt, expire_expr, inst.variables)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
                     await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
         else:
             # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
             nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
+            # 写点①「普通建单」（Java createTask：本轮把占位 now() 换成按表达式真算）
+            _apply_expire_time(nt, expire_expr, inst.variables)
             if len(actors) > 1:
                 nt.actorIds = actors
             await self._apply_surrogate(nt, process_name)
@@ -772,3 +797,89 @@ def _filter_field_by_perm(args: dict, node: Optional[FlowNode]) -> dict:
                 continue  # 只读/隐藏：剔除（不入变量）
         out[k] = v
     return out
+
+
+# ─── 到期时间求值（issues/126 案 A · 逐字对齐 Java FlowUtil.processTime）───────────
+
+#: 绝对时刻格式（Java ``SimpleDateFormat("yyyy-MM-dd HH:mm:ss")``，只此一种）
+_EXPIRE_LAYOUT = "%Y-%m-%d %H:%M:%S"
+#: 相对档前缀必须是整数（Java ``Integer.parseInt`` 的接受面；``int(" 2")``/``"1_0"`` 不算）
+_INT_PREFIX = re.compile(r"[+-]?[0-9]+")
+_UNIT_BY_SUFFIX = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+
+
+def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime]:
+    """解析节点配的「期待完成时间」表达式 —— **三档顺序不可换**（Java ``FlowUtil.processTime``，
+    jeeflow-java ``d9e9397`` 同批的参考实现）。
+
+    1. **变量档**：``args`` 里存在键名 == ``expr`` 原串的项 ⇒ 取该项的值：
+       ``datetime`` → 该时刻；``int`` 毫秒时间戳 → 本地该时刻（Java ``new Date(long)`` + 系统默认时区）；
+       ``str`` → 按 ``"yyyy-MM-dd HH:mm:ss"`` 解析，解析失败 → ``None``。
+       值类型不认识（``list`` / ``dict`` / ``float`` / ``bool`` …）⇒ **落穿**到档 2/3，
+       不是提前返回 ``None``（Java/C# 都是落穿，改成 return None 就是跨栈分叉）。
+    2. **相对档**：``expr`` 以 ``s|m|h|d`` 结尾且前缀是整数 ⇒ 当前时间 + N 秒/分/时/天。
+       ``d`` 走**日历加天**（Java ``Calendar.add(DAY_OF_MONTH)``），不乘 86400 秒
+       ——本栈写 ``createTime`` 用的是 naive 本地钟，naive ``datetime + timedelta(days=n)``
+       即名义（墙上时钟）加天，与 ``Calendar`` 同档。
+    3. **绝对档**：把 ``expr`` 本身按 ``"yyyy-MM-dd HH:mm:ss"`` 解析 → 时刻；失败 → ``None``。
+
+    **任何一档都不得返回 now()**：没配 / 解析不出 ⇒ ``None``（这一列留 NULL）。
+    这条是本卡的红线——占位写法 ``expire = now`` 让"配了到期表达式的节点"建单即逾期，
+    逾期统计因此全失真（issues/126 病灶形状）。
+
+    ⚠️ 与 Java 的一处有意差异：Java 在档 2「以 s/m/h/d 结尾但前缀不是整数」（表达式如 ``xh``）
+    由 ``Integer.parseInt`` 抛 NumberFormatException **打断建单**；此处按卡面 §1.5 的读法
+    （「以 s/m/h/d 结尾**且前缀是整数**」）判为不匹配档 2，继续走档 3，最终 ``None``。
+    错配一个到期表达式不该让流程起不来，且 ``None`` 正是「解析失败」的既定方向。
+    """
+    if expr is None:
+        return None
+    # ── 档 1：变量档（优先于相对档：args 里真有个键叫 "2h" 时取的是变量值，不是 now+2h）
+    if isinstance(args, dict) and expr in args:
+        value = args[expr]
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                return datetime.fromtimestamp(value / 1000)
+            except (OverflowError, OSError, ValueError):
+                return None      # 超出可表示范围 = 解析失败 ⇒ NULL
+        if isinstance(value, str):
+            try:
+                return datetime.strptime(value, _EXPIRE_LAYOUT)
+            except ValueError:
+                return None      # Java 此档同样直接 return null，**不落穿**
+        # 其它类型 ⇒ 落穿
+    if not expr:
+        return None
+    suffix = expr[-1]
+    if suffix in _UNIT_BY_SUFFIX and _INT_PREFIX.fullmatch(expr[:-1]):
+        # 本栈写 createTime 用 naive 本地钟 ⇒ naive datetime + timedelta 是**名义（墙上时钟）加量**：
+        # "d" 这一档即日历加天，与 Java Calendar.add(DAY_OF_MONTH) 同形，不是乘 86400 秒的瞬时加法
+        return datetime.now() + timedelta(**{_UNIT_BY_SUFFIX[suffix]: int(expr[:-1])})
+    try:
+        return datetime.strptime(expr, _EXPIRE_LAYOUT)
+    except ValueError:
+        return None
+
+
+def _apply_expire_time(task: Optional[ProcessTask], expr: Any, args: Optional[dict]) -> None:
+    """建单五写点共用的那一把尺子（对齐 Java ``ProcessInstance.applyExpireTime`` 两个重载 +
+    ``cb541d4`` 为绕过 createTask 直建行那一支开的公开入口 ``applyNodeExpireTime``）。
+
+    - ``expr`` 取节点属性 ``properties.expireTime``（设计器 JSON，Java ``TaskParser`` 的
+      ``EXPIRE_TIME_KEY`` 同名键）；非串按 Java ``getStr`` 归一为串。
+    - **节点没配 ⇒ 这一列保持 NULL**（owner 2026-09-28 口径：不造默认值，不写 now()/''/0）。
+      空白串（``"   "``）不算"没配"而是照 Java 交给 :func:`process_time` 求值 ⇒ 结果 ``None``。
+    - ``args`` = 变量源两档：**建单四处＝实例变量**（普通建单 / 串行首位 / 并行全员 /
+      串行推进出的下一位；boot2 的 ``execution.getArgs()``），
+      **回退新建＝随行拷贝那份**（boot2 的 ``hisVariable``）。搞混这两档，
+      "表达式是个变量名"这一格会跨栈给出不同答案。
+    """
+    if task is None or expr is None:
+        return
+    if not isinstance(expr, str):
+        expr = str(expr)
+    if not expr:
+        return
+    task.expireTime = process_time(expr, args if isinstance(args, dict) else {})

@@ -3638,6 +3638,10 @@ async def test_i121_p2_rollback_lineage_and_negatives():
 #
 # ⚠️ 判据是**同一行内 expire − create ≈ 表达式偏移**，不是"这一列非空"——
 #    只判非空就会被 now() 占位写法蒙过（建单即逾期，差值≈0），那正是病灶的形状。
+#
+# ⚠️ 写点④（回退/跳转新建）的表达式来源是**被回退掉的那个节点**（boot2 rejectTask 的 current，
+#    本栈 task.taskName），不是复活行落地的 prev；所以回退那几格的夹具给成**两个节点两份表达式**
+#    （落地 b1＝1d / 当前 b2＝3h）——只配一个节点时取错节点也照样绿，判不出来（09-28 二轮更正）。
 
 def _expire_flow(specs, name: str = "expire126") -> str:
     """线性流程 start → specs… → end。
@@ -3846,19 +3850,48 @@ async def test_i126_sequential_without_expression_leaves_both_rows_null():
 
 @pytest.mark.asyncio
 async def test_i126_rollback_new_row_gets_expire_from_node_expression():
-    """写点④「回退/跳转新建」：复活的那一行按**被回退掉的节点**（＝prev）的表达式重算。"""
+    """写点④「回退/跳转新建」：复活的那一行按**被回退掉的那个节点**（b2＝boot2 rejectTask 里的
+    current）的表达式重算，**不是**复活行落地的 b1（＝prev；form 等数据类字段仍照 prev 走，
+    boot2 就是这个形状）。基准逐字：ProcessTaskServiceImpl.rejectTask :363
+    current = model.getNode(currentTask.getTaskName()) → :385 expireTime =
+    ((TaskModel)current).getExpireTime() → :387 setExpireTime(processTime(expireTime, hisVariable))。
+    两个节点配成**不同**的偏移（落地 1d / 当前 3h）就是这格的牙：错接成落地节点会算出 ≈1d，
+    带宽 [3h−5s, 3h+60s] 当场报红。"""
     eng, repo, def_id = _expire_harness(
-        _expire_flow([("b1", "rbk-zhang", "2h"), ("b2", "rbk-wang", _MISSING)], "expire126rbk"))
+        _expire_flow([("b1", "rbk-zhang", "1d"), ("b2", "rbk-wang", "3h")], "expire126rbk"))
     inst = await eng.start_process_instance_by_id(def_id, "applicant")
     b1 = await _row(repo, inst.id, "b1")
+    _assert_expire_after_create(b1, 24 * 3600, "对照：原始 b1 行按落地节点自己的表达式（写点①）")
     await eng.execute_process_task(b1.id, "rbk-zhang")
     b2 = await _row(repo, inst.id, "b2")
-    assert b2.expireTime is None, "对照：b2 没配 ⇒ NULL"
+    _assert_expire_after_create(b2, 3 * 3600, "对照：b2 由写点①按它自己的 3h 建单")
     await eng.execute_and_jump_task(b2.id, "rbk-wang", None, "")
     revived = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b1"
                and t.id != b1.id]
     assert len(revived) == 1, f"前置：回退应新建恰好一条 b1 行，实得 {len(revived)}"
-    _assert_expire_after_create(revived[0], 2 * 3600, "回退新建")
+    _assert_expire_after_create(revived[0], 3 * 3600, "回退新建取被回退掉的那个节点（b2 的 3h）")
+
+
+@pytest.mark.asyncio
+async def test_i126_rollback_ignores_landing_node_expression():
+    """写点④的反向钉：**被回退掉的那个节点（b2）没配**表达式、复活行落地的 b1 配了 "1d"
+    ⇒ 复活行的 expire_time 必须留 NULL。这格是"取错节点"最直接的判据：
+    表达式来源写成落地节点就会算出 ≈1d（不是空）。"""
+    eng, repo, def_id = _expire_harness(
+        _expire_flow([("b1", "rbk-zhang", "1d"), ("b2", "rbk-wang", _MISSING)], "expire126rbneg"))
+    inst = await eng.start_process_instance_by_id(def_id, "applicant")
+    b1 = await _row(repo, inst.id, "b1")
+    _assert_expire_after_create(b1, 24 * 3600, "前置：1d 确实配在落地节点上（写点①读得到它）")
+    await eng.execute_process_task(b1.id, "rbk-zhang")
+    b2 = await _row(repo, inst.id, "b2")
+    assert b2.expireTime is None, "前置：b2 没配 ⇒ NULL"
+    await eng.execute_and_jump_task(b2.id, "rbk-wang", None, "")
+    revived = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "b1"
+               and t.id != b1.id]
+    assert len(revived) == 1, f"前置：回退应新建恰好一条 b1 行，实得 {len(revived)}"
+    assert revived[0].expireTime is None, \
+        f"被回退掉的节点没配表达式 ⇒ 复活行必须留空，实得 {revived[0].expireTime!r}" \
+        "（≈1d 就说明表达式取成了落地节点）"
 
 
 class _TimeNamedUserProv(_TestUserProv):
@@ -3878,16 +3911,20 @@ class _TimeNamedUserProv(_TestUserProv):
 async def test_i126_rollback_uses_row_variables_not_instance_variables():
     """卡面 §1「变量源两档」的判别格：回退新建用**随行拷贝那份**变量（boot2 的 hisVariable），
     建单三处用**实例变量**。探针 u_realName 只在行上有效 ⇒
-    两档写反就在"回退新建拿到 NULL"这一侧直接报红。"""
-    content = _expire_flow([("b1", "rbk-op", "u_realName"), ("b2", "rbk-wang", _MISSING)],
+    两档写反就在"回退新建拿到 NULL"这一侧直接报红。
+    表达式 "u_realName" 配在**被回退掉的那个节点**（b2，＝写点④的取值来源）上，于是同一份表达式
+    在这一格里同时给出正反对照：b2 自己那行（写点①读实例变量）⇒ NULL，
+    复活行（写点④读随行那份）⇒ rbk-op 的时刻 ⇒ 变量源与节点来源两档一起钉住。"""
+    content = _expire_flow([("b1", "rbk-op", _MISSING), ("b2", "rbk-wang", "u_realName")],
                            "expire126src")
     eng, repo, def_id = _expire_harness(content, "expire126src", user_prov=_TimeNamedUserProv())
     inst = await eng.start_process_instance_by_id(def_id, "applicant")
     b1 = await _row(repo, inst.id, "b1")
-    assert b1.expireTime is None, \
-        "起点自证：建单那一刻实例变量里的 u_realName 是发起人的（解析不出 ⇒ NULL）"
+    assert b1.expireTime is None, "对照：b1 没配表达式 ⇒ NULL"
     await eng.execute_process_task(b1.id, "rbk-op")
     b2 = await _row(repo, inst.id, "b2")
+    assert b2.expireTime is None, \
+        "起点自证：同一表达式走建单写点①读的是**实例变量**，那里 u_realName 是发起人的（解析不出 ⇒ NULL）"
     await eng.execute_and_jump_task(b2.id, "rbk-wang", None, "")
     inst_after = await repo.find_instance_by_id(inst.id)
     assert inst_after.variables.get("u_realName") != "2027-01-15 09:00:00", \

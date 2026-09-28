@@ -328,9 +328,16 @@ class EngineImpl(Engine):
         nt.variables = _lineage_vars(his.variables)
         nt.variables["isFirstTaskNode"] = is_first
         # 写点④「退回/跳转新建」（Java rejectTask 本轮并入同一个 applyExpireTime）：到期时间按
-        # 被复活的那个节点（prev）的表达式重算，变量源＝新建行随行那份（boot2 的 hisVariable），
+        # **被回退掉的那个节点**（＝当前行所属节点 task.taskName，boot2 里的 current）的表达式重算，
+        # **不是**复活行落地的那个节点（prev＝历史行所属节点；form 等数据类字段仍照 prev 走，
+        # boot2 就是这个形状）。基准逐字：ProcessTaskServiceImpl.rejectTask :363
+        # current = model.getNode(currentTask.getTaskName()) → :385 expireTime =
+        # ((TaskModel)current).getExpireTime() → :387 setExpireTime(FlowUtil.processTime(expireTime,
+        # hisVariable))（java/php/csharp/rust 同此）。变量源＝新建行随行那份（boot2 的 hisVariable），
         # **不是实例变量**——两档混了，"表达式是变量名"这一档就会跨栈给出不同答案。
-        _apply_expire_time(nt, (prev.properties or {}).get("expireTime"), nt.variables)
+        cur_node = _find_node(flow, task.taskName)
+        _apply_expire_time(nt, (cur_node.properties or {}).get("expireTime") if cur_node else None,
+                           nt.variables)
         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
         await self.repo.save_task(nt)
         await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, prev.id, operator))

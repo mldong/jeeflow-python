@@ -278,6 +278,10 @@ class JeeflowFacade:
         if not await self._can_withdraw(inst, operator, doing):
             raise ValueError("无权限撤回该流程实例")
         now = datetime.now()
+        # issues/134 案 A：实例状态守卫在聚合根 withdraw 里（非 10 ⇒ 20010009），
+        # 故这一句必须排在下面的任务行循环**之前**——被拒时任务行也不该被内存改写，
+        # 更不该有机会落库（对齐 Java JeeflowFacade.withdraw 的 canWithdraw → inst.withdraw → updateInstance 序）
+        inst.withdraw(now)  # issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
         withdrawn = []
         for t in doing:
             # issues/113：撤回写 WITHDRAW(30)，不用 ABANDONED(99)——99 是引擎废弃码
@@ -286,7 +290,6 @@ class JeeflowFacade:
             # issues/114：进行中任务的 update_user 回写为真实撤回人（契约同段）
             t.updateUser = operator
             withdrawn.append(t)
-        inst.withdraw(now)  # issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
         inst.updateUser = operator
         # 级联覆盖防护（issues/57 补正）：撤回副本同步回聚合（update_instance 级联覆盖防护）
         inst.tasks = withdrawn

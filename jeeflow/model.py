@@ -61,6 +61,16 @@ class TaskState(IntEnum):
     PENDING   = 50
     ABANDONED = 99
 
+# ─── 引擎内部错误（对齐 Java enums/WfErrEnum 的 code + message 形状）─────────────
+#
+# 本栈既有形状＝抛 ValueError(固定中文文案)，**内部码只进注释/文档不进 msg**（issues/121 口径）：
+# 门面 flow() 捕获后出 {"code": 99999999, "msg": 这句原文}，不拼码、不加前缀。
+# 参照 20010007 / 20010008（engine._rollback_to_parent 的 NO_LINEAGE / GUARD 两句）。
+#
+# 20010009 WITHDRAW_INSTANCE_NOT_DOING —— 撤回的实例状态守卫（issues/134 案 A），
+# 落点见下方 ProcessInstance.withdraw。
+ERR_WITHDRAW_INSTANCE_NOT_DOING = "流程实例非进行中，无法撤回"
+
 # ─── 字典枚举（v1.4.0，对齐 Java enums，值与 boot3 字典一致） ────────────────
 
 class DefineState(IntEnum):
@@ -157,7 +167,19 @@ class ProcessInstance:
         self.updateTime = now
 
     def withdraw(self, now) -> None:
-        """撤回流程（issues/53 E25：withdraw 用 Withdraw(30)，与 reject 区分）"""
+        """撤回流程（issues/53 E25：withdraw 用 Withdraw(30)，与 reject 区分）
+
+        issues/134 案 A：撤回只允许**进行中(10)** 的实例。实例不是 10（已完成 20 / 已撤回 30 /
+        强行终止 40 / 已拒绝 45 / 挂起 50 / 已废弃 99）⇒ 抛内部码 20010009，**一行都不改、不落库**，
+        否则已办结实例会被静默改写成 30（改历史、且用户看不到任何报错）。
+        守卫排在调用方的任务行循环之前（门面已把本调用上提），任务行层面那句
+        "已完成(20)/已终止(40) 行不改写"的既有保护保持原样。
+
+        Raises:
+            ValueError: 20010009 实例非进行中（出口 99999999 + 固定文案，文案不含内部码）
+        """
+        if self.state != InstanceState.DOING:
+            raise ValueError(ERR_WITHDRAW_INSTANCE_NOT_DOING)
         self.state = InstanceState.WITHDRAW
         self.updateTime = now
 

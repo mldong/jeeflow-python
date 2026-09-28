@@ -3935,3 +3935,185 @@ async def test_i126_rollback_uses_row_variables_not_instance_variables():
     assert to_datetime(revived[0].expireTime) == datetime(2027, 1, 15, 9, 0, 0), \
         f"回退新建必须按随行那份变量取值，实得 {revived[0].expireTime!r}"
 
+
+# ─── issues/134 案 A · 撤回的实例状态守卫（内部码 20010009）───────────────────────
+#
+# 契约（八栈逐字统一，owner 2026-09-28 拍板 A）：撤回作用于**实例**时，实例状态不是 10(进行中)
+# 一律拒——被拒时状态不得被改写、不落库。改前对已办结(20)/已终止(40) 的实例调撤回会静默改写成
+# 30，"已办列表 / 按状态聚合的统计"凭空改历史且用户看不到任何报错（本案病灶）。
+# 落点＝聚合根 ProcessInstance.withdraw（jeeflow/model.py），门面已把那句上提到任务行循环之前
+# ⇒ 守卫排在任务行层面既有保护（20/40 行不改写，保持原样）之前。
+# 出口＝issues/121 口径：门面吞内部码 ⇒ code=99999999 ＋ msg **逐字** `流程实例非进行中，无法撤回`，
+# 不拼码、不加前缀。
+# 权威＝jeeflow-java 参考实现（WfErrEnum.WITHDRAW_INSTANCE_NOT_DOING + ProcessInstance.withdraw）
+# ＋ jeeflow-doc/docs/spec/06-facade.md §processInstance/withdraw。
+# ⚠️ 40(强行终止) 档由常规流程路径造不出（issues/134 §5.2 同款豁免：集成层 gate 也造不出），
+#    故按案要求走引擎栈内单测钉死；20 档走真实办结夹具。
+
+_I134_WITHDRAW_MSG = "流程实例非进行中，无法撤回"   # 内部码 20010009 的固定文案（八栈逐字一致）
+
+
+async def _i134_finished_instance(facade, repo) -> int:
+    """夹具：01-simple 办到终态 ⇒ 实例 state=20、doing 任务清空（真实办结，非手搓状态）"""
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    doing = await repo.find_doing_tasks(iid)
+    assert [t.taskName for t in doing] == ["task1"], f"前置：应停在 task1: {[t.taskName for t in doing]}"
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": doing[0].id, "operator": "leader", "submitType": 1})
+    assert r["code"] == 0, r
+    inst = await repo.find_instance_by_id(iid)
+    assert inst.state == InstanceState.DONE, f"前置：夹具应是已办结(20)，实得 {inst.state}"
+    return iid
+
+
+@pytest.mark.asyncio
+async def test_i134_withdraw_rejects_finished_instance():
+    """负向 state=20（已办结）：断码 99999999 ＋ 文案逐字相等 ＋ 实例/任务行零改写、不落库"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    iid = await _i134_finished_instance(facade, repo)
+    inst_before = await repo.find_instance_by_id(iid)
+    rows_before = {t.id: (int(t.taskState), t.updateUser, t.updateTime)
+                   for t in await repo.find_history_tasks(iid)}
+
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "zhangsan"})
+    assert r["code"] == 99999999, f"已办结实例撤回必须显式报错，实得 {r}"
+    assert r["msg"] == _I134_WITHDRAW_MSG, \
+        f"文案须逐字相等（不拼码、不加前缀），实得 {r['msg']!r}"
+    assert "2001000" not in r["msg"], f"内部码不进 msg（issues/121 口径），实得 {r['msg']!r}"
+
+    inst_after = await repo.find_instance_by_id(iid)
+    assert inst_after.state == InstanceState.DONE, \
+        f"被拒后实例不得被静默改写成 30（本案病灶）: {inst_after.state}"
+    assert inst_after.updateTime == inst_before.updateTime, "被拒后实例 update_time 不得动"
+    assert inst_after.updateUser == inst_before.updateUser, "被拒后实例 update_user 不得动"
+    rows_after = {t.id: (int(t.taskState), t.updateUser, t.updateTime)
+                  for t in await repo.find_history_tasks(iid)}
+    assert rows_after == rows_before, "被拒后任务行必须零改写（含 update_user/update_time）"
+
+
+@pytest.mark.asyncio
+async def test_i134_withdraw_rejects_terminated_instance_and_keeps_doing_rows():
+    """负向 state=40（强行终止，栈内单测钉）：同样拒；且 doing 任务行不被改写成 30、不消失"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    doing = await repo.find_doing_tasks(iid)
+    assert len(doing) == 1, f"前置：应有一条 doing 行: {len(doing)}"
+    # 40 档造不出常规路径（案 §5.2 豁免）⇒ 仓储层直接置态，其余字段不动
+    inst = await repo.find_instance_by_id(iid)
+    inst.state = InstanceState.INTERRUPT
+    await repo.update_instance(inst)
+    before = await repo.find_instance_by_id(iid)
+    assert before.state == InstanceState.INTERRUPT, f"前置：夹具应为 40，实得 {before.state}"
+
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "zhangsan"})
+    assert r["code"] == 99999999, f"已终止实例撤回必须显式报错，实得 {r}"
+    assert r["msg"] == _I134_WITHDRAW_MSG, f"文案须逐字相等，实得 {r['msg']!r}"
+
+    after = await repo.find_instance_by_id(iid)
+    assert after.state == InstanceState.INTERRUPT, f"被拒后实例仍应是 40: {after.state}"
+    assert after.updateUser == before.updateUser and after.updateTime == before.updateTime, \
+        "被拒后实例 update_* 不得动"
+    left = await repo.find_doing_tasks(iid)
+    assert [t.id for t in left] == [t.id for t in doing], \
+        f"被拒后 doing 行不得消失（改前会整单落 30）: {[t.id for t in left]}"
+    row = await repo.find_task_by_id(doing[0].id)
+    assert row.taskState == TaskState.DOING, f"doing 行不应被改写成 30: {row.taskState}"
+    assert row.updateUser == doing[0].updateUser, "doing 行 update_user 不得被记成撤回人"
+
+
+@pytest.mark.asyncio
+async def test_i134_withdraw_still_succeeds_on_doing_instance():
+    """正向对照 state=10：守卫没写反——进行中实例撤回仍 code=0，整单落 30（既有语义不动）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    doing = await repo.find_doing_tasks(iid)
+
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "zhangsan"})
+    assert r["code"] == 0 and r["data"] is None, \
+        f"进行中实例撤回必须照旧成功（守卫写反成「只允许非 10」时这一格报红）: {r}"
+    inst = await repo.find_instance_by_id(iid)
+    assert inst.state == InstanceState.WITHDRAW, f"撤回成功应落 30: {inst.state}"
+    assert inst.updateUser == "zhangsan", "update_user 应回写撤回人"
+    assert not await repo.find_doing_tasks(iid), "撤回后不得残留 doing 任务"
+    row = await repo.find_task_by_id(doing[0].id)
+    assert row.taskState == TaskState.WITHDRAW, f"doing 行应落 30: {row.taskState}"
+
+
+def test_i134_aggregate_guard_covers_every_non_doing_state():
+    """聚合根一层（jeeflow/model.py ProcessInstance.withdraw）的判别力：
+    20/30/40/45/50/99 六档全拒且**不写任何字段**；10 档（含仓储水合可能给的裸 int）照旧放行。"""
+    now = datetime(2026, 9, 28, 10, 0, 0)
+    non_doing = [InstanceState.DONE, InstanceState.WITHDRAW, InstanceState.INTERRUPT,
+                 InstanceState.REJECT, InstanceState.PENDING, InstanceState.ABANDON]
+    # 裸 int 档：守卫必须按"值等于 10"判，不得用 `is`（历史数据/自定义仓储可能给 int）
+    non_doing += [20, 40, 99]
+    for st in non_doing:
+        inst = ProcessInstance(id=1, defineId=1, state=st, operator="zhangsan",
+                               updateUser="init", updateTime=None)
+        with pytest.raises(ValueError) as ei:
+            inst.withdraw(now)
+        assert str(ei.value) == _I134_WITHDRAW_MSG, f"{st} 档文案应逐字相等: {ei.value}"
+        assert inst.state == st, f"{st} 档被拒后 state 不得被改写: {inst.state}"
+        assert inst.updateTime is None, f"{st} 档被拒后 update_time 不得被写: {inst.updateTime}"
+        assert inst.updateUser == "init", f"{st} 档被拒后 update_user 不得被写: {inst.updateUser}"
+
+    for doing in (InstanceState.DOING, 10):
+        inst = ProcessInstance(id=1, defineId=1, state=doing, operator="zhangsan")
+        inst.withdraw(now)
+        assert inst.state == InstanceState.WITHDRAW, f"{doing} 档应照旧撤回成 30: {inst.state}"
+        assert inst.updateTime == now
+
+
+@pytest.mark.asyncio
+async def test_i134_second_withdraw_on_withdrawn_instance_is_rejected():
+    """负向 state=30（二次撤回）：首撤照旧成功，二撤被拒且**不得把 update_user 改成第二次操作人**。
+    撤回人用 flow.admin 哨兵（归属判据③放行）⇒ 报错只可能来自状态守卫，不被鉴权分支抢先命中
+    （对齐 Java WithdrawInstanceStateGuardTest 门面级两档）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+
+    r1 = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "zhangsan"})
+    assert r1["code"] == 0, f"前置：首撤（进行中）应成功: {r1}"
+    assert (await repo.find_instance_by_id(iid)).updateUser == "zhangsan"
+
+    r2 = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "flow.admin"})
+    assert r2["code"] == 99999999, f"已撤回(30) 实例二次撤回必须被拒: {r2}"
+    assert r2["msg"] == _I134_WITHDRAW_MSG, f"文案须逐字相等，实得 {r2['msg']!r}"
+    after = await repo.find_instance_by_id(iid)
+    assert after.state == InstanceState.WITHDRAW
+    assert after.updateUser == "zhangsan", \
+        f"被拒的那次不得把撤回人改成第二次操作人: {after.updateUser}"
+
+
+@pytest.mark.asyncio
+async def test_i134_guard_sits_after_operator_and_ownership_branches():
+    """回归：本案守卫不污染既有失败文案与分支序（issues/114 两支仍排在状态守卫之前命中），
+    且三条负向（缺 operator／越权／非进行中）全都不改状态、不落库。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    iid = await _i134_finished_instance(facade, repo)
+    before = await repo.find_instance_by_id(iid)
+    rows_before = {t.id: (int(t.taskState), t.updateUser) for t in await repo.find_history_tasks(iid)}
+
+    r = await facade.flow("processInstance/withdraw", {"id": iid})
+    assert r["code"] == 99999999 and "operator 必填" in r["msg"], r
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "nobody"})
+    assert r["code"] == 99999999 and "无权限撤回该流程实例" in r["msg"], \
+        f"鉴权分支应仍排在状态守卫之前: {r}"
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "zhangsan"})
+    assert r["code"] == 99999999 and r["msg"] == _I134_WITHDRAW_MSG, r
+
+    after = await repo.find_instance_by_id(iid)
+    assert after.state == InstanceState.DONE, f"三条负向后实例仍应是 20: {after.state}"
+    assert (after.updateUser, after.updateTime) == (before.updateUser, before.updateTime)
+    rows_after = {t.id: (int(t.taskState), t.updateUser) for t in await repo.find_history_tasks(iid)}
+    assert rows_after == rows_before, "三条负向后任务行零改写"
+

@@ -555,7 +555,15 @@ class EngineImpl(Engine):
                                         vars_: dict, actors: list[str], process_name: str = "",
                                         parent_id: int = 0, is_first: bool = False):
         """以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）；
-        建单前同样应用委托（issues/116：任何新任务都是"建单那一刻"）"""
+        建单前同样应用委托（issues/116：任何新任务都是"建单那一刻"）
+
+        **当前零调用者，但承担契约形状义务（issues/137 B）**——121 P2 之后回退改走血缘版
+        ``_rollback_to_parent``，本函数成了"显式参与者建单"这条形状的留档位。owner 拍"不删、
+        补用例钉住"（口径：与主路径 ``_create_task`` 的建单产物逐维一致，见 spec_test
+        ``test_i137b_create_task_with_actors_matches_main_path``）。
+        ⚠️ 已知缺口（126 案 A 同源，rust 侧 ``reject_task`` 同条留档）：本函数**没有**到期写点①
+        （不调 ``_apply_expire_time``）——将来要复活它，先补写点再把该维并进一致性断言。
+        """
         if not actors: return
         ct = node.properties.get("countersignType", "")
         _pt = node.properties.get("performType", 0)
@@ -665,7 +673,18 @@ class EngineImpl(Engine):
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict,
                            process_name: str = "", parent_id: int = 0, is_first: bool = False):
         actors = await self._resolve_actors(node, inst, operator, vars_)
-        if not actors: return
+        if not actors:
+            # issues/141 G5：参与者解析为空**不丢 token**。此前此处直接 return —— 该节点既没有
+            # 任务行也没有继续流转，实例永远停在 state=10 却零可办行（谁也办不动，demo 里
+            # define=10「自定义节点」/define=14「handler 取不到人」两档就是这么卡住的）。
+            # Java 参考实现在这条路上从不跳过建单（CreateTaskHandler 无条件
+            # ProcessTask.create 落 DOING 行），本栈对齐"必建一行"，并按本栈既有兜底口径
+            # （_rollback_actors 的 ``... or [operator]``、_sync_resolve_actors 同款）把行挂给
+            # 当前操作人，使它成为一条真实可办的待办；操作人与发起人都取不到人才回落不建单。
+            fallback = operator or inst.operator
+            if not fallback:
+                return
+            actors = [fallback]
         # performType 容错解析（对齐 Java codeOf，issue 42）：int 优先；
         # 字符串 'ALL'/'COUNTERSIGN'（设计器面板格式，大小写不敏感）映射为会签；未知回落 0
         _pt = node.properties.get("performType", 0)

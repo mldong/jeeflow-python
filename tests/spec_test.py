@@ -16,7 +16,8 @@ from jeeflow.repository.ext import JdbcProcessExtRepository
 from jeeflow.surrogate import (NullSurrogateApplier, hydrate_enabled, surrogate_enabled_on,
                                to_datetime)
 from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance,
-                           ProcessSurrogate, ProcessTask, TaskState, InstanceState, UserInfo)
+                           ProcessSurrogate, ProcessTask, TaskState, InstanceState, UserInfo,
+                           parse_flow_model)
 from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
 
 import flows_resolver
@@ -5180,4 +5181,240 @@ async def test_i134_guard_sits_after_operator_and_ownership_branches():
     assert (after.updateUser, after.updateTime) == (before.updateUser, before.updateTime)
     rows_after = {t.id: (int(t.taskState), t.updateUser) for t in await repo.find_history_tasks(iid)}
     assert rows_after == rows_before, "三条负向后任务行零改写"
+
+
+# ─── issues/139 · 流程定义 JSON 解析失败的出口 msg 形状（八栈同批 · python 腿）──────────────
+# 判据源：jeeflow-hub `issues/139-….md`（owner 拍"修"）＋ issues/121 那轮定的口径——
+#   失败信封只出逐字固定文案（code=99999999 ＋ 一句中文），内部码与内部异常细节一律不进 msg。
+# 逐字基准＝Java 参考实现 `jeeflow-core/src/main/java/com/mldong/jeeflow/parser/ModelParser.java:47`
+#   `throw new RuntimeException("读取流程定义 JSON 失败", e)`（原始异常只作 cause），
+#   C# `ModelParser.cs:45/:54` 同句佐证，node 腿已按此收口（facade.ts + __tests__/spec.test.ts）。
+#   Java 的 deploy / processDefine·redeploy / processDesign·redeploy 三条腿都走同一个
+#   ModelParser.parse ⇒ 本栈三条腿也收敛到单一解析点 `JeeflowFacade._parse_define_content`
+#   （改前：design redeploy 腿拼 `f"…: {e}"`；另两条腿压根没包，`flow()` 顶层 str(e) 把
+#    JSONDecodeError 原文「Expecting value: line 1 column 10 (char 9)」直接送进出口）。
+# 反闸写法照 node/issues/121：单断"包含"对"带前缀/带尾巴"恒绿 ⇒ 逐字等值 ＋ 逐项禁泄漏 ＋ 正向对照。
+
+_I139_MSG = "读取流程定义 JSON 失败"          # 逐字＝Java 参考实现原文，八栈可比对
+
+#: 出口 msg 一律不得出现的内部细节（异常类名／解析器文本／堆栈／文件路径／SQL／入参片段）
+_I139_LEAKS = ["Error", "Exception", "JSONDecode", "Traceback", 'File "', "json.loads",
+               "Expecting", "char", "line", "column", "at ", ".json", "/", "\\",
+               "SELECT", "INSERT", "SENTINEL", "nodes", "{", "["]
+
+_I139_BAD_TRUNCATED = '{"name":"bad139","nodes":['          # 截断 JSON
+_I139_BAD_SENTINEL = '{"nodes":[SENTINEL_泄漏面_139]}'       # 非法且内容里带可辨识片段
+
+
+def _i139_facade():
+    eng, repo = setup()
+    return eng, repo, JeeflowFacade(eng, repo, MemoryExtRepository())
+
+
+def _i139_assert_verbatim(r: dict, leg: str):
+    """失败信封三件：code 固定 ＋ msg 逐字等值 ＋ 逐项禁泄漏（改前的两种病灶都红）。"""
+    assert r["code"] == 99999999, f"{leg} 坏内容必须被拒: {r}"
+    assert r["msg"] == _I139_MSG, (
+        f"{leg} 出口 msg 要逐字等值——改前病灶是把原始异常文本拼进 msg"
+        f"（design redeploy 腿拼 f-string，另两条腿裸送 JSONDecodeError 原文），本格即红: "
+        f"{r['msg']!r}")
+    for leak in _I139_LEAKS:
+        assert leak not in r["msg"], f"{leg} msg 不得含内部细节 {leak!r}: {r['msg']!r}"
+
+
+@pytest.mark.asyncio
+async def test_i139_design_redeploy_parse_fail_msg_is_verbatim():
+    """病灶腿 processDesign/redeploy：坏快照 → 逐字文案零细节，且解析失败排在任何写库之前
+    （既不落定义行、也不把设计置成已部署）。"""
+    eng, repo, facade = _i139_facade()
+    for tag, bad in (("截断", _I139_BAD_TRUNCATED), ("带片段", _I139_BAD_SENTINEL)):
+        r0 = await facade.flow("processDesign/save", {"name": f"bad139-{tag}",
+                                                      "displayName": f"坏内容139-{tag}",
+                                                      "content": bad, "operator": "zhangsan"})
+        assert r0["code"] == 0, f"前置：save 不校验内容合法性，坏 JSON 也该入库回 id: {r0}"
+        design_id = int(r0["data"]["id"])
+        assert len(await facade._ext.list_design_his(design_id)) == 1, \
+            "前置：内容快照已入库（本用例打的是「有快照但解析失败」那条腿）"
+
+        r = await facade.flow("processDesign/redeploy", {"id": design_id, "operator": "zhangsan"})
+        _i139_assert_verbatim(r, f"processDesign/redeploy（{tag}）")
+        assert "SENTINEL" not in r["msg"], f"msg 不得把设计稿片段透出来: {r['msg']!r}"
+
+        assert not await repo.find_define_by_name(f"bad139-{tag}"), "解析失败不得留下流程定义行"
+        design = await facade._ext.find_design_by_id(design_id)
+        assert design.isDeployed == 0, f"被拒后设计仍是未部署(0): {design.isDeployed}"
+
+
+@pytest.mark.asyncio
+async def test_i139_deploy_family_parse_fail_shares_same_verbatim_msg():
+    """另两条腿 processDefine/deploy、processDefine/redeploy（含经 _deploy 的 processDesign/deploy）
+    与病灶腿同句逐字——Java 三条腿共用一个 ModelParser.parse，本栈共用一个解析点。"""
+    eng, repo, facade = _i139_facade()
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        good = f.read()
+
+    r = await facade.flow("processDefine/deploy", {"content": _I139_BAD_SENTINEL,
+                                                   "operator": "zhangsan"})
+    _i139_assert_verbatim(r, "processDefine/deploy")
+
+    # 空内容同样是解析失败：改前这里裸送 JSONDecodeError 原文「Expecting value: line 1 column 1 (char 0)」
+    r = await facade.flow("processDefine/deploy", {"content": "", "operator": "zhangsan"})
+    _i139_assert_verbatim(r, "processDefine/deploy（content 为空）")
+
+    r_ok = await facade.flow("processDefine/deploy", {"content": good, "operator": "zhangsan"})
+    assert r_ok["code"] == 0, r_ok
+    define_id = int(r_ok["data"]["processDefineId"])
+    r = await facade.flow("processDefine/redeploy", {"processDefineId": define_id,
+                                                     "content": _I139_BAD_TRUNCATED,
+                                                     "operator": "zhangsan"})
+    _i139_assert_verbatim(r, "processDefine/redeploy")
+    untouched = await repo.find_define_by_id(define_id)
+    assert untouched.content == good, "被拒的 redeploy 不得改写既有定义内容"
+
+    r0 = await facade.flow("processDesign/save", {"name": "bad139-deploy", "displayName": "坏稿139",
+                                                  "content": _I139_BAD_TRUNCATED,
+                                                  "operator": "zhangsan"})
+    assert r0["code"] == 0, r0
+    r = await facade.flow("processDesign/deploy", {"id": int(r0["data"]["id"]),
+                                                   "operator": "zhangsan"})
+    _i139_assert_verbatim(r, "processDesign/deploy（走 _deploy 同一点）")
+
+
+@pytest.mark.asyncio
+async def test_i139_parse_fail_keeps_original_exception_as_cause():
+    """原始异常不进 msg，但要留在错误对象上（``raise ... from e`` ⇒ ``__cause__``）：
+    排查侧仍拿得到解析器细节，只是不跨出口。"""
+    with pytest.raises(ValueError) as ei:
+        JeeflowFacade._parse_define_content(_I139_BAD_TRUNCATED)
+    assert str(ei.value) == _I139_MSG, f"异常文本本身也要逐字: {str(ei.value)!r}"
+    assert isinstance(ei.value.__cause__, json.JSONDecodeError), \
+        f"原始解析异常应作 __cause__ 留在错误对象上: {ei.value.__cause__!r}"
+
+
+@pytest.mark.asyncio
+async def test_i139_valid_content_legs_still_succeed():
+    """正向对照（防"改成无条件抛"）：三条腿喂合法内容仍 code=0，msg 仍是"成功"。"""
+    eng, repo, facade = _i139_facade()
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        good = f.read()
+
+    r = await facade.flow("processDefine/deploy", {"content": good, "operator": "zhangsan"})
+    assert r["code"] == 0 and r["msg"] == "成功", f"正向 deploy 不得被新文案分支拦掉: {r}"
+    define_id = int(r["data"]["processDefineId"])
+
+    r = await facade.flow("processDefine/redeploy", {"processDefineId": define_id,
+                                                     "content": good, "operator": "zhangsan"})
+    assert r["code"] == 0, f"正向 processDefine/redeploy: {r}"
+
+    r0 = await facade.flow("processDesign/save", {"name": "good139", "displayName": "合法139",
+                                                  "content": good, "operator": "zhangsan"})
+    assert r0["code"] == 0, r0
+    design_id = int(r0["data"]["id"])
+    r = await facade.flow("processDesign/deploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0 and r["data"]["processDefineId"], f"正向 processDesign/deploy: {r}"
+    r = await facade.flow("processDesign/redeploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0 and r["data"]["processDefineId"], f"正向 processDesign/redeploy: {r}"
+    assert (await facade._ext.find_design_by_id(design_id)).isDeployed == 1, "正向仍置已部署(1)"
+    assert await repo.find_define_by_id(int(r["data"]["processDefineId"])), "正向定义行确实落库"
+
+
+# ─── issues/137 B · 零调用者建单函数 _create_task_with_actors 的契约形状 ─────────────────
+# 案文（jeeflow-hub/issues/137-….md §4 B）：owner 拍「**不删，补用例钉住**」——本栈
+#   `EngineImpl._create_task_with_actors` 自 issues/121 P2（回退改走血缘版 `_rollback_to_parent`）
+#   起零调用者（grep 全仓只剩定义处 + spec_test 一条陈旧注释），但它是「显式参与者建单」
+#   这条形状的留档位：会签逐人拆行、普通一行承载多参与者、建单前应用委托、落库后 fire 码 3。
+#   本格不接线、不改语义，只钉「直调该函数的建单产物与主路径 `_create_task` 逐维一致」。
+#   已知缺口在函数 docstring 与本节注释同步留档：本函数**没有** issues/126 案 A 的到期写点①
+#   （不调 `_apply_expire_time`，与 rust 侧 `reject_task` 同款 deferred）⇒ 用例不给节点配
+#    expireTime，也不把该维并进一致性断言；将来复活它先补写点再谈全维一致。
+
+_I137B_FIELDS = ("taskName", "displayName", "formKey", "taskType", "performType",
+                 "taskState", "parentTaskId", "createUser", "updateUser")
+
+
+async def _i137b_shapes(repo, rows) -> list[dict]:
+    """任务行 → 可比对形状。参与者读**持久参与者行**（与 issues/116 那族用例同口径，
+    不看内存对象），按参与者排序保证两批逐行对齐。"""
+    out = []
+    for t in rows:
+        shape = {f: getattr(t, f) for f in _I137B_FIELDS}
+        shape["actorIds"] = list(await repo.find_task_actors(t.id))
+        shape["isFirstTaskNode"] = (t.variables or {}).get("isFirstTaskNode")
+        out.append(shape)
+    return sorted(out, key=lambda s: s["actorIds"])
+
+
+def _i137b_node(content: str, node_id: str):
+    """同一份 content 解析出节点对象——直调入参与主路径拿到的节点是同一形状。"""
+    return next(n for n in parse_flow_model(json.loads(content)).nodes if n.id == node_id)
+
+
+@pytest.mark.asyncio
+async def test_i137b_create_task_with_actors_matches_main_path():
+    """直调 vs 主路径：普通·单人 / 普通·多参与者 / 并行会签·逐人拆行三档，
+    建单产物逐维一致（行数、参与者、performType、parentTaskId、isFirstTaskNode、留痕字段）。"""
+    for idx, (specs, actors) in enumerate((
+            ([("t1", "zhang")], ["zhang"]),                       # 普通·单人
+            ([("t1", "zhang,li")], ["zhang", "li"]),               # 普通·多参与者任一可办
+            ([("t1", "zhang,li", "PARALLEL")], ["zhang", "li"]),   # 并行会签·逐人拆行
+    )):
+        pname = f"i137b-shape{idx}"
+        content = _flow_json(specs, name=pname)
+        eng, repo, _ext, def_id = _surr_harness(pname, content)
+        node = _i137b_node(content, "t1")
+
+        # ① 主路径：start → _execute_node → _create_task（参与者由 assignee 解析而来）
+        inst_main = await eng.start_process_instance_by_id(def_id, "boss1")
+        main_rows = await _i137b_shapes(repo, await repo.find_doing_tasks(inst_main.id))
+
+        # ② 直调：另一实例上绕开 _resolve_actors，把同一批参与者显式喂进去
+        inst_direct = await eng.start_process_instance_by_id(def_id, "boss1")
+        before = {t.id for t in await repo.find_doing_tasks(inst_direct.id)}
+        await eng._create_task_with_actors(node, inst_direct, "boss1", {}, list(actors),
+                                           process_name=pname, parent_id=0, is_first=True)
+        direct_rows = [t for t in await repo.find_doing_tasks(inst_direct.id)
+                       if t.id not in before]
+        direct_shapes = await _i137b_shapes(repo, direct_rows)
+
+        assert len(direct_shapes) == len(main_rows), (
+            f"{pname}：直调建单行数 {len(direct_shapes)} ≠ 主路径 {len(main_rows)}"
+            f"（会签逐人拆行 / 普通一行的分档语义必须一致）\n主路径={main_rows}\n直调={direct_shapes}")
+        for m, d in zip(main_rows, direct_shapes):
+            assert d == m, (f"{pname}：直调与主路径建单产物逐维不一致\n主路径={m}\n直调={d}")
+
+
+@pytest.mark.asyncio
+async def test_i137b_create_task_with_actors_applies_surrogate_and_fires_task_start():
+    """函数 docstring 承诺的两件事同样与主路径一致：建单前并入委托人（issues/116）＋
+    落库后逐任务 fire PROCESS_TASK_START（码 3，载荷 actors＝落库那份）。"""
+    pname = "i137b-surr"
+    content = _flow_json([("t1", "zhang")], name=pname)
+    eng, repo, ext, def_id = _surr_harness(pname, content)
+    await _put_surr(ext, "zhang", "i137b-agent", pname)
+    evts: list = []
+    eng.set_extensions(EngineExtensions(event_listeners=[evts.append]))
+
+    inst_main = await eng.start_process_instance_by_id(def_id, "boss1")
+    main_actors = await _doing_actors(repo, inst_main.id, "t1")
+
+    inst_direct = await eng.start_process_instance_by_id(def_id, "boss1")
+    before = {t.id for t in await repo.find_doing_tasks(inst_direct.id)}
+    await eng._create_task_with_actors(_i137b_node(content, "t1"), inst_direct, "boss1", {},
+                                       ["zhang"], process_name=pname, parent_id=0, is_first=True)
+    new_rows = [t for t in await repo.find_doing_tasks(inst_direct.id) if t.id not in before]
+    assert len(new_rows) == 1, f"直调应建一行普通任务，实得 {len(new_rows)}"
+    direct_actors = await repo.find_task_actors(new_rows[0].id)
+
+    assert direct_actors == main_actors, (
+        f"「建单前同样应用委托」两档不一致：直调 {direct_actors} vs 主路径 {main_actors}")
+    assert direct_actors == ["zhang", "i137b-agent"], \
+        f"直调那一行应既保留授权人又并入代理人（任一可办）: {direct_actors}"
+
+    starts = [e for e in evts if e.type is EventType.PROCESS_TASK_START]
+    assert len(starts) == 3, f"两次发起各 1 条 + 直调 1 条，实得 {len(starts)} 条码 3"
+    last = starts[-1]
+    assert (last.instanceId, last.taskId) == (inst_direct.id, new_rows[0].id), \
+        f"直调的码 3 必须落在它自己新建的那行上: {last}"
+    assert list(last.actors) == direct_actors, \
+        f"码 3 载荷 actors 取落库那份（含代理人）: {last.actors}"
 

@@ -41,6 +41,14 @@ SUBMIT_COUNTERSIGN_DISAGREE = 20
 CC_ACTORS_START = KEY_CC_ACTORS_START
 CC_ACTORS = KEY_CC_ACTORS
 
+# issues/139（八栈同批）：流程定义 content 解析失败的**对外** msg 是逐字固定文案，
+# 基准＝Java 参考实现 jeeflow-core/parser/ModelParser.java:47
+# `throw new RuntimeException("读取流程定义 JSON 失败", e)`——原始异常只作 cause 挂在错误对象上，
+# 一律不进 msg（门面顶层 `flow()` 的 `str(e)` 会把 message 原样送进出口，拼进去就是泄漏解析器细节）。
+# deploy / processDefine/redeploy / processDesign/redeploy 三条腿共用这一句，对齐 Java 三条腿
+# 同走一个 ModelParser.parse 的形状。
+MSG_READ_DEFINE_JSON_FAIL = "读取流程定义 JSON 失败"
+
 
 class JeeflowFacade:
     """统一门面——flow(action, args) -> dict"""
@@ -210,7 +218,7 @@ class JeeflowFacade:
     async def _deploy(self, args: dict) -> dict:
         """deploy 版本管理（对齐 boot3）：按 name 查最新定义，存在 version+1 插新记录，否则从 0 起"""
         content = self._content(args)
-        flow = json.loads(content)
+        flow = self._parse_define_content(content)
         name = flow.get("name", "")
         if not name:
             raise ValueError("流程定义缺少 name")
@@ -231,7 +239,7 @@ class JeeflowFacade:
         if not define_id:
             raise ValueError("processDefineId 缺失或非法")
         content = self._content(args)
-        flow = json.loads(content)
+        flow = self._parse_define_content(content)
         def_ = ProcessDefine(id=define_id, name=flow.get("name", ""),
                              displayName=flow.get("displayName", ""),
                              type=flow.get("type", "approval"),
@@ -533,11 +541,7 @@ class JeeflowFacade:
         if not his_list:
             raise ValueError("流程设计没有内容，无法发布")
         content = his_list[0].content
-        import json as _json
-        try:
-            flow = _json.loads(content)
-        except Exception as e:
-            raise ValueError(f"流程定义 JSON 解析失败: {e}")
+        flow = self._parse_define_content(content)
         name = flow.get("name") or ""
         if not name:
             raise ValueError("流程定义缺少 name")
@@ -1223,6 +1227,19 @@ class JeeflowFacade:
         if isinstance(content, bytes):
             return content.decode("utf-8")
         return str(content)
+
+    @staticmethod
+    def _parse_define_content(content):
+        """流程定义 content → JSON（issues/139：Java ModelParser.parse 的同位单一解析点）。
+
+        解析失败对外只出逐字固定文案 ``MSG_READ_DEFINE_JSON_FAIL``，原始异常作 ``__cause__``
+        留在错误对象上（``raise ... from e``）——门面顶层 ``flow()`` 用 ``str(e)`` 出 msg，
+        拼进去就是把解析器文本（异常类名/位置/内容片段）透给前端与日志。
+        """
+        try:
+            return json.loads(content)
+        except Exception as e:
+            raise ValueError(MSG_READ_DEFINE_JSON_FAIL) from e
 
     @staticmethod
     def _to_int(v) -> Optional[int]:

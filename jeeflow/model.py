@@ -220,6 +220,33 @@ class ProcessInstance:
         self.tasks.append(task)
         return task
 
+    def create_history_task(self, task_id: int, task_name: str, display_name: str,
+                            operator: str, now, parent_task_id: int,
+                            is_first_task_node: bool) -> "ProcessTask":
+        """创建**历史/已完成**任务行（记录类节点专用，issues/141 G9 · spec 02-flow-definition.md §6.1）。
+
+        形状基准＝jeeflow-java ``ProcessInstance.createHistoryTask(CustomModel, operator, ...)``
+        （domain/ProcessInstance.java:425）：``ProcessTask.create(...)`` ＋ ``setTaskState(FINISHED)``
+        ——即 **task_state=20**、参与者＝当前操作人（留痕主体，**不是待办**）、无 form、
+        无 expireTime、会签字段 0；建单不变量（parentTaskId ＋ 行级 isFirstTaskNode）同样适用
+        （issues/121 P1，java 那边是同一句注释）。
+
+        ⚠️ 这一支存在的理由（owner 2026-09-29 裁定，原话「这个得根据任务类型来，自定义类型这种
+        记录类的，不会有参与人，是正常行为」）：记录类节点**没有参与者是正常形态**，既不许按
+        任务类建 DOING 行，也不许"兜底把行挂给当前操作人"伪造一条他不该收到的待办，更不许
+        直接跳过节点丢留痕。正确形状只有这里这一种：落一条 DONE 行、令牌继续流转。
+        任务类节点仍走 ``create_task``（DOING）。"""
+        task = ProcessTask(id=task_id, processInstanceId=self.id,
+                           taskName=task_name, displayName=display_name,
+                           taskState=TaskState.DONE,
+                           actorIds=[operator] if operator else [], actorId=operator,
+                           formKey="", performType=0, parentTaskId=parent_task_id,
+                           finishTime=now, createTime=now, updateTime=now,
+                           createUser=operator, updateUser=operator)
+        task.variables["isFirstTaskNode"] = is_first_task_node
+        self.tasks.append(task)
+        return task
+
 
 @dataclass
 class ProcessTask:

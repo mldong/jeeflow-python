@@ -6093,3 +6093,447 @@ async def test_i141_g2_spi_defaults_keep_third_party_repos_on_old_behaviour():
     assert created == ["a", "b"], f"default 只折叠同一次调用内的重复、不做跨行判重: {created}"
     assert repo.create_calls == [("a", "b")], f"default 把子集原样交给 create_cc_instance: {repo.create_calls}"
 
+
+# ═══ Test 141 G10：空抄送人不建 cc 行（spec 06-facade.md §2.10 · owner 2026-09-29 拍「空不创建行」）
+#
+# 立法逐字依据（jeeflow-doc/docs/spec/06-facade.md §2.10，只读）：三条入口（发起 ``f_ccActors``／
+# 办理 ``tf_ccActors``／门面手动 ``createCCInstance``）解析抄送人集合时，**空串、纯空白、数组里的
+# 空元素一律丢弃**；丢完为空 ⇒ 不建任何 cc 行、也**不 fire 码 4**；逗号串与数组两形同判据。
+# 四点实现要求：① **两层都挡**（漏斗归一＋写侧 ``create_cc_instance`` 自己也丢，只修漏斗则绕过
+# 引擎/门面直连仓储的调用方照样灌空值）；② **落库与比较一律取 trim 后的值**（``" 123 "`` 与
+# ``"123"`` 同一个人，不 trim 会把上一轮 G2 的写侧判重打穿成同一人两行）；③ 手动腿丢完为空时与
+# **本仓既有的"空 actorIds"档同判**（本栈＝99999999 ＋ ``processInstanceId/actorIds 缺失``，
+# 沿用不新造码/文案）；④ **反向哨兵**：``"0"`` 这类"看起来像空"的正常 id 不得被当空值丢掉。
+#
+# 形状基准＝jeeflow-java commit ``5fbd5ac``（``StringUtils.normalizeCcActors`` 一支归一腿 ＋
+# handleCcActors／createCCInstance 各自先归一再判空 ＋ SPI default createCcInstanceIfAbsent ＋
+# Jdbc/Memory 两仓 createCcInstance 写侧兜底）。
+#
+# 本栈现状普查（2026-09-30 实测，明细见本轮报告）：漏斗 ``parse_cc_actors`` **早已**逐元素
+# trim/丢空/去重（java 那侧曾 ``"".split(",")`` 落一条 ``actor_id=''`` 的行、按本条更正；python
+# 没有这个洞），G10 真正缺的是——写侧三层（SPI default／内存仓／SQL 仓 裸调 ``create_cc_instance``
+# 灌空值照样落行）＋ trim 判等（``" 123 "`` 与 ``"123"`` 两行）＋ 手动腿的**数组形空元素**档
+# （``_to_str_list`` 的 list 分支只 ``str()`` 不丢 ⇒ ``[""]`` 走成"报成功但一行没建"）。
+
+def test_i141_g10_funnel_parse_cc_actors_drops_blanks_and_trims():
+    """漏斗归一（普查表钉成断言）：逗号串与数组**两形同判据**——空串/纯空白/空元素丢弃、
+    值取 trim 后的串、同一次调用折叠重复；反向哨兵 ``"0"`` 不得被当空值丢掉（要求 ④）。
+
+    摘掉 ``parse_cc_actors`` 的 trim/丢空（写回 ``raw`` 原样返回）这一格立刻红。
+    """
+    from jeeflow.engine import parse_cc_actors
+    # 逗号串腿
+    assert parse_cc_actors("") == [], '"" 归一为空集（java 旧形状这里会落一条 actor_id="" 的行）'
+    assert parse_cc_actors("   ") == []
+    assert parse_cc_actors(" , ") == []
+    assert parse_cc_actors("a,,b") == ["a", "b"], "空段丢弃、有效项保留"
+    assert parse_cc_actors("a,") == ["a"], "尾随逗号带出的空段丢弃"
+    assert parse_cc_actors(" a ") == ["a"], "落库/比较值取 trim 后的串"
+    assert parse_cc_actors(" 8123 , 8123 ") == ["8123"], "trim 后同一个人 ⇒ 折叠成一项"
+    # 数组腿
+    assert parse_cc_actors(["a", "", "  "]) == ["a"]
+    assert parse_cc_actors([""]) == []
+    assert parse_cc_actors(["  ", "\t"]) == []
+    assert parse_cc_actors(None) == []
+    assert parse_cc_actors([]) == []
+    # 反向哨兵
+    assert parse_cc_actors("0") == ["0"], '"0" 是正常 id，不是空值'
+    assert parse_cc_actors(["0", ""]) == ["0"]
+    assert parse_cc_actors([" 0 "]) == ["0"]
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_start_leg_blank_cc_creates_no_row_and_no_fire():
+    """发起腿 ``f_ccActors``：空串/纯空白/全空元素数组 ⇒ **零 cc 行、零码 4**；
+    混着给时只留有效项（丢完为空与"没带抄送"逐字同形，spec §2.10＋§11.2 原则 1）。"""
+    from jeeflow.engine import KEY_CC_ACTORS_START
+    for blank in ("", "   ", ["", "  "], ["  "], ["\t"], None):
+        eng, repo, facade, cc_events = _cc141_harness()
+        define_id = await _deploy(facade, "01-simple.json")
+        inst = await eng.start_process_instance_by_id(define_id, "zhangsan",
+                                                      {KEY_CC_ACTORS_START: blank})
+        assert await repo.find_cc_actor_ids(inst.id) == [], f"空抄送不得建行: {blank!r}"
+        assert repo.cc_rows_for_test(inst.id) == [], f"空抄送不得建行: {blank!r}"
+        assert cc_events == [], f"空抄送不得 fire 码 4: {blank!r} {[e.ccActorId for e in cc_events]}"
+    # 混给：只留有效项、且值取 trim 后的串
+    eng, repo, facade, cc_events = _cc141_harness()
+    define_id = await _deploy(facade, "01-simple.json")
+    inst = await eng.start_process_instance_by_id(define_id, "zhangsan",
+                                                  {KEY_CC_ACTORS_START: " 7101 ,, 7102 ,"})
+    assert await repo.find_cc_actor_ids(inst.id) == ["7101", "7102"]
+    assert [e.ccActorId for e in cc_events] == ["7101", "7102"]
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_handle_leg_blank_cc_creates_no_row_and_no_fire():
+    """办理腿 ``tf_ccActors``：与发起腿同一条判据（只修一条腿＝跨栈分叉）。"""
+    from jeeflow.engine import KEY_CC_ACTORS
+    for blank in ("", "   ", ["", "  "], ["  "]):
+        eng, repo, facade, cc_events = _cc141_harness()
+        define_id = await _deploy(facade, "01-simple.json")
+        inst = await eng.start_process_instance_by_id(define_id, "zhangsan")
+        doing = await repo.find_doing_tasks(inst.id)
+        await repo.add_task_actor(doing[0].id, ["zhangsan"])
+        await eng.execute_process_task(doing[0].id, "zhangsan", {"submitType": 0})
+        doing = await repo.find_doing_tasks(inst.id)
+        assert doing, "申请节点办结后应有 task1 待办"
+        await repo.add_task_actor(doing[0].id, ["leader"])
+        cc_events.clear()
+        await eng.execute_process_task(doing[0].id, "leader",
+                                       {"submitType": 1, KEY_CC_ACTORS: blank})
+        assert await repo.find_cc_actor_ids(inst.id) == [], f"办理腿空抄送不得建行: {blank!r}"
+        assert cc_events == [], f"办理腿空抄送不得 fire 码 4: {blank!r}"
+    # 混给：空元素丢弃、有效项照常
+    eng, repo, facade, cc_events = _cc141_harness()
+    define_id = await _deploy(facade, "01-simple.json")
+    inst = await eng.start_process_instance_by_id(define_id, "zhangsan")
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["zhangsan"])
+    await eng.execute_process_task(doing[0].id, "zhangsan", {"submitType": 0})
+    doing = await repo.find_doing_tasks(inst.id)
+    await repo.add_task_actor(doing[0].id, ["leader"])
+    cc_events.clear()
+    await eng.execute_process_task(doing[0].id, "leader",
+                                   {"submitType": 1, KEY_CC_ACTORS: ["", " 7103 ", "", "7104"]})
+    assert await repo.find_cc_actor_ids(inst.id) == ["7103", "7104"]
+    assert [e.ccActorId for e in cc_events] == ["7103", "7104"]
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_manual_leg_empty_after_drop_is_the_missing_actorids_case():
+    """手动腿（要求 ③）：``actorIds`` 丢完为空 ⇒ 与本仓**既有的"空 actorIds"档同判**
+    ——99999999 ＋ msg 含 ``actorIds 缺失``（逐字沿用 ``test_create_cc_instance_empty_actors``
+    那一档，不新造错误码/文案），并且零行零 fire。
+
+    旧形状：``[""]`` 经 ``_to_str_list`` 得到**非空 list** ⇒ 过了判空闸门、进了漏斗被丢成空集
+    ⇒ "报成功但一行没建"（与 java 的 ``return error("actorIds 缺失")`` 分叉）。"""
+    for bad in ([""], ["  "], ["", "  "], ["\t"], "", "   ", " , "):
+        eng, repo, facade, cc_events = _cc141_harness()
+        r = await facade.flow("processInstance/createCCInstance",
+                              {"processInstanceId": 500, "operator": "zhangsan", "actorIds": bad})
+        assert r["code"] == 99999999, f"{bad!r} 应与空 actorIds 同档报错: {r}"
+        assert "actorIds 缺失" in r["msg"], f"{bad!r} 沿用既有文案: {r}"
+        assert await repo.find_cc_actor_ids(500) == []
+        assert cc_events == []
+    # 既有那两档不破（回归）：真空 list／缺键同样报同一句
+    eng, repo, facade, _ev = _cc141_harness()
+    for bad_args in ({"actorIds": []}, {}):
+        r = await facade.flow("processInstance/createCCInstance",
+                              {"processInstanceId": 500, "operator": "zhangsan", **bad_args})
+        assert r["code"] == 99999999 and "actorIds 缺失" in r["msg"], (bad_args, r)
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_manual_leg_keeps_valid_and_trim_matches_write_side_dedup():
+    """手动腿正向：数组里的空元素丢弃、有效项 trim 后落库；**trim 判等与 G2 写侧判重咬合**
+    （要求 ②）——先抄 ``" 8123 "`` 再抄 ``"8123"`` ⇒ 库里只有 8123 一行、第二次不新增也不 fire。"""
+    eng, repo, facade, cc_events = _cc141_harness()
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    cc_events.clear()
+
+    await _cc141_manual(facade, iid, "a", "", "  ")
+    assert await repo.find_cc_actor_ids(iid) == ["a"], "空元素丢弃、有效项保留"
+    assert [e.ccActorId for e in cc_events] == ["a"]
+
+    cc_events.clear()
+    await _cc141_manual(facade, iid, " 8123 ")
+    assert await repo.find_cc_actor_ids(iid) == ["a", "8123"], \
+        f"落库值取 trim 后的串: {await repo.find_cc_actor_ids(iid)}"
+    assert [e.ccActorId for e in cc_events] == ["8123"]
+
+    cc_events.clear()
+    _cc141_tick()
+    await _cc141_manual(facade, iid, "8123")
+    assert await repo.find_cc_actor_ids(iid) == ["a", "8123"], \
+        "同一人不许因前后空格落两行（G10 的 trim 与 G2 的判重同一条尺子）"
+    assert cc_events == [], f"没发生创建 ⇒ 不发码 4: {cc_events}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_memory_repo_write_side_blocks_blanks():
+    """写侧兜底（要求 ①，内存仓）：绕过引擎漏斗/门面**裸调** ``create_cc_instance`` 灌空值 ⇒
+    照样建不出行；同批里的有效项照常落。只修漏斗时这一档是漏的（本轮普查实测：旧形状
+    ``("",)``／``("  ",)`` 各落一条 ``CcRow('')``/``CcRow('  ')``）。"""
+    repo = MemoryRepository()
+    await repo.create_cc_instance(1, "zhangsan", "", "   ", "\t", None)
+    assert repo.cc_rows_for_test(1) == [], "空串/纯空白/None 一律不落行"
+    await repo.create_cc_instance(2, "zhangsan", "6101", "", "  ")
+    assert [str(r) for r in repo.cc_rows_for_test(2)] == ["6101"], "混给时只丢空元素"
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_memory_repo_write_side_trims():
+    """写侧兜底＋trim（内存仓，要求 ②）：``" 8102 "`` 与 ``"8102"`` 是同一个人 ⇒ 只一行，
+    且落库值是 trim 后的串；**同一次调用内**两形也只一行（不 trim 就把 G2 判重打穿成两行）。"""
+    repo = MemoryRepository()
+    await repo.create_cc_instance(3, "zhangsan", " 8102 ")
+    assert [str(r) for r in repo.cc_rows_for_test(3)] == ["8102"], "落库值取 trim 后的串"
+    await repo.create_cc_instance(3, "zhangsan", "8102")
+    assert [str(r) for r in repo.cc_rows_for_test(3)] == ["8102"], "跨调用判重不吃空格"
+    await repo.create_cc_instance(3, "zhangsan", " 8103 ", "8103")
+    assert [str(r) for r in repo.cc_rows_for_test(3)] == ["8102", "8103"], "同调用折叠"
+    assert await repo.find_cc_actor_ids(3) == ["8102", "8103"]
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_spi_default_drops_blanks_and_trims():
+    """写侧兜底（要求 ①，SPI default ``create_cc_instance_if_absent``）：未覆写
+    ``find_cc_actor_ids`` 的第三方仓储走 default ⇒ 空档不进子集（连 ``create_cc_instance``
+    都不该被调），比较与返回的子集取 trim 后的值。"""
+    class _ThirdPartyRepo(MemoryRepository):
+        find_cc_actor_ids = ProcessRepository.find_cc_actor_ids
+
+        def __init__(self):
+            super().__init__()
+            self.create_calls: list[tuple] = []
+
+        async def create_cc_instance(self, instance_id, creator, *actor_ids):
+            self.create_calls.append(actor_ids)
+            await MemoryRepository.create_cc_instance(self, instance_id, creator, *actor_ids)
+
+    repo = _ThirdPartyRepo()
+    assert await repo.create_cc_instance_if_absent(9, "zhangsan", ["", "  ", "\t", None]) == []
+    assert repo.create_calls == [], "全空入参 ⇒ 子集空 ⇒ 不写库、不 fire"
+    created = await repo.create_cc_instance_if_absent(
+        9, "zhangsan", [" 8201 ", "", "8201", None, "8202"])
+    assert created == ["8201", "8202"], f"子集＝归一后的值＋折叠重复: {created}"
+    assert repo.create_calls == [("8201", "8202")], repo.create_calls
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_sql_repo_write_side_blocks_blanks_and_trims():
+    """写侧兜底（要求 ①②，SQL 仓一路真 SQLite）：裸调 ``create_cc_instance`` 灌空值 ⇒ 零行；
+    ``" 8301 "`` 与 ``"8301"`` 判同一人只一行。断言直查 ``wf_process_cc_instance`` 的真实行。"""
+    raw, repo = _cc141_sql_repo()
+    iid = 9_421_010
+    await repo.create_cc_instance(iid, "zhangsan", "", "  ", "\t", None)
+    assert _cc141_cc_rows(raw, iid) == [], "空串/纯空白/None 一律不落行"
+
+    await repo.create_cc_instance(iid, "zhangsan", " 8301 ")
+    assert [r[1] for r in _cc141_cc_rows(raw, iid)] == ["8301"], "落库值取 trim 后的串"
+    await repo.create_cc_instance(iid, "zhangsan", "8301")
+    assert [r[1] for r in _cc141_cc_rows(raw, iid)] == ["8301"], "同一人不许因空格落两行"
+    await repo.create_cc_instance(iid, "zhangsan", "8302", "", " 8302 ", "8303")
+    assert [r[1] for r in _cc141_cc_rows(raw, iid)] == ["8301", "8302", "8303"]
+
+    created = await repo.create_cc_instance_if_absent(
+        iid, "zhangsan", ["", " 8303 ", "8304", None])
+    assert created == ["8304"], f"子集只含归一后的新人: {created}"
+    assert [r[1] for r in _cc141_cc_rows(raw, iid)] == ["8301", "8302", "8303", "8304"]
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_reverse_sentinel_zero_like_ids_survive_every_layer():
+    """反向哨兵（要求 ④）：``"0"`` 这类"看起来像空"的正常 id 在**每一层**都不许被丢掉——
+    漏斗／内存仓／SQL 仓／SPI default／门面手动腿。判据只认 ``strip()`` 后是否为空串，
+    写成 ``if not actor`` 就会在这一格红。"""
+    from jeeflow.engine import parse_cc_actors
+    assert parse_cc_actors(["0"]) == ["0"]
+
+    repo = MemoryRepository()
+    await repo.create_cc_instance(11, "zhangsan", "0")
+    assert [str(r) for r in repo.cc_rows_for_test(11)] == ["0"], "内存仓不得丢掉 0"
+
+    raw, sql = _cc141_sql_repo()
+    await sql.create_cc_instance(11, "zhangsan", "0")
+    assert [r[1] for r in _cc141_cc_rows(raw, 11)] == ["0"], "SQL 仓不得丢掉 0"
+    assert await sql.create_cc_instance_if_absent(11, "zhangsan", ["0"]) == [], \
+        "已存在的人判重生效（判据是库里已有行，不是值是 0）"
+
+    eng, _repo, facade, cc_events = _cc141_harness()
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": 500, "operator": "zhangsan", "actorIds": ["0"]})
+    assert r["code"] == 0, f'"0" 不是空值，不该走"actorIds 缺失"档: {r}'
+    assert [e.ccActorId for e in cc_events] == ["0"]
+
+
+@pytest.mark.asyncio
+async def test_i141_g10_two_repos_same_answer():
+    """两仓同答案（issues/117 场景 27 那把尺子）：同一批"带空值/带空格"的入参逐对灌进内存仓与
+    SQL 仓，落出的 actor 集必须逐字相同——只修一边（本轮普查的真实风险面）在这一格红。"""
+    matrix = [("",), ("  ",), ("a", ""), (" b ",), ("b",), ("0",), (" 0 ",), (None,)]
+    mem = MemoryRepository()
+    raw, sql = _cc141_sql_repo()
+    for i, args in enumerate(matrix, start=1):
+        await mem.create_cc_instance(i, "zhangsan", *args)
+        await sql.create_cc_instance(i, "zhangsan", *args)
+    mem_ans = {i: [str(r) for r in mem.cc_rows_for_test(i)] for i in range(1, len(matrix) + 1)}
+    sql_ans = {i: [r[1] for r in _cc141_cc_rows(raw, i)] for i in range(1, len(matrix) + 1)}
+    assert mem_ans == sql_ans, f"两仓判据分叉:\n 内存仓 {mem_ans}\n SQL 仓 {sql_ans}"
+    assert mem_ans[1] == [] and mem_ans[2] == [] and mem_ans[8] == [], "空档两仓都是零行"
+    assert mem_ans[3] == ["a"] and mem_ans[4] == ["b"] and mem_ans[5] == ["b"], \
+        f"trim 判等两仓同尺: {mem_ans}"
+    assert mem_ans[6] == ["0"] and mem_ans[7] == ["0"], "哨兵 0 两仓都保住"
+
+
+# ═══ Test 141 G9：记录类（snaker:custom）节点没有参与者是正常形态（spec 02 §6.1）═══════════
+#
+# 立法逐字依据（jeeflow-doc/docs/spec/02-flow-definition.md §6.1，只读）——
+# owner 2026-09-29 原话：「这个得根据任务类型来，自定义类型这种记录类的，不会有参与人，是正常行为。」
+# ⇒ "参与者解析为空"按**节点类型分判**：
+#   · 任务类（task／approval，含会签）：仍建 DOING 行（G5 那一支本轮不动）；
+#   · 记录类（custom／带 clazz 的自定义节点）：**不得建 DOING 行**，执行 clazz、落一条
+#     历史/已完成行（task_state=20）、令牌继续流转。
+# 三条禁止形状里本轮撤掉的是 python 上一笔 commit `ac8b557` 引入的②「兜底把行挂给当前操作人」
+# （伪造一条他不该收到的待办）。形状基准＝jeeflow-java `model/CustomModel.java`
+# （exec ⇒ 执行 clazz ⇒ `createHistoryTask`（FINISHED）⇒ `runOutTransition`）。
+#
+# ⚠️ 一处刻意的栈分歧（不是判据分歧，报告里单列）：java/C# 在 clazz 不可解析时**显式报错**；
+# python 夹具里的 clazz 是 JVM 类名（`com.mldong.jeeflow.test.TestCustomHandler`），本栈无从解析，
+# 报错会让任何沿用共享夹具的流程必然失败 ⇒ 本栈未注册时记 WARNING 后继续"落历史行＋推进"。
+
+def _i141g9_harness():
+    """记录类节点夹具：引擎＋门面＋**全量**事件 sink＋可按名注册 clazz 处理器的 registry。"""
+    from jeeflow import HandlerRegistry
+    repo = MemoryRepository()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    events: list = []
+    reg = HandlerRegistry()
+    eng.set_extensions(EngineExtensions(event_listeners=[lambda e: events.append(e)], registry=reg))
+    return eng, repo, facade, events, reg
+
+
+@pytest.mark.asyncio
+async def test_i141_g9_custom_node_is_record_not_todo_and_flow_continues():
+    """核心形状（夹具 08-custom-node.json：start→apply(task)→custom1(custom)→end）：
+    发起后 custom1 **不建 DOING 行**、落一条 **DONE 历史行**、令牌走到 end ⇒ 实例 state=20。
+
+    改前（HEAD `f6fc3b4`，参与者为空时兜底给当前操作人建 DOING）这一格红在②③：
+    实测形状是 custom1 `task_state=10`／actors=['userB']，实例停在 state=10。"""
+    _eng, repo, facade, events, _reg = _i141g9_harness()
+    define_id = await _deploy(facade, "08-custom-node.json")
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "userB"})
+    assert r["code"] == 0, r
+    iid = int(r["data"]["processInstanceId"])
+
+    inst = await repo.find_instance_by_id(iid)
+    tasks = {t.taskName: t for t in inst.tasks}
+    assert "custom1" in tasks, f"记录类节点不得丢留痕: {list(tasks)}"
+    # ② 禁止"兜底挂当前操作人的 DOING 行"
+    assert int(tasks["custom1"].taskState) == 20, \
+        f"custom 节点必须落历史/已完成行（不许当任务类建待办）: {tasks['custom1'].taskState}"
+    assert not await repo.find_doing_tasks(iid), f"custom 节点不得产生 DOING 行: {await repo.find_doing_tasks(iid)}"
+    # ③ 禁止"直接跳过不建行"——令牌继续推进到 end
+    assert int(inst.state) == 20, f"流程应随记录类节点执行后继续推进到办结，实得 state={inst.state}"
+    # 当前操作人那里不该多出这条待办
+    todo = await facade.flow("processTask/todoList", {"operator": "userB", "pageNum": 1, "pageSize": 50})
+    names = [row.get("taskName") for row in (todo.get("data") or {}).get("rows") or []]
+    assert "custom1" not in names, f"伪造待办又回来了: {names}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g9_custom_history_row_carries_invariants_and_no_task_start_event():
+    """历史行的建单不变量与事件形状：parentTaskId＝刚办结的那个任务（非 0）、
+    行级 isFirstTaskNode 在、`finish_time` 落了；**不发**码 3（PROCESS_TASK_START）——
+    对齐 java `persistTasks` 只对新建 DOING 单走 `notifyTaskStart`，`createHistoryTask` 那支不进。"""
+    _eng, repo, facade, events, _reg = _i141g9_harness()
+    define_id = await _deploy(facade, "08-custom-node.json")
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "userB"})
+    iid = int(r["data"]["processInstanceId"])
+    inst = await repo.find_instance_by_id(iid)
+    apply_task = next(t for t in inst.tasks if t.taskName == "apply")
+    custom = next(t for t in inst.tasks if t.taskName == "custom1")
+
+    assert custom.parentTaskId == apply_task.id and custom.parentTaskId, \
+        f"历史行要带 parent（issues/121 P1 建单不变量）: {custom.parentTaskId} vs {apply_task.id}"
+    assert custom.variables.get("isFirstTaskNode") is False, "custom1 不是首任务节点"
+    assert apply_task.variables.get("isFirstTaskNode") is True, "apply 是首任务节点（对照）"
+    assert custom.finishTime is not None, "已完成行应有 finishTime"
+    assert custom.displayName == "通知外部系统", f"行显示名取节点 text: {custom.displayName}"
+
+    starts = [e for e in events if e.type is EventType.PROCESS_TASK_START]
+    assert all(int(e.taskId) != custom.id for e in starts), \
+        f"记录类行不得发码 3（码 3 表达新待办产生）: {[(e.taskId, e.taskName) for e in starts]}"
+    assert any(e.type is EventType.PROCESS_INSTANCE_END for e in events), "实例办结仍要发码 2"
+
+
+@pytest.mark.asyncio
+async def test_i141_g9_custom_clazz_handler_runs_and_return_lands_in_vars():
+    """clazz 执行腿：按名注册的处理器被调用（java `CustomModel.exec` 的 IHandler 那支同形），
+    返回值写进执行变量的 `val` 指定键；未指定 `val` 时回落缺省键 `custom_return_val`
+    （java FlowConst.CUSTOM_RETURN_VAL）。异步与同步两种 handle 都吃。"""
+    from jeeflow.extensions import ICustomHandler
+    from jeeflow.engine import KEY_CUSTOM_RETURN_VAL
+
+    seen: list = []
+
+    class _AsyncHandler(ICustomHandler):
+        async def handle(self, node, instance, operator, vars_):
+            seen.append((node.id, operator))
+            return "customExecuted"
+
+    eng, repo, facade, _events, reg = _i141g9_harness()
+    reg.register_custom("com.mldong.jeeflow.test.TestCustomHandler", _AsyncHandler())
+    define_id = await _deploy(facade, "08-custom-node.json")
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "userB"})
+    iid = int(r["data"]["processInstanceId"])
+    assert seen == [("custom1", "userB")], f"handler 应按 clazz 名解析并执行一次: {seen}"
+    inst = await repo.find_instance_by_id(iid)
+    # 夹具的 custom1 properties 里 "val": "customResult" ⇒ 返回值落 customResult
+    assert inst.variables.get("customResult") == "customExecuted", \
+        f"返回值应写进 val 指定的键: {inst.variables}"
+    assert KEY_CUSTOM_RETURN_VAL not in inst.variables, "给了 val 就不该再落到缺省键"
+
+
+@pytest.mark.asyncio
+async def test_i141_g9_unregistered_clazz_falls_back_to_record_and_continue():
+    """本栈刻意的分歧档（报告单列）：clazz 未注册 ⇒ **不报错**，仍然落历史行＋流程继续推进。
+    java/C# 这里是 `throw 自定义模型[class=...]实例化对象失败`；python 的夹具 clazz 是 JVM 类名、
+    本栈无从解析，报错＝沿用共享夹具的流程在 python 必然失败（栈限制非语义缺陷）。
+    这一格钉住"分歧只在 clazz 那一支，形状（DONE 行＋推进）不许跟着漂"。"""
+    _eng, repo, facade, _events, _reg = _i141g9_harness()   # 不注册任何 custom handler
+    define_id = await _deploy(facade, "08-custom-node.json")
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "userB"})
+    assert r["code"] == 0, f"未注册 clazz 不得把流程打断: {r}"
+    inst = await repo.find_instance_by_id(int(r["data"]["processInstanceId"]))
+    custom = next(t for t in inst.tasks if t.taskName == "custom1")
+    assert int(custom.taskState) == 20 and int(inst.state) == 20, \
+        f"仍要落历史行＋推进: row={custom.taskState} inst={inst.state}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g9_task_node_with_empty_actors_still_creates_doing_row():
+    """分流的另一半（回归哨兵）：**任务类**节点参与者为空 ⇒ 照旧建一行 DOING（G5 的口径本轮不动，
+    owner 指令"这条不变"）——改动只把记录类那一侧搬走，不许顺手把任务类也变成不建行。
+
+    夹具：start → apply(task, assignee=applicant，被 startAndExecute 自动办结)
+    → task2(task，**不给 assignee/handler** ⇒ `_resolve_actors` 返回空) → end。"""
+    eng, repo, facade, _events, _reg = _i141g9_harness()
+    content = json.dumps({
+        "name": "g9-task-empty-actors", "displayName": "任务类空参与者", "type": "approval",
+        "nodes": [
+            {"id": "start", "type": "snaker:start", "text": {"value": "开始"}, "properties": {}},
+            {"id": "apply", "type": "snaker:task", "text": {"value": "发起申请"},
+             "properties": {"assignee": "applicant"}},
+            {"id": "task2", "type": "snaker:task", "text": {"value": "没人可派的审批"},
+             "properties": {}},
+            {"id": "end", "type": "snaker:end", "text": {"value": "结束"}, "properties": {}},
+        ],
+        "edges": [{"id": "e1", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {}},
+                  {"id": "e2", "sourceNodeId": "apply", "targetNodeId": "task2", "properties": {}},
+                  {"id": "e3", "sourceNodeId": "task2", "targetNodeId": "end", "properties": {}}],
+    })
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    assert r["code"] == 0, r
+    did = int(r["data"]["processDefineId"])
+    node2 = next(n for n in parse_flow_model(json.loads(content)).nodes if n.id == "task2")
+    inst_probe = await repo.find_instance_by_id(1) or ProcessInstance(id=1, defineId=did, operator="zhangsan")
+    assert await eng._resolve_actors(node2, inst_probe, "zhangsan", {}) == [], \
+        "夹具前提：task2 的参与者解析必须真的是空集，否则这一格照不到兜底那一支"
+
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": did, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    iid = int(r["data"]["processInstanceId"])
+    doing = await repo.find_doing_tasks(iid)
+    assert [t.taskName for t in doing] == ["task2"], \
+        f"任务类节点解析不到人也要留一行可办待办（本轮不许把这条一起改掉）: {doing}"
+    inst = await repo.find_instance_by_id(iid)
+    assert int(inst.state) == 10, "任务类空参与者仍停在进行中"
+

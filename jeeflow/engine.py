@@ -1,5 +1,6 @@
 """引擎核心——对标 Java EngineImpl"""
 import logging
+import inspect
 import json, re, time, random
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
@@ -11,6 +12,7 @@ from .model import (
     parse_flow_model,
 )
 from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
+from .spi import normalize_cc_actors
 from .extensions import EngineExtensions, EventType, ProcessEvent
 
 KEY_SUBMIT_TYPE   = "submitType"
@@ -38,6 +40,10 @@ KEY_AUTO_GEN_TITLE = "autoGenTitle"
 KEY_CC_ACTORS_START = "f_ccActors"
 KEY_CC_ACTORS = "tf_ccActors"
 
+# ─── 记录类（自定义）节点返回值变量键（逐字对齐 Java FlowConst.CUSTOM_RETURN_VAL，issues/141 G9）
+# 节点 properties 的 `val` 指定别的键名时用那个；`val` 缺省才回落到本键。
+KEY_CUSTOM_RETURN_VAL = "custom_return_val"
+
 # ─── 事件分档（spec 11-events §11.3 码 5/6 互斥判据）──────────────────────────────
 
 #: 归入 TASK_REJECT（码 6）的 submitType 档：拒绝 / 退上一步 / 退发起人 / 会签软拒绝。
@@ -63,6 +69,14 @@ def parse_cc_actors(value: Any) -> list[str]:
     逗号串、``list``/``tuple``、单个标量都吃 → ``list[str]``；逐项 ``str``＋trim、丢空项、
     **按出现顺序去重**；``None``/空串/空集合 → ``[]``（零副作用）。
 
+    **issues/141 G10「空不创建行」**（spec 06 §2.10）：逐元素的 trim/丢空/折叠重复收在
+    ``spi.normalize_cc_actors`` 单点（java 的 ``StringUtils.normalizeCcActors`` 同构），本函数只做
+    **形态适配**（逗号串拆成元素）——逗号串与数组两形在这条上同判据，缺一条腿就是分叉。
+    ``""`` 拆出来的是**一个空元素**（python 与 java 同病），归一后为 ``[]`` ⇒ 调用方
+    （``handle_cc_actors``）既不建 cc 行也不 fire 码 4；``"0"`` 这类正常 id **不是**空值，不得丢。
+    漏斗只是**第一层**，写侧（两仓 ``create_cc_instance`` ＋ SPI default ``create_cc_instance_if_absent``）
+    还各有一层兜底，绕过引擎/门面直连仓储的调用方同样灌不进空值。
+
     去重不是锦上添花：``create_cc_instance`` 逐行写、CC_CREATE 逐人 fire，二者粒度必须一一对应
     （spec §11.3 码 4「逐抄送人 fire 一次」）。同一人传两次在内存仓会被 ``dict.fromkeys`` 折成一行，
     事件却发两条 ⇒「一行两事件」破掉粒度；SQL 仓那侧更是直接双写 cc 行。
@@ -75,12 +89,7 @@ def parse_cc_actors(value: Any) -> list[str]:
         raw = value.split(",")
     else:
         raw = [value]
-    out: list[str] = []
-    for item in raw:
-        actor = str(item).strip()
-        if actor and actor not in out:
-            out.append(actor)
-    return out
+    return normalize_cc_actors(raw)
 
 
 class Engine:
@@ -214,6 +223,11 @@ class EngineImpl(Engine):
         ``cc_actors`` 为 ``None``/空 ⇒ 零写入、零 fire、返回 ``[]``（纯增量：不带抄送的发起/办理
         行为与上一版逐字一致）。返回归一化后的**请求**抄送人列表（不是新建子集——调用方按
         "我请求抄给了谁"读，事件按"实际新建了谁"发，两件事各有各的形状）。
+
+        **空不创建行**（issues/141 G10 · spec 06 §2.10）：``f_ccActors``/``tf_ccActors`` 给
+        ``""``、``"   "``、``"a,"``、``["a", "", "  "]`` 这类形态时，``parse_cc_actors`` 先归一
+        ——空串/纯空白/空元素全丢，**丢完为空就是 ``[]``** ⇒ 这一支既不建行也不 fire 码 4；
+        逗号串与数组两形同判据（``" 123 "`` 与 ``"123"`` 归一后是同一个人，与下面的写侧判重咬合）。
 
         重复抄送同一个人（issues/141 G2 · spec 06 §4）＝数据面 no-op：不新增行、不重置未读、
         不刷原行时间，且**不发**码 4。判重落在仓储写侧（两仓同判据），事件收口落在这一个漏斗里，
@@ -634,10 +648,16 @@ class EngineImpl(Engine):
                             parent_id: int = 0):
         # 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
         # 任务完成的拦截器由 execute_process_task 显式触发，1.8.0 SYNC 同步演进）
-        if node.type in (TYPE_TASK, TYPE_CUSTOM):
+        if node.type == TYPE_TASK:
             await self._create_task(node, inst, operator, vars_,
                                     await self._surrogate_process_name(flow, inst),
                                     parent_id, self._is_first_task_node(flow, node))
+            return
+        # 记录类节点（snaker:custom）：**不是**任务类，按节点类型分流（issues/141 G9 ·
+        # spec 02 §6.1，owner 2026-09-29 裁定「自定义类型这种记录类的，不会有参与人，是正常行为」）
+        # ——java 那边 CustomModel 与 TaskModel 是两个平行模型，custom 从不走 CreateTaskHandler。
+        if node.type == TYPE_CUSTOM:
+            await self._exec_custom_node(flow, inst, node, operator, vars_, parent_id)
             return
         if not await self._fire_pre(node, inst): return
         try:
@@ -693,13 +713,15 @@ class EngineImpl(Engine):
                            process_name: str = "", parent_id: int = 0, is_first: bool = False):
         actors = await self._resolve_actors(node, inst, operator, vars_)
         if not actors:
-            # issues/141 G5：参与者解析为空**不丢 token**。此前此处直接 return —— 该节点既没有
-            # 任务行也没有继续流转，实例永远停在 state=10 却零可办行（谁也办不动，demo 里
-            # define=10「自定义节点」/define=14「handler 取不到人」两档就是这么卡住的）。
-            # Java 参考实现在这条路上从不跳过建单（CreateTaskHandler 无条件
-            # ProcessTask.create 落 DOING 行），本栈对齐"必建一行"，并按本栈既有兜底口径
-            # （_rollback_actors 的 ``... or [operator]``、_sync_resolve_actors 同款）把行挂给
-            # 当前操作人，使它成为一条真实可办的待办；操作人与发起人都取不到人才回落不建单。
+            # issues/141 G5→G9：这一支现在**只服务任务类节点**——记录类（snaker:custom）已在
+            # ``_execute_node`` 按类型分流到 ``_exec_custom_node``（spec 02 §6.1，owner 2026-09-29
+            # 裁定「自定义类型这种记录类的，不会有参与人，是正常形态」），不再进这里，
+            # 也就不再产生"记录类兜底挂操作人 ⇒ 伪造一条不该收到的待办"那个形状。
+            # 任务类保持 G5 的既有口径不动：参与者解析为空**不丢 token**，仍要建一行 DOING
+            # （java CreateTaskHandler 无条件建单；本栈按 ``or [operator]`` 的既有兜底口径
+            # 挂给当前操作人，使这一行真实可办——与 _rollback_actors / _sync_resolve_actors 同款。
+            # 注：spec §6.1 硬结论 1「兜底挂当前操作人八栈一律不许有」若也适用于任务类，
+            # 需要 owner 另行拍板改成"零参与者建单"，本轮按指令只动记录类那一侧）。
             fallback = operator or inst.operator
             if not fallback:
                 return
@@ -755,6 +777,66 @@ class EngineImpl(Engine):
             await self._apply_surrogate(nt, process_name)
             await self.repo.save_task(nt)
             await self._fire_task_start(inst, nt, node.id, operator)
+
+    async def _exec_custom_node(self, flow: FlowModel, inst: ProcessInstance, node: FlowNode,
+                                operator: str, vars_: dict, parent_id: int = 0) -> None:
+        """记录类节点（``snaker:custom``／带 ``clazz`` 的自定义节点）执行腿
+        ——issues/141 G9 · spec 02-flow-definition.md §6.1（owner 2026-09-29 裁定）。
+
+        原话：「这个得根据任务类型来，自定义类型这种记录类的，不会有参与人，是正常行为。」
+        ⇒ "参与者解析为空"按节点类型**分判**，本腿是记录类那一半：
+
+        1. 执行 ``clazz``（按名解析处理器，见下）；
+        2. 落一条**历史/已完成**行（``task_state=20``，``ProcessInstance.create_history_task``）；
+        3. **令牌沿出边继续流转**（流程推进，不卡在这一格）。
+
+        三件禁止的形状（spec §6.1 表列"本轮抓到过实例"），本腿逐条不犯：
+        - ① 当任务类建 DOING 行 —— 不建；
+        - ② **兜底把行挂给当前操作人伪造一条待办** —— 上一笔 commit ``ac8b557`` 为消
+          ``demo_reset_test`` 长期红就是这么修的，本轮按裁定**撤回**；操作人只作为历史行的
+          **留痕主体**（``actorIds=[operator]``，java ``createHistoryTask`` 同形），行状态是
+          DONE ⇒ 谁也办不动，不在待办里出现；
+        - ③ 直接跳过节点不建行（丢留痕）—— 上一版之前的旧形状，也不许回到那里。
+
+        ``clazz`` 的解析形状：java 用反射按 FQCN 实例化（``CustomModel.exec``），python 没有
+        JVM 类路径可解析（夹具 ``flows/08-custom-node.json`` 里就是 ``com.mldong...`` 这种
+        Java 类名），故与 **C# 栈同策**：集成方 ``HandlerRegistry.register_custom(<clazz 原样串>,
+        handler)`` 按名注册，引擎按名解析后调用，返回值非 ``None`` 时写进执行变量的 ``val``
+        （缺省键 ``custom_return_val``，对齐 java ``FlowConst.CUSTOM_RETURN_VAL``）。
+        ⚠️ **与 java/C# 的一处刻意分歧**：java 与 C# 在"clazz 不可解析"时**显式报错**
+        （``自定义模型[class=...]实例化对象失败``）。本栈未注册时**记 WARNING 日志后继续**——
+        因为本栈根本没有"能不能反射到某个 Java 类"这件事可判，报错会让任何沿用共享夹具
+        （``08-custom-node.json`` 的 JVM 类名）的流程在 python 上必然失败，那是**栈限制**不是
+        **语义缺陷**；而"建行＋继续推进"才是 §6.1 要钉的形状。要 java/C# 同策（显式报错）
+        需 owner 另行拍板，见本轮报告。
+
+        不发 ``PROCESS_TASK_START``（码 3）：码 3 表达"新待办产生"，本腿建行即已完成态，
+        对齐 java——``persistTasks`` 只对 ``exec.getProcessTaskList()``（新建的 DOING 单）
+        走 ``saveNewTask``→``notifyTaskStart``，``createHistoryTask`` 挂的是聚合根 tasks，
+        由 ``updateInstance`` 级部落库，不进码 3 那支。"""
+        clazz = str(node.properties.get("clazz", "") or "").strip()
+        handler = None
+        if clazz and self.ext is not None and self.ext.registry is not None:
+            handler = self.ext.registry.resolve_custom(clazz)
+        if handler is not None:
+            # 处理器执行失败一律外抛（对齐 java CustomModel：方法调用失败 ⇒ RuntimeException）
+            ret = handler.handle(node, inst, operator, vars_)
+            if inspect.isawaitable(ret):
+                ret = await ret
+            var_key = str(node.properties.get("val", "") or "").strip() or KEY_CUSTOM_RETURN_VAL
+            if ret is not None:
+                vars_[var_key] = ret
+        elif clazz:
+            logging.warning("[jeeflow] custom 节点 clazz=%s 未注册处理器，跳过执行只落历史行"
+                            "（本栈按名注册：HandlerRegistry.register_custom）", clazz)
+        now = datetime.now()
+        ht = inst.create_history_task(self._next_id(), node.id, node.text.get("value", ""),
+                                      operator, now, parent_id,
+                                      self._is_first_task_node(flow, node))
+        await self.repo.save_task(ht)
+        # 令牌继续流转（java CustomModel 收尾那句 runOutTransition）
+        for n in _follow_edges(flow, node.id):
+            await self._execute_node(flow, inst, n, operator, vars_, parent_id)
 
     async def _apply_surrogate(self, task: ProcessTask, process_name: str) -> None:
         """委托代理自动生效（issues/116 批次 D，引擎内置默认开启）——

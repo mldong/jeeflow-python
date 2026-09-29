@@ -3,6 +3,13 @@
 矩阵 = 八语言共用 canonical（day-shift 已在 Rust demo 实测全绿，照 rust seed_business.rs 移植）：
 16 进行中(state=10) + 9 已完成(advance 推到 state=20) + 8 委托。
 8 用户 × 5 菜单（待办/已办/发起/抄送/委托）全覆盖。
+
+⚠️ 矩阵"行数"与落库"状态读数"自 2026-09-30 起不再相等（issues/141 G9 · spec 02 §6.1）：
+IN_PROGRESS 的 I15 用的是 08-custom-node.json（define=10），该流程 apply 之后就是 custom1
+**记录类节点**——按裁定它不建待办、落一条已完成历史行并直接走到 end ⇒ I15 实测办结成
+state=20。本栈实测状态读数 **15 进行中 / 10 已完成**（行数仍 16/9，实例总数 25 不变），
+tests/demo_reset_test.py 钉的是状态读数。下方 `ok_in/ok_fin` 计数的是"种子行跑成功几条"，
+不是状态分布，别拿它对数。
 """
 
 IN_PROGRESS = [

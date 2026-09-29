@@ -13,6 +13,39 @@ class QueryCondition:
     value: Any
 from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow, DefineRow, InstanceRow, TaskRow, InstanceStatsRow, TaskStatsRow)
 
+
+def normalize_cc_actors(raw) -> list[str]:
+    """抄送人集合归一（issues/141 G10「空不创建行」，spec 06-facade.md §2.10）——
+    逐元素 ``str``＋trim，**空串与纯空白丢弃**，同一次调用内的重复折叠（顺序保持）。
+
+    形状基准＝jeeflow-java ``StringUtils.normalizeCcActors``（commit ``5fbd5ac``）。
+    本仓把它放在 **spi 层**（与 ``ProcessRepository`` 同模块）而不是 engine 层，理由和 java
+    放在 ``StringUtils`` 一样：这条判据要同时被**漏斗**（``engine.parse_cc_actors``／门面手动腿）
+    和**写侧**（``create_cc_instance_if_absent`` default、两仓 ``create_cc_instance``）吃到，
+    而仓储实现不该反向依赖引擎模块——只修漏斗时，绕过门面/引擎直连仓储的调用方照样能把
+    空归属值灌进 ``actor_id``（issues/129 那族"空 operator 读全库"的病根）。
+
+    判据要点：
+    - **逗号串不在这里拆**——拆串是漏斗的形态适配（``parse_cc_actors`` 的 str 分支），
+      本函数只管"逐元素 trim/丢空/折叠重复"，两形共用同一条尺子；
+    - **落库与比较一律取 trim 后的值**：``" 123 "`` 与 ``"123"`` 是同一个人，不 trim 就会
+      把 G2 的写侧判重（``create_cc_instance_if_absent``）打穿成同一人两行；
+    - **``"0"`` 这类"看起来像空"的正常 id 不得丢掉**——只按 ``strip()`` 后是否为空串判，
+      严禁写成 ``if not actor``（反向哨兵见 tests/spec_test.py 的 G10 段）。
+    """
+    out: list[str] = []
+    if raw is None:
+        return out
+    for item in raw:
+        if item is None:
+            continue
+        actor = str(item).strip()
+        if not actor or actor in out:
+            continue
+        out.append(actor)
+    return out
+
+
 class ProcessRepository(ABC):
     @abstractmethod
     async def find_define_by_id(self, id: int) -> Optional[ProcessDefine]: ...
@@ -63,7 +96,14 @@ class ProcessRepository(ABC):
         （owner 2026-09-29 拍：接受既成事实，写侧判重只保证今后不再新增）。
         建 cc 的三条入口（发起 `f_ccActors`／办理 `tf_ccActors`／手动 `createCCInstance`）都经由
         引擎的 `handle_cc_actors` 漏斗，那里调的是 `create_cc_instance_if_absent`
-        ——需要"实际新建了谁"拿去 fire `CC_CREATE`（码 4）。"""
+        ——需要"实际新建了谁"拿去 fire `CC_CREATE`（码 4）。
+
+        **空不创建行**（issues/141 G10 · spec 06-facade.md §2.10）：入参里的**空串、纯空白、
+        `None` 一律丢弃**，落库值取 **trim 后的串**。这条义务要钉在**实现方**而不只钉在引擎漏斗里
+        ——绕过 `handle_cc_actors`/门面直连仓储的调用方（集成层、第三方仓储消费者）同样不得把空
+        归属值灌进 `actor_id`，那正是 issues/129 那族"空 operator 读全库"的病根；不 trim 则
+        `" 123 "` 与 `"123"` 会被判成两个人，把上面那条写侧判重打穿成同一人两行。两仓
+        （SQL 仓 `JdbcRepository` / 内存仓 `MemoryRepository`）同判据，第三方实现按本 docstring 自守。"""
         ...
     @abstractmethod
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None: ...
@@ -85,17 +125,25 @@ class ProcessRepository(ABC):
         判据：`actor_ids` 里已在该实例有 cc 行的跳过、同一次调用内的重复也折叠（顺序与入参一致），
         剩下的子集交给 `create_cc_instance` 落库。
 
+        **空不创建行**（issues/141 G10 · spec 06 §2.10）：入参先过 ``normalize_cc_actors``——
+        空串/纯空白/`None` 丢弃，比较与返回的子集一律取 **trim 后的值**（`" 123 "` 与 `"123"`
+        是同一个人，也才和上面那条判重咬合）。丢完为空 ⇒ 子集空 ⇒ 不建行、不 fire 码 4。
+
         为什么返回子集而不是 None：spec 11-events §11.2 原则 1「码值表达发生了什么事实」
         ⇒ 没发生"创建"就**不得** fire `CC_CREATE`（码 4）。三条入口一律拿这个子集去 fire，
         **子集为空整支不发**（不空转，也不照旧按原始请求全量 fire）。
 
         未覆写 `find_cc_actor_ids` 的第三方仓储走本 default ⇒ 与旧
-        `create_cc_instance(全量)` 逐字一致（子集＝入参去重后全量），不静默改变既有集成方行为。
+        `create_cc_instance(全量)` 逐字一致（子集＝入参**归一**后全量），不静默改变既有集成方行为
+        ——G10 的归一腿是唯一被加进来的判据，旧行为里"空值也建行"那一档按裁定作废。
         """
         existing = set(await self.find_cc_actor_ids(instance_id) or [])
         fresh: list[str] = []
-        for actor_id in actor_ids or []:
-            if actor_id is None or actor_id in existing or actor_id in fresh:
+        # issues/141 G10「空不创建行」：先过归一腿——空串/纯空白/None 丢弃，值取 trim 后的串
+        # （" 123 " 与 "123" 是同一个人，也才与下面的判重咬合）。判据落在这一层而不只落在引擎
+        # 漏斗：绕过 handle_cc_actors 直连仓储的调用方同样建不出空行。
+        for actor_id in normalize_cc_actors(actor_ids):
+            if actor_id in existing or actor_id in fresh:
                 continue
             fresh.append(actor_id)
         if fresh:

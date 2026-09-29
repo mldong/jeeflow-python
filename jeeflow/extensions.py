@@ -164,6 +164,21 @@ class IDecisionHandler(ABC):
     async def decide(self, node, instance, vars: dict) -> str: ...
 
 
+class ICustomHandler(ABC):
+    """记录类（自定义）节点处理器——流程定义 ``clazz`` 按名解析的目标（issues/141 G9）。
+
+    形状基准＝java ``IHandler.handle(Execution)``／C# ``IHandler.HandleAsync(Execution)``：
+    java 用反射按 FQCN 实例化类，python 没有对应的类路径可解析（夹具里的
+    ``com.mldong.jeeflow.test.TestCustomHandler`` 是 JVM 类名），故与 C# 同策——
+    集成方在 ``HandlerRegistry.register_custom("<clazz 原样字符串>", handler)`` 注册，
+    引擎按名解析后调用。返回值非 ``None`` 时写进执行变量的 ``val``（缺省
+    ``custom_return_val``），对齐 java ``CustomModel`` 的 ``var`` 那支。
+
+    ``handle`` 可同步可异步（引擎两侧都吃，同 ``IAssignmentHandler`` 的宽容形状）。"""
+    @abstractmethod
+    def handle(self, node, instance, operator: str, vars_: dict): ...
+
+
 # ─── HandlerRegistry ─────────────────────────────────────────────────────────────
 
 class HandlerRegistry:
@@ -172,6 +187,7 @@ class HandlerRegistry:
     def __init__(self):
         self._assignments: dict[str, IAssignmentHandler] = {}
         self._decisions: dict[str, IDecisionHandler] = {}
+        self._customs: dict[str, ICustomHandler] = {}
 
     def register_assignment(self, name: str, handler: IAssignmentHandler):
         self._assignments[name] = handler
@@ -179,11 +195,19 @@ class HandlerRegistry:
     def register_decision(self, name: str, handler: IDecisionHandler):
         self._decisions[name] = handler
 
+    def register_custom(self, name: str, handler: ICustomHandler):
+        """注册记录类节点处理器，键＝流程定义 ``properties.clazz`` 的原样字符串（issues/141 G9）。"""
+        self._customs[name] = handler
+
     def resolve_assignment(self, name: str) -> Optional[IAssignmentHandler]:
         return self._assignments.get(name)
 
     def resolve_decision(self, name: str) -> Optional[IDecisionHandler]:
         return self._decisions.get(name)
+
+    def resolve_custom(self, name: str) -> Optional[ICustomHandler]:
+        """按 ``clazz`` 名解析记录类节点处理器；未注册 ⇒ ``None``（引擎侧记日志后继续流转）。"""
+        return self._customs.get(name) if name else None
 
 
 # ─── EngineExtensions ────────────────────────────────────────────────────────────

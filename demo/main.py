@@ -133,7 +133,9 @@ def load_seed():
 
 load_seed()
 
-# T003：业务数据种子（引擎真实启动 16 进行中 + 9 已完成 + 8 委托），/api/reset 复跑。
+# T003：业务数据种子（引擎真实启动 16 行 IN_PROGRESS + 9 行 FINISHED + 8 委托），/api/reset 复跑。
+# ⚠️ 落库状态读数自 issues/141 G9（spec 02 §6.1 记录类节点不建待办）起是 15 进行中 / 10 已完成
+#    ——I15（define=10 自定义节点流程）发起后直接办结，理由见 demo/seed_business.py 文件头。
 # 兼容 uvicorn reload：worker 在运行中的事件循环里 import 本模块，此时挂后台任务而非 asyncio.run。
 try:
     asyncio.get_running_loop()

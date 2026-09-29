@@ -4,7 +4,8 @@ from .facade import JeeflowFacade
 from .extensions import EngineExtensions, FlowInterceptor, HandlerRegistry, EventType, ProcessEvent
 from .memory import MemoryRepository
 from .repository import JdbcRepository, TsIDGenerator, MySqlAdapter, PostgresAdapter
-from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
+from .spi import (ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator,
+                  normalize_cc_actors)
 from .builtin import (register_builtin_assignments, OperatorAssignmentHandler, FormFieldAssigneeHandler,
                       DeptLeaderAssignmentHandler, DeptMainLeaderAssignmentHandler,
                       ApplicantDeptLeaderAssignmentHandler, ApplicantDeptMainLeaderAssignmentHandler,

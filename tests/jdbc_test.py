@@ -547,10 +547,83 @@ async def main():
         _again = await repo.create_cc_instance_if_absent(cc141_a, "zhangsan", ["i141user1", "i141new"])
         check("⑩.6 G2 全重复时子集为空（④不发码 4 的依据）", _again == [], f"created={_again}")
 
+        # ── ⑩.7 issues/141 G10：空抄送人不建 cc 行（真库 SQL 仓一路）──
+        # 判据与 T0 的 tests/spec_test.py「Test 141 G10」同一条（spec 06-facade.md §2.10，基准＝
+        # jeeflow-java 5fbd5ac）：空串/纯空白/None 一律丢弃、落库与比较取 trim 后的值。
+        # 这一层是**写侧兜底**——绕过引擎漏斗（parse_cc_actors）与门面直连仓储的调用方同样灌不进
+        # 空值；只修漏斗时下面这几格全红（本轮普查实测：旧形状 ("",) 真落一条 actor_id='' 的行）。
+        _cc_all = ("SELECT id, actor_id FROM wf_process_cc_instance"
+                   " WHERE process_instance_id = ? ORDER BY id")
+        g10_a, g10_b, g10_c, g10_d = DEFINE_ID + 17, DEFINE_ID + 18, DEFINE_ID + 19, DEFINE_ID + 20
+        g10_now = _dt141.now()
+        for _iid in (g10_a, g10_b, g10_c, g10_d):
+            await repo.save_instance(_PI141(
+                id=_iid, defineId=DEFINE_ID, state=InstanceState.DOING, operator="zhangsan",
+                businessNo=f"G10-{_iid}", variables={},
+                createTime=g10_now, updateTime=g10_now, createUser="py-test", updateUser="py-test"))
+
+        await repo.create_cc_instance(g10_a, "zhangsan", "", "   ", "\t", None)
+        _cnt = int(await raw_count(adapter, "SELECT COUNT(*) FROM wf_process_cc_instance"
+                                          " WHERE process_instance_id = ?", [g10_a]))
+        check("⑩.7 G10 裸写入口灌空串/纯空白/None ⇒ 零行（写侧兜底，不只靠漏斗）",
+              _cnt == 0, f"count={_cnt}")
+        check("⑩.7 G10 空档读侧也是空集",
+              await repo.find_cc_actor_ids(g10_a) == [],
+              f"{await repo.find_cc_actor_ids(g10_a)}")
+        _sub = await repo.create_cc_instance_if_absent(g10_a, "zhangsan", ["", "  ", None])
+        check("⑩.7 G10 全空入参时 SPI default 子集为空（据此不发码 4）",
+              _sub == [] and int(await raw_count(adapter,
+                  "SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ?",
+                  [g10_a])) == 0, f"created={_sub}")
+
+        await repo.create_cc_instance(g10_b, "zhangsan", " 8141t1 ")
+        _actors_b = await repo.find_cc_actor_ids(g10_b)
+        check("⑩.7 G10 落库值取 trim 后的串", _actors_b == ["8141t1"], f"actors={_actors_b}")
+        await repo.create_cc_instance(g10_b, "zhangsan", "8141t1")
+        _rows_b = await raw_rows(adapter, _cc_all, [g10_b])
+        check("⑩.7 G10 trim 判等与 G2 写侧判重咬合（跨调用同一人不落两行）",
+              [r[1] for r in _rows_b] == ["8141t1"], f"rows={[r[1] for r in _rows_b]}")
+        await repo.create_cc_instance(g10_b, "zhangsan", " 8141t2 ", "8141t2")
+        _rows_b = await raw_rows(adapter, _cc_all, [g10_b])
+        check("⑩.7 G10 同一次调用内两形也只落一行",
+              [r[1] for r in _rows_b] == ["8141t1", "8141t2"], f"rows={[r[1] for r in _rows_b]}")
+
+        _fresh = await repo.create_cc_instance_if_absent(
+            g10_b, "zhangsan", ["", " 8141t1 ", "8141t1", None, " 8141t3 ", "8141t3"])
+        check("⑩.7 G10 default 子集＝归一后的新人（空值与已有值都不进子集）",
+              _fresh == ["8141t3"], f"created={_fresh}")
+        _rows_b = await raw_rows(adapter, _cc_all, [g10_b])
+        check("⑩.7 G10 子集只落对应那一行",
+              [r[1] for r in _rows_b] == ["8141t1", "8141t2", "8141t3"],
+              f"rows={[r[1] for r in _rows_b]}")
+
+        await repo.create_cc_instance(g10_c, "zhangsan", "0")
+        _actors_c = await repo.find_cc_actor_ids(g10_c)
+        check("⑩.7 G10 反向哨兵：'0' 是正常 id，不得被当空值丢掉", _actors_c == ["0"],
+              f"actors={_actors_c}")
+
+        # 两仓同答案（issues/117 场景 27）：同一批带空值/带空格的入参**逐对灌进同一个实例**，
+        # SQL 仓与内存仓的每一档读法都必须同答案（判据分叉只修一边时这一格红）
+        from jeeflow.memory import MemoryRepository as _MemRepo141
+        _mem = _MemRepo141()
+        _g10_matrix = [("",), ("  ",), ("x1", ""), (" x2 ",), ("x2",), ("0",), (" 0 ",), (None,)]
+        _sql_ans, _mem_ans = {}, {}
+        for _i, _args in enumerate(_g10_matrix, start=1):
+            await repo.create_cc_instance(g10_d, "zhangsan", *_args)
+            await _mem.create_cc_instance(g10_d, "zhangsan", *_args)
+            _sql_ans[_i] = sorted(r[1] for r in await raw_rows(adapter, _cc_all, [g10_d]))
+            _mem_ans[_i] = sorted(str(r) for r in _mem.cc_rows_for_test(g10_d))
+        check("⑩.7 G10 两仓同判据（SQL 仓与内存仓在同一批入参下必须同答案）",
+              _sql_ans == _mem_ans, f"SQL={_sql_ans.get(len(_g10_matrix))} 内存={_mem_ans.get(len(_g10_matrix))}")
+        check("⑩.7 G10 两仓末档读法＝归一后 3 人（空档零行、trim 判等、哨兵 0 保住）",
+              _sql_ans[len(_g10_matrix)] == ["0", "x1", "x2"] and
+              _mem_ans[len(_g10_matrix)] == ["0", "x1", "x2"],
+              f"SQL={_sql_ans[len(_g10_matrix)]} 内存={_mem_ans[len(_g10_matrix)]}")
+
         # 本轮取证行按实例 id 清干净（零残留；实例行由收尾的 cleanup 按 define_id 兜）
         conn = await adapter.acquire()
         try:
-            for _iid in (cc141_a, cc141_b):
+            for _iid in (cc141_a, cc141_b, g10_a, g10_b, g10_c, g10_d):
                 await conn.execute(
                     sql_of(adapter, "DELETE FROM wf_process_cc_instance WHERE process_instance_id = ?"),
                     [_iid])

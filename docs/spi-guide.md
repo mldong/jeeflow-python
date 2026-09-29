@@ -40,6 +40,16 @@ class MyRepository(ProcessRepository):
 > 自带两仓（`JdbcRepository` / `MemoryRepository`）都覆写 `find_cc_actor_ids`；**集成方自实现
 > 仓储时也应覆写**，否则 default 返回空集＝不判重，重复抄送会照旧逐条 INSERT。
 
+> **空不创建行**（issues/141 G10 · [规范 06 · 门面](../../spec/06-facade) §2.10）：抄送人集合里的
+> **空串、纯空白、`None` 一律丢弃**，落库与比较值一律取 **trim 后的串**（`" 123 "` 与 `"123"` 是
+> 同一个人）；丢完为空 ⇒ 不建任何 cc 行、也**不 fire `CC_CREATE`（码 4）**。判据落在**两层**：
+> 漏斗层 `engine.parse_cc_actors`（逗号串与数组两形共用 `spi.normalize_cc_actors` 那一支），
+> 以及**写侧兜底**——`create_cc_instance_if_absent` 的 default、两仓的 `create_cc_instance`
+> 各自再挡一次。**集成方自实现 `create_cc_instance` 时同样要丢空值并 trim**（绕过引擎/门面直连
+> 仓储的调用方不得把空归属值灌进 `actor_id`，那是 issues/129 那族"空 operator 读全库"的病根）。
+> 反向哨兵：`"0"` 是正常 id，**不是**空值，不许丢。手动腿 `createCCInstance` 丢完为空时与
+> "空 `actorIds`"同档（报 `processInstanceId/actorIds 缺失`，不新造错误码/文案）。
+
 > 开箱即用：
 > - `MemoryRepository`（`jeeflow/memory.py`）供演示/测试；
 > - **`JdbcRepository`（`jeeflow/repository/`）— 多数据库 JDBC 实现**：共享核心 `base.py`（SQL 逻辑唯一维护点）+ 每库一个薄适配器。按库安装依赖（核心零依赖）：

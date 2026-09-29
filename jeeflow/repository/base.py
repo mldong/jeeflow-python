@@ -22,7 +22,7 @@ from typing import Any, Optional, Protocol, Sequence
 from ..spi import QueryCondition
 
 from ..model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate, InstanceStatsRow, TaskStatsRow)
-from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository
+from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository, normalize_cc_actors
 
 # 当前协程上下文绑定的事务连接
 _tx_conn_var: contextvars.ContextVar = contextvars.ContextVar("jeeflow_tx_conn", default=None)
@@ -510,10 +510,15 @@ class JdbcRepository(ProcessRepository):
         # create_time/update_time 逐字不变）。判重放在写侧而不是查询侧：查询保持现状不引入
         # DISTINCT（owner 2026-09-29 拍），历史重复行也不清理。
         # 与 MemoryRepository.create_cc_instance 同一条判据——两仓判据分叉＝issues/117 场景 27。
+        #
+        # issues/141 G10「空不创建行」（spec 06 §2.10）：入参先过 normalize_cc_actors——空串/
+        # 纯空白/None 一律丢弃，**落库值取 trim 后的串**。绕过引擎漏斗（``handle_cc_actors``）
+        # 直连仓储的调用方也建不出 ``actor_id=''`` 的行——空归属值正是 issues/129 那族
+        # "空 operator 读全库"的病根；不 trim 则 " 123 " 与 "123" 判成两个人，把上面那句判重打穿。
         existing = await self.find_cc_actor_ids(instance_id)
         async with self._conn() as conn:
-            for actor_id in actor_ids:
-                if actor_id is None or actor_id in existing:
+            for actor_id in normalize_cc_actors(actor_ids):
+                if actor_id in existing:
                     continue
                 await conn.execute(self._sql(
                     "INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state,"

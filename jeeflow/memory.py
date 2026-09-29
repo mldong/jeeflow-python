@@ -7,6 +7,7 @@ from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, Inst
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate,
                     InstanceStatsRow, TaskStatsRow)
 from .spi import ProcessRepository, ProcessExtRepository
+from .spi import normalize_cc_actors
 from .surrogate import hydrate_enabled, to_datetime   # 判据本身已收口到 ProcessSurrogate.is_effective（issues/123）
 
 class CcRow(str):
@@ -124,9 +125,15 @@ class MemoryRepository(ProcessRepository):
         # issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与 JdbcRepository.create_cc_instance
         # 同一条判据：同一 (实例, 被抄送人) 已有 cc 行 ⇒ 跳过——①不新增行 ②不重置未读（state 保持
         # 原值）③不更新原行时间（create_time/update_time 逐字不变）。判重在写侧，查询侧不引入去重。
+        #
+        # issues/141 G10「空不创建行」（spec 06 §2.10）：入参先过 normalize_cc_actors——
+        # 空串/纯空白/None 一律丢弃，落库值取 **trim 后的串**（" 123 " 与 "123" 是同一个人，
+        # 不 trim 就会把上面 G2 的写侧判重打穿成同一人两行）。这一层是**绕过引擎漏斗直连仓储**
+        # 的兜底：漏斗那侧 parse_cc_actors 已经在归一，摘掉仓储这一层也照样建不出空行。
+        # 与 JdbcRepository.create_cc_instance 同判据——两仓分叉＝issues/117 场景 27。
         rows = self._cc.setdefault(instance_id, [])
-        for actor_id in actor_ids:
-            if actor_id is None or actor_id in rows:
+        for actor_id in normalize_cc_actors(actor_ids):
+            if actor_id in rows:
                 continue
             now = datetime.now()
             rows.append(CcRow(actor_id, create_time=now, update_time=now))

@@ -33,7 +33,7 @@
 | `snaker:task` | 审批节点（普通参与 / 会签） |
 | `snaker:decision` | 决策节点（按边表达式路由） |
 | `snaker:fork` / `snaker:join` | 并行分支 / 合并 |
-| `snaker:custom` | 自定义节点 |
+| `snaker:custom` | 自定义节点（**记录类**，非任务类）：不建待办；执行 `clazz` → 落一条 `task_state=20` 历史行 → 令牌沿出边继续流转（[规范 02 §6.1](../../spec/02-flow-definition)／issues/141 G9）。"没有参与者"是该节点的正常形态，引擎不会兜底把它挂给当前操作人。`clazz` 在本栈按名解析：`HandlerRegistry.register_custom(<clazz 原样串>, handler)`；未注册 ⇒ 记 WARNING 后照常落历史行＋推进（java/C# 那边是显式报错，本栈夹具的 clazz 是 JVM 类名无从解析） |
 
 ## 任务节点属性
 

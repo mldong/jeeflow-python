@@ -20,7 +20,9 @@ from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_AC
                      KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState
-from .spi import ProcessExtRepository, ProcessRepository, QueryCondition
+from .spi import ProcessExtRepository, ProcessRepository, QueryCondition, normalize_cc_actors
+
+# submitType 枚举（对齐 boot3）
 
 # submitType 枚举（对齐 boot3）
 SUBMIT_APPLY = 0
@@ -913,12 +915,19 @@ class JeeflowFacade:
     async def _processInstance_createCCInstance(self, args: dict) -> dict:
         instance_id = self._to_int(args.get("processInstanceId"))
         operator = self._operator_arg(args)
-        actor_ids = self._to_str_list(args.get("actorIds"))
+        actor_ids = normalize_cc_actors(self._to_str_list(args.get("actorIds")))
         if not instance_id or not actor_ids:
             raise ValueError("processInstanceId/actorIds 缺失")
         # 手动 CC 与发起/办理两条腿**同一个漏斗**（spec §11.2 原则 1：码值表达"发生了什么事实"，
         # 不表达"谁触发的"；§11.7 三条路径同判）。门面不再自己 create_cc_instance、不再自己
         # fire CC_CREATE —— 落库 + 逐人 fire 都在 engine.handle_cc_actors 那一处。
+        #
+        # issues/141 G10「空不创建行」（spec 06 §2.10）：判空**之前**先过 normalize_cc_actors
+        # （与引擎腿 parse_cc_actors 共用那一支归一腿）——`actorIds=[""]`／`["  "]` 这类
+        # "非空但全是空元素"的形态，丢完为空 ⇒ 与上面那条**"空 actorIds"同档**（沿用既有
+        # ``processInstanceId/actorIds 缺失`` 文案，不新造错误码/文案），不再"报错没报、行也没建"。
+        # 逗号串与数组两形同判据：_to_str_list 的 str 分支已经丢过空段，list 分支只 str() 不丢，
+        # 归一放在这里两形才都盖住。
         await self._engine.handle_cc_actors(instance_id, operator, actor_ids)
         return None
 

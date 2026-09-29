@@ -23,8 +23,9 @@
 必须对同一份数据给出同一结论（06 §4.5 条款 6；顺序本身是条款 1.4 的硬约束，见 issues/123）。
 
 判据④自 issues/130 案 A 起**只认整数 1**（``'1'`` / ``1.0`` / ``True`` 等等价写法一律停用）。
-整数列被驱动回读成字符串属**边界事实**，由 ``hydrate_enabled`` 在内置 SQL 仓储装行处还原后再交判据，
-判据本身不为此放宽；内存仓无驱动，故不还原（Python 对象类型即列值类型）。
+整数列在边界上变成字符串属**边界事实**，由 ``hydrate_enabled`` 在两处补：内置 SQL 仓储的**装行处**
+（驱动把 INT 列回读成 ``'1'``）与内存仓的**委托写入边界**（``save_surrogate``，本台账建模的就是
+INT 列；owner 2026-09-29 拍「python 内存仓统一到 node 侧」）。判据本身不为此放宽。
 """
 from __future__ import annotations
 
@@ -110,11 +111,15 @@ def hydrate_enabled(value: Any) -> Any:
     无小数点、无正号），``'1.0'`` / ``' 1'`` / ``'01'`` / ``'1abc'`` / ``'abc'`` / ``''`` 以及
     ``True`` / ``1.0`` 一律原样返回，由判据④判停用。特别地 ``'2'`` 会被还原成整数 ``2``——
     还原只补类型，值不是 1 照样停用，可见"还原"与"判宽"是两回事。
-    ⚠️ 调用点只允许在**内置 SQL 仓储装行处**（``repository/ext.JdbcProcessExtRepository._map_surrogate``）；
-    内存仓 ``MemoryExtRepository`` **刻意不还原**——它没有驱动，Python 对象类型就是列值本身，
-    在此还原等于伪造 INT 列的类型事实，也就废掉了 issues/130 §2 那条"SPI 直传脏值即停用"
-    的判别力（``tests/spec_test.py`` 的脏值矩阵正钉在这上面）。业务方自定义 SPI 仓储读出非整数
-    属 §2 的分叉源，按案 A 由实现侧自行还原（``hydrate_enabled`` 即为此导出）。
+    ⚠️ 调用点两处，都是**边界**、都不动判据：
+    ① **内置 SQL 仓储装行处**（``repository/ext.JdbcProcessExtRepository._map_surrogate``）——
+       读侧还原"整数列被驱动回读成字符串"；
+    ② **内存仓委托写入边界**（``memory.MemoryExtRepository.save_surrogate``）——写侧把规范整数串
+       落成 int（本台账建模的就是 INT 列，SQL 那一步由数据库做；owner 2026-09-29 拍
+       「python 内存仓统一到 node 侧」，形状＝node ``memory-ext.saveSurrogate``；
+       ``update_surrogate`` 有意不归一，留作台账原值显形出口）。
+    业务方自定义 SPI 仓储读出非整数属 §2 的分叉源，按案 A 由实现侧自行还原（``hydrate_enabled``
+    即为此导出）。
     """
     if isinstance(value, str) and _CANONICAL_INT.match(value):
         return int(value)

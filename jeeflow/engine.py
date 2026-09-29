@@ -2,7 +2,7 @@
 import logging
 import json, re, time, random
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from .model import (
     FlowModel, FlowNode, FlowEdge,
     TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK, TYPE_JOIN, TYPE_CUSTOM,
@@ -30,6 +30,58 @@ KEY_AUTO_ID   = "flow.auto"
 KEY_ADMIN_ID  = "flow.admin"
 # issue 29：自动生成标题（对齐 boot3 FlowConst.AUTO_GEN_TITLE）
 KEY_AUTO_GEN_TITLE = "autoGenTitle"
+# ─── 抄送人入参键（spec 11-events §11.7／issues/127；逐字对齐 Java FlowConst.CC_ACTORS_START·CC_ACTORS）
+# 发起腿 f_ccActors、办理腿 tf_ccActors——两条腿在**引擎侧**共用同一个 handle_cc_actors 漏斗，
+# 门面只解析参数不再自己建 cc 行／自己 fire（三栈 java/go/node 同形状，见该方法 docstring）。
+# 办理腿的**覆盖面**按 spec §11.7 边界 2 只有 executeProcessTask 一条（钩子参数见
+# ``_prepare_execute_task`` 的 ``on_task_updated``，与 go :102-105 传钩子 / :206 传 nil 同形）。
+KEY_CC_ACTORS_START = "f_ccActors"
+KEY_CC_ACTORS = "tf_ccActors"
+
+# ─── 事件分档（spec 11-events §11.3 码 5/6 互斥判据）──────────────────────────────
+
+#: 归入 TASK_REJECT（码 6）的 submitType 档：拒绝 / 退上一步 / 退发起人 / 会签软拒绝。
+#: 其余（APPLY/AGREE/JUMP/RE_APPLY 与未传）归 TASK_COMPLETE（码 5）。「跳转回退」按
+#: spec 应归 6，但本栈的 JUMP 档位不带前/后向信息，按 §11.3 的「跳转」列入 5（见本轮报告）。
+_REJECT_SUBMIT_TYPES = frozenset({int(SubmitType.REJECT), int(SubmitType.ROLLBACK),
+                                  int(SubmitType.ROLLBACK_TO_OPERATOR),
+                                  int(SubmitType.COUNTERSIGN_DISAGREE)})
+
+
+def _to_submit_type(value) -> Optional[int]:
+    """submitType 归一化为整数；脏值/缺省按 None 处理（不得因脏值把办掉说成退回）"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_cc_actors(value: Any) -> list[str]:
+    """抄送人入参归一（判据对齐 Java ``JeeflowEngineImpl.handleCcActors`` 的
+    String/Collection 两支 ＋ Go ``parseCcActors``/Node ``parseCcActors`` 的 trim/丢空/去重）：
+
+    逗号串、``list``/``tuple``、单个标量都吃 → ``list[str]``；逐项 ``str``＋trim、丢空项、
+    **按出现顺序去重**；``None``/空串/空集合 → ``[]``（零副作用）。
+
+    去重不是锦上添花：``create_cc_instance`` 逐行写、CC_CREATE 逐人 fire，二者粒度必须一一对应
+    （spec §11.3 码 4「逐抄送人 fire 一次」）。同一人传两次在内存仓会被 ``dict.fromkeys`` 折成一行，
+    事件却发两条 ⇒「一行两事件」破掉粒度；SQL 仓那侧更是直接双写 cc 行。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw: list[Any] = list(value)
+    elif isinstance(value, str):
+        raw = value.split(",")
+    else:
+        raw = [value]
+    out: list[str] = []
+    for item in raw:
+        actor = str(item).strip()
+        if actor and actor not in out:
+            out.append(actor)
+    return out
+
 
 class Engine:
     """引擎接口"""
@@ -39,6 +91,10 @@ class Engine:
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
     async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None, target_task_name: str = None) -> ProcessInstance: ...
     async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
+    async def handle_cc_actors(self, instance_id: int, operator: str, cc_actors: Any) -> list[str]:
+        """抄送唯一漏斗（spec §11.7）：门面手动 ``createCCInstance`` 与引擎发起/办理两条腿共用；
+        自定义引擎实现若不提供，手动抄送腿就只剩"写行不 fire"，属 §11.2 原则 1 的缺支。"""
+        ...
 
 class EngineImpl(Engine):
     def __init__(self, repo: ProcessRepository, user_prov: UserProvider = None,
@@ -124,6 +180,54 @@ class EngineImpl(Engine):
         self._define_name_cache[define_id] = name
         return name
 
+    # ─── 抄送腿（spec 11-events §11.7／issues/127）─────────────────────────────────
+
+    async def handle_cc_actors(self, instance_id: int, operator: str, cc_actors: Any) -> list[str]:
+        """抄送的**唯一漏斗**：归一化抄送人 → **先** ``create_cc_instance`` 落 cc 行 →
+        落库**后**逐抄送人 fire ``CC_CREATE``(码 4)。
+
+        形状基准＝jeeflow-java ``JeeflowEngineImpl.handleCcActors`` → ``ProcessPublisher.notifyCcCreate``
+        （发起 ``f_ccActors`` 与办理 ``tf_ccActors`` 共用同一条腿），go ``EngineImpl.HandleCcActors``、
+        node ``Engine.handleCcActors`` 同构。**三条路径都进这一个函数**（spec §11.2 原则 1
+        「同一事实只发一次、路径不进事件名」）：
+
+        - 发起 ``f_ccActors`` —— 本引擎 ``start_process_instance_by_id`` 内部调用；
+        - 办理 ``tf_ccActors`` —— 只由 ``execute_process_task`` 经 ``_prepare_execute_task`` 的
+          ``on_task_updated`` 钩子调用（与任务更新同一次调用栈）。**jump/reject 族不挂此钩子**
+          ——spec §11.7 边界 2 明写覆盖面「只算 executeProcessTask 一条」，
+          「``executeAndJumpTask`` / ``jumpToEnd`` / ``rollbackToOperator`` 这类跳转·回退 action
+          带的 ``tf_ccActors`` 本轮不建 cc、不发 ``CC_CREATE``」，单栈自行放宽＝跨栈分叉；
+        - 手动 ``processInstance/createCCInstance`` —— 门面调本方法（不再自己建行、不再自己 fire）。
+
+        ⚠️ **契约位置**：cc 行的写入与事件都在**引擎执行路径内**，因此与同一次 ``start``/``execute``
+        里的实例/任务写库处在**同一个事务作用域**——本栈的事务约定是
+        ``JdbcProcessRepository.with_tx``（``contextvars`` 绑连接，spec 05 §7.4）：调用方把
+        ``engine.start/execute`` 包进 ``with_tx`` 时，cc 行 insert 与任务/实例更新同连接同事务、
+        一起提交一起回滚；未包时逐条 autocommit（与本栈其余写库点同档）。
+        抄送腿若留在门面（本轮之前的形状），门面是在 ``engine.*`` **返回之后**才执行的 ⇒
+        任何只包住引擎调用的事务都盖不到 cc 行，且**直连引擎 API 的调用方（不经门面）
+        传 ``f_ccActors``/``tf_ccActors`` 根本不建 cc 行**——这正是本轮要搬掉的病灶。
+
+        ``cc_actors`` 为 ``None``/空 ⇒ 零写入、零 fire、返回 ``[]``（纯增量：不带抄送的发起/办理
+        行为与上一版逐字一致）。返回归一化后的抄送人列表。
+        """
+        cc_list = parse_cc_actors(cc_actors)
+        if not cc_list or not instance_id:
+            return cc_list
+        await self.repo.create_cc_instance(instance_id, operator, *cc_list)
+        await self._notify_cc_create(instance_id, cc_list)
+        return cc_list
+
+    async def _notify_cc_create(self, instance_id: int, cc_list: list[str]) -> None:
+        """CC_CREATE（码 4，issues/102）逐抄送人 fire，与 ``create_cc_instance`` 的逐行写一一对应
+        （对齐 Java ``ProcessPublisher.notifyCcCreate``）。``ccActorId`` 直传事件体，监听器免反查 cc 表。
+        接收人过滤（合法性/存在性）属集成层监听器职责，引擎只按 cc 行粒度 fire。
+        ⚠️ 只在 cc 行落库**之后**调用（spec §11.2 原则 3）——本方法是 ``handle_cc_actors`` 的下游，
+        不得脱离 cc 行落库单独调用。"""
+        for actor in cc_list:
+            await self._fire_event(ProcessEvent(type=EventType.CC_CREATE, instanceId=instance_id,
+                                                ccActorId=actor))
+
     # ─── Start ────────────────────────────────────────────────────────────────
 
     async def start_process_instance_by_id(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
@@ -141,7 +245,13 @@ class EngineImpl(Engine):
                                createUser=operator, updateUser=operator,
                                businessNo=str(vars_.get(KEY_BUSINESS_NO, "")))
         await self.repo.save_instance(inst)
-        await self._fire_event(ProcessEvent(type=EventType.PROCESS_START, instanceId=inst.id, operator=operator))
+        # PROCESS_INSTANCE_START（码 1）：实例行 insert 之后 fire（spec §11.3 触发时机列）
+        await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_START, inst.id,
+                                            defineId=define_id, operator=operator))
+        # 发起腿抄送（issues/127／spec §11.7）：实例行 insert 之后、节点执行之前，与实例写库
+        # 处在同一次调用栈（同事务作用域）建 cc 行并逐人 fire 码 4。
+        # 位置对齐 Java startProcessInstanceById 的第 6→7 步（saveInstance → handleCcActors → start.execute）。
+        await self.handle_cc_actors(inst.id, operator, (args or {}).get(KEY_CC_ACTORS_START))
         start_node = _find_by_type(flow, TYPE_START)
         if not start_node: raise ValueError("no start node")
         for node in _follow_edges(flow, start_node.id):
@@ -151,7 +261,15 @@ class EngineImpl(Engine):
     # ─── Execute ──────────────────────────────────────────────────────────────
 
     async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
-        task, inst, flow, vars_ = await self._prepare_execute_task(task_id, operator, args)
+        # issues/127 / spec §11.7 办理时抄送（tf_ccActors）：**覆盖面只有本条腿**——钩子挂在这里，
+        # 不挂在共用的 ``_prepare_execute_task`` 里（形状基准＝go engine_impl.go:102-105 传钩子、
+        # :206/:228/:265 三个 jump 入口传 nil；java 基准 JeeflowEngineImpl 的 handleCcActors 唯一
+        # 调用点也在 executeProcessTask 的 runInTx 内）。以后新增办理入口默认不带 cc，不会漏收。
+        args = args or {}
+        task, inst, flow, vars_ = await self._prepare_execute_task(
+            task_id, operator, args,
+            on_task_updated=lambda instance_id: self.handle_cc_actors(
+                instance_id, operator, args.get(KEY_CC_ACTORS)))
         now = datetime.now()
         cur_node = _find_node(flow, task.taskName)
         if cur_node:
@@ -191,8 +309,8 @@ class EngineImpl(Engine):
                         _apply_expire_time(nt, (cur_node.properties or {}).get("expireTime"), inst.variables)
                         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
                         await self.repo.save_task(nt)
-                        # TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
-                        await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, cur_node.id, operator))
+                        # PROCESS_TASK_START（码 3）：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
+                        await self._fire_task_start(inst, nt, cur_node.id, operator)
                         return await self.repo.find_instance_by_id(inst.id)
                 else:
                     return await self.repo.find_instance_by_id(inst.id)
@@ -220,18 +338,29 @@ class EngineImpl(Engine):
     # ─── Reject ───────────────────────────────────────────────────────────────
 
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
-        _, inst, _, _ = await self._prepare_execute_task(task_id, operator, args)
         # 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
+        # spec §11.7 边界 2：jumpToEnd 档不带 cc 钩子（显式 None，同 go :206 传 nil）——
+        # 这一档传 tf_ccActors 也零 cc 行、零码 4。
+        _, inst, _, _ = await self._prepare_execute_task(
+            task_id, operator, args, reject_as=int(SubmitType.REJECT), on_task_updated=None)
         inst.reject(datetime.now())
         await self.repo.update_instance(inst)
-        await self._fire_event(ProcessEvent(EventType.PROCESS_REJECT, inst.id, task_id, operator=operator))
+        # 实例进入终态＝PROCESS_INSTANCE_END（码 2），拒绝/办结合一号（spec §11.6：
+        # 旧的 PROCESS_REJECT/PROCESS_FINISH 拆分以「实例终态＝2」为准，靠载荷 state 分）
+        await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
+                                            operator=operator, state=int(inst.state)))
         return await self.repo.find_instance_by_id(inst.id)
 
     # ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）──
 
     async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None,
                                      target_task_name: str = None) -> ProcessInstance:
-        task, inst, flow, vars_ = await self._prepare_execute_task(task_id, operator, args)
+        # 空 target＝血缘回退（spec §11.3 码 6 的"退回"族）；命名 target＝跳转（码 5 族）
+        # spec §11.7 边界 2：ROLLBACK / JUMP 两档都不挂 cc 钩子（显式 None，同 go :228）
+        task, inst, flow, vars_ = await self._prepare_execute_task(
+            task_id, operator, args,
+            reject_as=None if target_task_name else int(SubmitType.ROLLBACK),
+            on_task_updated=None)
         if not target_task_name:
             # issues/121 P2：ROLLBACK 走血缘版——复活 parentTaskId 指的那条历史行，
             # 参与者＝该行办结人（首任务节点行取该行 u_userId）。无血缘/守卫不过显式报错，
@@ -252,7 +381,11 @@ class EngineImpl(Engine):
 
     async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str,
                                                    args: dict[str, Any] = None) -> ProcessInstance:
-        _, inst, flow, vars_ = await self._prepare_execute_task(task_id, operator, args)
+        # 退发起人＝spec §11.3 码 6 的"退回"族（载荷 submitType=6 分档，不另开号）
+        # spec §11.7 边界 2：退发起人档不挂 cc 钩子（显式 None，同 go :265）
+        _, inst, flow, vars_ = await self._prepare_execute_task(
+            task_id, operator, args, reject_as=int(SubmitType.ROLLBACK_TO_OPERATOR),
+            on_task_updated=None)
         # 找到第一个任务节点，强制参与者为发起人，重新执行
         start_node = _find_by_type(flow, TYPE_START)
         if start_node:
@@ -265,11 +398,24 @@ class EngineImpl(Engine):
 
     # ─── Execute 公共序言（对齐 Java prepareExecution）────────────────────────
 
-    async def _prepare_execute_task(self, task_id: int, operator: str, args: dict[str, Any]):
+    async def _prepare_execute_task(self, task_id: int, operator: str, args: dict[str, Any] = None,
+                                     reject_as: Optional[int] = None,
+                                     on_task_updated: Optional[Callable[[int], Any]] = None):
         """执行公共序言（对齐 Java prepareExecution）：权限校验 → f_ 字段权限过滤 →
         完成任务（子实体状态转换 + 实例变量合并，经 update_instance 级联落库）→
         返回流程模型 + 合并后执行变量。Java jump 路径不废弃其余 DOING 任务
-        （会签兄弟任务不受影响），此处保持一致。"""
+        （会签兄弟任务不受影响），此处保持一致。
+
+        ``reject_as``：调用方本身就是「退回」族动作时显式声明其 submitType 档
+        （REJECT=2 / ROLLBACK=3 / ROLLBACK_TO_OPERATOR=6）。有值 ⇒ 本次任务事件必发
+        ``TASK_REJECT``（码 6），不依赖调用方有没有把 submitType 塞进 args。
+
+        ``on_task_updated``：**任务行 update 落库之后、码 5/6 fire 之前**的钩子（协程，收 instance_id）。
+        形状照 go ``prepareExecuteTask(ctx, …, onTaskUpdated)``——cc 这类「只对某一条办理腿成立」的
+        副作用由**调用方注入**，而不是在公共序言里判断"我是哪条腿"，这样以后加入口不会漏。
+        本栈唯一挂此钩子的是 ``execute_process_task``（办理抄送腿）；jump/reject 族一律不挂
+        （spec §11.7 边界 2）。钩子留在公共序言的调用位＝与任务更新同一次调用栈（同事务作用域），
+        满足 §11.7 边界 1。"""
         task, inst = await self._load_and_check(task_id, operator)
         # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
         def_ = await self.repo.find_define_by_id(inst.defineId)
@@ -289,7 +435,25 @@ class EngineImpl(Engine):
         # v1.0.1：update_instance 级联持久化依赖聚合内任务副本为最新状态，
         # complete_task 改的是外部任务对象，需同步回聚合根
         _sync_task_to_aggregate(inst, task)
-        await self._fire_event(ProcessEvent(EventType.TASK_COMPLETE, inst.id, task.id, task.taskName, operator))
+        # 办理腿副作用钩子位（spec §11.7 边界 1「与任务更新同事务」）：位置取 Go
+        # ``prepareExecuteTask`` 的那一刀（UpdateTask 之后、码 5/6 之前）。
+        # ⚠️ 抄送**不在这里无条件发生**：cc 由 ``execute_process_task`` 注入的钩子带来，
+        # jump/reject 族不注入 ⇒ 那些档位带 ``tf_ccActors`` 也零建行、零 fire 码 4
+        # （spec §11.7 边界 2；上一版把漏斗挂在本序言内 ⇒ 五条办理腿全建 cc，属"单栈超集"
+        # 跨栈分叉，本轮按 go/java 收窄）。
+        if on_task_updated is not None:
+            await on_task_updated(inst.id)
+        # 任务落库后 fire（spec §11.3 码 5/6 互斥：同一动作走退回就不再 fire「办掉」；
+        # 拒绝/退上一步/退发起人/会签软拒绝都归 TASK_REJECT，靠载荷 submitType 分档）。
+        # submitType 只取**本次 args**——实例变量里可能残留上一步的 submitType（_merge_exec_into_instance
+        # 会保留非 u_ 键），拿残留值判档会把一次普通"同意"错认成"退回"。
+        submit_type = _to_submit_type((args or {}).get(KEY_SUBMIT_TYPE))
+        if submit_type is None:
+            submit_type = reject_as
+        is_reject = reject_as is not None or submit_type in _REJECT_SUBMIT_TYPES
+        evt_type = EventType.TASK_REJECT if is_reject else EventType.TASK_COMPLETE
+        await self._fire_event(ProcessEvent(evt_type, inst.id, task.id, task.taskName, operator,
+                                            submitType=submit_type))
         # issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
         inst.variables = _merge_exec_into_instance(base_vars, vars_)
         await self.repo.update_instance(inst)
@@ -340,7 +504,7 @@ class EngineImpl(Engine):
                            nt.variables)
         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
         await self.repo.save_task(nt)
-        await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, prev.id, operator))
+        await self._fire_task_start(inst, nt, prev.id, operator)
         return nt
 
     def _is_first_task_node(self, flow: FlowModel, node: FlowNode) -> bool:
@@ -407,26 +571,26 @@ class EngineImpl(Engine):
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
-                    await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+                    await self._fire_task_start(inst, nt, node.id, operator)
             elif ct == "SEQUENTIAL":
                 nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
                 nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
-                await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+                await self._fire_task_start(inst, nt, node.id, operator)
             else:
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
-                    await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+                    await self._fire_task_start(inst, nt, node.id, operator)
         else:
             nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
             if len(actors) > 1:
                 nt.actorIds = actors
             await self._apply_surrogate(nt, process_name)
             await self.repo.save_task(nt)
-            await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+            await self._fire_task_start(inst, nt, node.id, operator)
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -467,7 +631,10 @@ class EngineImpl(Engine):
                 # issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 _prepare_execute_task 一致）
                 inst.variables = _merge_exec_into_instance(inst.variables, vars_)
                 await self.repo.update_instance(inst)
-                await self._fire_event(ProcessEvent(EventType.PROCESS_FINISH, inst.id, operator=operator))
+                # PROCESS_INSTANCE_END（码 2）：实例 state 落库之后 fire，载荷带落库后的 state
+                # （办结 20 / 拒绝 45 共用一号，spec §11.6 收口旧的 Finish/Reject 拆分）
+                await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
+                                                    operator=operator, state=int(inst.state)))
         finally:
             await self._fire_post(node, inst)
 
@@ -519,8 +686,8 @@ class EngineImpl(Engine):
                     _apply_expire_time(nt, expire_expr, inst.variables)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
-                    # TASK_CREATE：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
-                    await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+                    # PROCESS_TASK_START（码 3）：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
+                    await self._fire_task_start(inst, nt, node.id, operator)
             elif ct == "SEQUENTIAL":
                 nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
                 # 写点②「串行会签首位成员」（Java createCountersignTasks SEQUENTIAL 分支）。
@@ -531,7 +698,7 @@ class EngineImpl(Engine):
                 nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
-                await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+                await self._fire_task_start(inst, nt, node.id, operator)
             else:
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
@@ -539,7 +706,7 @@ class EngineImpl(Engine):
                     _apply_expire_time(nt, expire_expr, inst.variables)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
-                    await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+                    await self._fire_task_start(inst, nt, node.id, operator)
         else:
             # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
             nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
@@ -549,7 +716,7 @@ class EngineImpl(Engine):
                 nt.actorIds = actors
             await self._apply_surrogate(nt, process_name)
             await self.repo.save_task(nt)
-            await self._fire_event(ProcessEvent(EventType.TASK_CREATE, inst.id, nt.id, node.id, operator))
+            await self._fire_task_start(inst, nt, node.id, operator)
 
     async def _apply_surrogate(self, task: ProcessTask, process_name: str) -> None:
         """委托代理自动生效（issues/116 批次 D，引擎内置默认开启）——
@@ -693,20 +860,51 @@ class EngineImpl(Engine):
         return ic_list
 
     async def fire_event(self, evt: ProcessEvent):
-        """公开事件发布入口（issues/102）：facade 层 CC 创建后逐抄送人 fire CC_CREATE；
-        无监听器（ext/event_listener 为空）时零副作用，与上一版逐字节一致"""
+        """公开事件发布入口（issues/102）：门面层的**转办/撤回**等非引擎执行链内的事实经此 fire。
+        ⚠️ 抄送（CC_CREATE）**不走这里**——已由引擎侧 ``handle_cc_actors`` 漏斗在 cc 行落库后
+        自行 fire（spec §11.7），门面不得再自己补发（§11.1 禁止态）。
+        零监听器时安全返回（spec §11.5「无监听器」行）。"""
         await self._fire_event(evt)
 
+    def add_event_listener(self, listener) -> "EngineImpl":
+        """追加事件监听器（spec 11-events §11.5 列表基线）：**追加不覆盖**。
+
+        旧形状 ``EngineExtensions(event_listener=...)`` 仍然有效（解析时排在最前），
+        三壳升级到多监听器时可以逐壳迁移，不需要一次改完。
+        ``ext`` 未建时补建一个空扩展体（零配置场景注册监听器不该报错）。
+        """
+        if self.ext is None:
+            self.ext = EngineExtensions()
+        self.ext.add_event_listener(listener)
+        return self
+
+    async def _fire_task_start(self, inst: ProcessInstance, task: ProcessTask,
+                               node_id: str, operator: str) -> None:
+        """PROCESS_TASK_START（码 3）：任务行落库后**逐任务** fire（spec §11.3 触发时机列）。
+
+        每个调用点都紧随 ``save_task``（taskId 已分配、行已可见），监听器可按 taskId 反查；
+        载荷必备键 instanceId/taskId/actors——actors 取落库那份参与者集合（含委托并入的代理人）。
+        """
+        actors = list(task.actorIds) if task.actorIds else ([task.actorId] if task.actorId else [])
+        await self._fire_event(ProcessEvent(EventType.PROCESS_TASK_START, inst.id, task.id,
+                                            node_id, operator, actors=actors))
+
     async def _fire_event(self, evt: ProcessEvent):
-        if self.ext and self.ext.event_listener:
-            # 兜底语义（issues/104 P2 统一口径）：监听器异常只记录不传播——不得影响引擎主流程
-            # （对齐 PHP per-listener catch；Python 为单回调形态，无"后续监听器"概念）
+        """事件派发（spec 11-events §11.5）：一次 fire 送达**全部**已注册监听器，
+        注册顺序＝回调顺序；**逐监听器** catch——单个监听器抛异常只记日志，
+        ① 不回滚主流程，② 不中断后续监听器（issues/104 P2 八栈统一口径）。
+        零监听器时直接返回（不得空指针）。"""
+        if self.ext is None:
+            return
+        listeners = self.ext.resolve_event_listeners()
+        for idx, listener in enumerate(listeners):
             try:
-                result = self.ext.event_listener(evt)
+                result = listener(evt)
                 if hasattr(result, '__await__'):
                     await result
-            except Exception:  # noqa: BLE001 —— 引擎侧兜底，异常不外溢
-                logging.exception("[jeeflow] process event listener error: type=%s", evt.type)
+            except Exception:  # noqa: BLE001 —— 引擎侧兜底：异常不外溢、不中断后续监听器
+                logging.exception("[jeeflow] process event listener #%d error: type=%s code=%s",
+                                  idx, evt.type.name, int(evt.type))
 
 # ─── Pure Functions ─────────────────────────────────────────────────────────────
 

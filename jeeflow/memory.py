@@ -7,7 +7,7 @@ from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, Inst
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate,
                     InstanceStatsRow, TaskStatsRow)
 from .spi import ProcessRepository, ProcessExtRepository
-from .surrogate import to_datetime   # 判据本身已收口到 ProcessSurrogate.is_effective（issues/123）
+from .surrogate import hydrate_enabled, to_datetime   # 判据本身已收口到 ProcessSurrogate.is_effective（issues/123）
 
 class MemoryRepository(ProcessRepository):
     def __init__(self):
@@ -576,6 +576,19 @@ class MemoryExtRepository(ProcessExtRepository):
         s.createTime = s.createTime or now
         s.updateTime = s.updateTime or now
         # 显式 enabled=0 是合法值（停用委托）；缺省由门面处理（对齐 Java/Go，issues/82-7）
+        # ── issues/130 遗留分叉收口（owner 2026-09-29 拍：**统一到 node 侧**）──────────────
+        # wf_process_surrogate.enabled 建模的是 **INT 列**（tests/schema/schema-mysql.sql），
+        # 本台账就是那张列的替身：把文本 '1' 直写进 INT 列，落进去的就是数值 1——SQL 仓那一步
+        # 由数据库做，内存仓没人做，于是绕过门面的仓储直写会把 '1' 原样留在台账里，被读侧
+        # 严判据（只认整数 1）判废 ⇒ 同一条 '1' 两栈两答案（node 归一、python 不归一）。
+        # ⚠️ 只还原**规范整数串**（`hydrate_enabled`：'1'→1、'0'→0；'abc' / '1.0' / ' 1' / '01' /
+        # True / 1.0 一律原样留着交判据停用），**不是**把接受集合放宽回去——判据④本体
+        # （`surrogate_enabled_on`）一个字没动，仍只认整数 1；node 的 memory-ext.saveSurrogate
+        # 是同一形状（其脏值矩阵走 updateSurrogate 那一条不归一的整行覆盖路径）。
+        # ⚠️ update_surrogate **故意不归一**（与本方法有意不对称，对齐 node updateSurrogate 与
+        # PHP InMemoryProcessExtRepository::updateSurrogate）：那是"调用方给的原始值直接显形"
+        # 的唯一出口，脏值矩阵钉的就是这一档。
+        s.enabled = hydrate_enabled(s.enabled)
         self._surrogates[s.id] = deepcopy(s)
 
     async def update_surrogate(self, s: ProcessSurrogate):
@@ -612,11 +625,13 @@ class MemoryExtRepository(ProcessExtRepository):
 
         四判据本身见 ``ProcessSurrogate.is_effective``（判据① 作用域在本方法这一层）。
 
-        ⚠️ 本仓**不做** issues/130 案 A 的读侧类型还原（``surrogate.hydrate_enabled`` 只在内置 SQL
-        仓装行处调用）：内存仓没有驱动，存进来的 Python 类型就是"列值类型"本身，在这里把 ``'1'``
-        折成 ``1`` 等于伪造 INT 列的类型事实，也就废掉"SPI 直传脏值即停用"的判别力
-        （``tests/spec_test.py`` 脏值矩阵钉的正是这一条）。要 ``'1'`` 生效请走门面写侧
-        （``processSurrogate/save`` 的 ``_to_int`` 归一，落库存的就是整数 1）。
+        ⚠️ 本仓**不做** issues/130 案 A 的**读侧**类型还原（``surrogate.hydrate_enabled`` 挂在
+        内置 SQL 仓装行处那一趟，读侧还原的是"驱动把 INT 列回读成字符串"这个边界事实）：
+        内存仓没有驱动，读回的就是台账里存着的东西。它补的是**写侧**那一步——
+        ``save_surrogate`` 把规范整数串 ``'1'`` 落成整数 1（本台账建模的就是 INT 列，
+        SQL 那侧由数据库做，owner 2026-09-29 拍"统一到 node 侧 memory-ext.saveSurrogate"）；
+        ``update_surrogate`` 有意不归一，是"台账里就是调用方给的原始值"的显形出口
+        （issues/130 §2，脏值矩阵走这一路）。**判据④本身始终只认整数 1**，两档边界都不放宽它。
         """
         if operator is None:
             return None

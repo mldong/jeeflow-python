@@ -2,7 +2,8 @@
 import os, sys, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from jeeflow import EngineImpl, MemoryRepository, EngineExtensions, FlowInterceptor, HandlerRegistry, register_builtin_assignments
+from jeeflow import (EngineImpl, MemoryRepository, EngineExtensions, EventType, FlowInterceptor,
+                     HandlerRegistry, register_builtin_assignments)
 from jeeflow.model import ProcessDefine, TaskState, InstanceState, UserInfo
 from jeeflow.spi import IDGenerator, ExpressionEvaluator
 
@@ -242,23 +243,25 @@ async def main():
     eng2 = EngineImpl(repo, TestUserProv(), TestIDGen(), TestExpr())
     eng2.set_extensions(EngineExtensions(
         interceptors=[TestIC()],
-        event_listener=lambda evt: events.append(evt.type.value),
+        # spec 11-events §11.3：判据用规范名（旧 C 套字符串 .value 已整型化为 A 套码）
+        event_listener=lambda evt: events.append(evt.name),
     ))
     inst = await _start_and_execute(eng2, repo, 1, "applicant")
-    check("PROCESS_START 事件", "PROCESS_START" in events)
+    check("PROCESS_INSTANCE_START 事件", "PROCESS_INSTANCE_START" in events)
     doing = await repo.find_doing_tasks(inst.id)
     await repo.add_task_actor(doing[0].id, ["leader"])
     await eng2.execute_process_task(doing[0].id, "leader")
     check("pre_handle 被调用", pre_called[0])
     check("post_handle 被调用", post_called[0])
-    check("4 个事件（start+apply+task+finish）", len(events) >= 3, str(events))
-    check("事件包含 START/FINISH", "PROCESS_START" in events and "PROCESS_FINISH" in events)
+    check("4 个事件（start+apply+task+end）", len(events) >= 3, str(events))
+    check("事件包含 START/END",
+          "PROCESS_INSTANCE_START" in events and "PROCESS_INSTANCE_END" in events)
     print()
 
-    # ═══ 10b. TASK_CREATE 事件（对齐 Java CreateTaskHandler / Rust engine.rs）═══════════
-    # 任务落库**之后**逐个 fire，事件带 taskId/taskName/operator，监听器可按 taskId 反查任务 actor。
+    # ═══ 10b. PROCESS_TASK_START 事件（对齐 Java CreateTaskHandler / Rust engine.rs）═══════
+    # 任务落库**之后**逐个 fire，事件带 taskId/taskName/operator/actors，监听器可按 taskId 反查任务 actor。
     # 独立 repo + engine（避免与主 repo 的 id 序列冲突污染后续用例）。
-    print("[10b] TASK_CREATE 事件（落库后 fire / 会签逐任务）")
+    print("[10b] PROCESS_TASK_START 事件（落库后 fire / 会签逐任务）")
     creates = []
     repo10b = MemoryRepository()
     def10b = {}
@@ -271,27 +274,30 @@ async def main():
         def10b[key] = _d.id
     eng2b = EngineImpl(repo10b, TestUserProv(), TestIDGen(), TestExpr())
     eng2b.set_extensions(EngineExtensions(
-        event_listener=lambda evt: creates.append(evt) if evt.type.value == "TASK_CREATE" else None,
+        event_listener=lambda evt: creates.append(evt)
+        if evt.type is EventType.PROCESS_TASK_START else None,
     ))
     # ① 普通任务：01-simple startAndExecute → apply 完成 → task1 创建（共 2 个）
     inst = await _start_and_execute(eng2b, repo10b, def10b["simple"], "applicant")
-    check("普通流程 2 个 TASK_CREATE（apply+task1）", len(creates) == 2, str([c.taskId for c in creates]))
+    check("普通流程 2 个 PROCESS_TASK_START（apply+task1）", len(creates) == 2, str([c.taskId for c in creates]))
     for c in creates:
         t = await repo10b.find_task_by_id(c.taskId)
-        check(f"TASK_CREATE taskId={c.taskId} 落库后可反查", t is not None,
+        check(f"PROCESS_TASK_START taskId={c.taskId} 落库后可反查", t is not None,
               f"actor={t.actorIds if t else None}")
-        check(f"TASK_CREATE 字段齐全（instanceId/taskName/operator）",
-              c.instanceId == inst.id and c.taskName != "" and c.operator != "",
+        check(f"PROCESS_TASK_START 字段齐全（instanceId/taskName/operator/actors）",
+              c.instanceId == inst.id and c.taskName != "" and c.operator != "" and bool(c.actors),
               f"evt={c}")
+        check(f"PROCESS_TASK_START 载荷必备键齐（spec §11.3 码 3：instanceId/taskId/actors）",
+              all(k in c.data for k in ("instanceId", "taskId", "actors")), f"data={c.data}")
     creates.clear()
     # ② 并行会签：userA/userB/userC 三人逐任务 fire（apply + 3 会签 = 4）
     inst2 = await _start_and_execute(eng2b, repo10b, def10b["par"], "applicant")
-    check("并行会签 4 个 TASK_CREATE（apply+3会签）", len(creates) == 4,
+    check("并行会签 4 个 PROCESS_TASK_START（apply+3会签）", len(creates) == 4,
           str([c.taskId for c in creates]))
     seen = set()
     for c in creates[1:]:
         t = await repo10b.find_task_by_id(c.taskId)
-        check(f"会签 TASK_CREATE taskId={c.taskId} 落库后可反查", t is not None,
+        check(f"会签 PROCESS_TASK_START taskId={c.taskId} 落库后可反查", t is not None,
               f"actor={t.actorIds if t else None}")
         seen.add(c.taskId)
     check("会签 TaskID 互不相同（逐任务 fire）", len(seen) == 3, str(seen))

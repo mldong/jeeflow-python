@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowInterceptor, EngineExtensions
-from jeeflow.engine import KEY_AUTO_GEN_TITLE
+from jeeflow.engine import KEY_AUTO_GEN_TITLE, KEY_CC_ACTORS
 from jeeflow.facade import JeeflowFacade
 from jeeflow.memory import MemoryExtRepository
 from jeeflow.repository.ext import JdbcProcessExtRepository
@@ -268,9 +268,12 @@ async def test_10_interceptor_and_events():
 
     pre_called = [False]; post_called = [False]
     events = []
+    codes = []
 
     async def on_event(evt: ProcessEvent):
-        events.append(evt.type.value)
+        # spec 11-events §11.3：跨栈判据用**规范名**，码值是 A 套整型附带数值（旧 C 套字符串名作废）
+        events.append(evt.name)
+        codes.append(evt.code)
 
     eng.set_extensions(EngineExtensions(
         interceptors=[_TestInterceptor(pre_called, post_called, order=1)],
@@ -278,7 +281,7 @@ async def test_10_interceptor_and_events():
     ))
 
     inst = await eng.start_process_instance_by_id(df.id, "applicant", None)
-    assert "PROCESS_START" in events
+    assert "PROCESS_INSTANCE_START" in events
 
     # 自动完成 apply 节点
     doing = await repo.find_doing_tasks(inst.id)
@@ -292,18 +295,22 @@ async def test_10_interceptor_and_events():
 
     assert pre_called[0], "pre_handle not called"
     assert post_called[0], "post_handle not called"
-    # issues/100：任务落库后 fire TASK_CREATE（对齐 Java CreateTaskHandler，含 apply 节点任务）。
-    # 完整序列：start → [apply 任务 TASK_CREATE, apply 自动完成 TASK_COMPLETE]
-    #         → [task1 TASK_CREATE, task1 完成 TASK_COMPLETE] → PROCESS_FINISH
+    # issues/100（任务落库后 fire，对齐 Java CreateTaskHandler）× issues/132（规范名+整型码）。
+    # 完整序列：start → [apply 任务 PROCESS_TASK_START, apply 自动完成 TASK_COMPLETE]
+    #         → [task1 PROCESS_TASK_START, task1 完成 TASK_COMPLETE] → PROCESS_INSTANCE_END
+    # （旧断言写作 PROCESS_START/TASK_CREATE/PROCESS_FINISH 字符串名，spec §11.6 已把它们
+    #   并到 A 套规范名：PROCESS_START→PROCESS_INSTANCE_START、TASK_CREATE→PROCESS_TASK_START、
+    #   PROCESS_FINISH→PROCESS_INSTANCE_END；序列结构与条数不变）
     assert events == [
-        "PROCESS_START",
-        "TASK_CREATE",
+        "PROCESS_INSTANCE_START",
+        "PROCESS_TASK_START",
         "TASK_COMPLETE",
-        "TASK_CREATE",
+        "PROCESS_TASK_START",
         "TASK_COMPLETE",
-        "PROCESS_FINISH",
+        "PROCESS_INSTANCE_END",
     ], f"unexpected event sequence, got {events}"
-    assert events.count("TASK_CREATE") == 2  # apply 节点任务 + task1 各一次
+    assert codes == [1, 3, 5, 3, 5, 2], f"A 套码序列不符，got {codes}"
+    assert events.count("PROCESS_TASK_START") == 2  # apply 节点任务 + task1 各一次
     assert events.count("TASK_COMPLETE") == 2
 
 
@@ -2108,6 +2115,632 @@ async def test_event_listener_exception_isolated():
     assert r["code"] == 0, "监听器异常不应影响发起主流程"
 
 
+# ─── Test 127＋132: 事件代码腿（spec 11-events §11.3 码表 / §11.5 订阅形状 / §11.7 抄送联动）──
+
+def _is_subsequence(want: list, got: list) -> bool:
+    """want 是否**按顺序**出现在 got 中（spec §11.8 L2-30 判据：只断"出现过"不算过）"""
+    it = iter(got)
+    return all(x in it for x in want)
+
+
+@pytest.mark.asyncio
+async def test_event_codes_are_a_set_integers():
+    """spec §11.3/§11.6：本栈从 C 套字符串名整型化到 A 套 1..9（1/2/3 不变，4 号位由 Java
+    死码 PROCESS_TASK_END 让位给 CC_CREATE，5..9 本轮新增）。旧名以**同码别名**保留兼容。"""
+    assert {e.name: int(e) for e in EventType} == {
+        "PROCESS_INSTANCE_START": 1, "PROCESS_INSTANCE_END": 2, "PROCESS_TASK_START": 3,
+        "CC_CREATE": 4, "TASK_COMPLETE": 5, "TASK_REJECT": 6, "TASK_TRANSFER": 7,
+        "TASK_WITHDRAW": 8, "INSTANCE_TERMINATED": 9,
+    }
+    assert [int(e) for e in EventType] == [1, 2, 3, 4, 5, 6, 7, 8, 9]  # 别名不进成员表
+    # 旧名兼容别名＝同一个成员（集成层旧代码 EventType.TASK_CREATE 仍可用）
+    assert EventType.PROCESS_START is EventType.PROCESS_INSTANCE_START
+    assert EventType.TASK_CREATE is EventType.PROCESS_TASK_START
+    assert EventType.PROCESS_FINISH is EventType.PROCESS_INSTANCE_END
+    assert EventType.PROCESS_REJECT is EventType.PROCESS_INSTANCE_END
+    assert EventType.CC_CREATE == 4
+
+
+@pytest.mark.asyncio
+async def test_event_recorder_canonical_sequence_and_cc_branch():
+    """spec §11.8 L2-30：一条流从发起到办结**按顺序**收到
+    [PROCESS_INSTANCE_START, PROCESS_TASK_START, TASK_COMPLETE, PROCESS_INSTANCE_END]
+    ＋ 抄送支 CC_CREATE（发起 f_ccActors／办理 tf_ccActors 两条腿都算数，issues/127）。
+
+    同时逐码验"fire 必在落库之后"（spec §11.2 原则 3）——监听器**当场反查仓储**读得到
+    那一行（任务行/cc 行/实例终态），读不到即红。
+    """
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "02-multi-task.json")
+
+    names: list[str] = []
+    codes: list[int] = []
+    cc_actors: list[str] = []
+    persisted: dict[str, bool] = {}
+
+    async def recorder(evt: ProcessEvent):
+        names.append(evt.name)
+        codes.append(evt.code)
+        if evt.type is EventType.PROCESS_TASK_START:
+            t = await repo.find_task_by_id(evt.taskId)          # 码 3：任务行已落库
+            persisted["task_start"] = (t is not None and list(t.actorIds) == list(evt.actors)
+                                       and evt.sourceId == evt.taskId
+                                       and set(evt.data) >= {"instanceId", "taskId", "actors"})
+        elif evt.type is EventType.CC_CREATE:
+            _rows, total = await repo.page_cc_instances(1, 10, evt.ccActorId)  # 码 4：cc 行已落库
+            cc_actors.append(evt.ccActorId)
+            persisted[f"cc:{evt.ccActorId}"] = (total >= 1 and evt.sourceId == evt.instanceId
+                                                and evt.data.get("ccActorId") == evt.ccActorId)
+        elif evt.type is EventType.PROCESS_INSTANCE_END:
+            inst = await repo.find_instance_by_id(evt.instanceId)  # 码 2：终态已落库
+            persisted["instance_end"] = (inst is not None and int(inst.state) == evt.state
+                                         and evt.data.get("state") == evt.state)
+
+    eng.set_extensions(EngineExtensions(event_listeners=[recorder]))
+
+    # ① 发起腿：f_ccActors → 建 cc 行 + 逐人 CC_CREATE
+    r = await facade.flow("processInstance/startAndExecute", {
+        "processDefineId": define_id, "operator": "applicant", "f_ccActors": "alice,bob"})
+    assert r["code"] == 0, r
+    iid = int(r["data"]["processInstanceId"])
+
+    # ② 办理腿：tf_ccActors（issues/127 病灶——此前本栈根本没有这条腿，cc 行不建、事件不发）
+    doing = await repo.find_doing_tasks(iid)
+    assert doing and doing[0].taskName == "task1", doing
+    r = await facade.flow("processTask/execute", {
+        "processTaskId": doing[0].id, "operator": "leader", "submitType": 1, "tf_ccActors": "carol"})
+    assert r["code"] == 0, r
+    # 数据腿：办理时抄送真的落了 cc 行（ccList 出口读得到）
+    for who in ("alice", "bob", "carol"):
+        rows = (await facade.flow("processInstance/ccList", {"operator": who}))["data"]["rows"]
+        assert len(rows) == 1 and int(rows[0]["id"]) == iid, (who, rows)
+
+    # ③ 走完流程到办结
+    for name, op in (("task2", "manager"), ("task3", "boss")):
+        doing = await repo.find_doing_tasks(iid)
+        assert doing and doing[0].taskName == name, doing
+        r = await facade.flow("processTask/execute", {
+            "processTaskId": doing[0].id, "operator": op, "submitType": 1})
+        assert r["code"] == 0, r
+
+    # ── 序列判据（按顺序，不是"出现过"）──
+    assert names[0] == "PROCESS_INSTANCE_START" and names[-1] == "PROCESS_INSTANCE_END", names
+    want = ["PROCESS_INSTANCE_START", "PROCESS_TASK_START", "TASK_COMPLETE", "PROCESS_INSTANCE_END"]
+    assert _is_subsequence(want, names), f"规范名序列不符: {names}"
+    assert _is_subsequence([1, 3, 5, 2], codes), f"A 套码序列不符: {codes}"
+    assert _is_subsequence(["CC_CREATE"], names), f"抄送支缺失: {names}"
+    # 抄送支逐人 fire（spec §11.3 码 4「逐抄送人 fire 一次」），且发起腿在实例发起后、办理腿在办理后
+    assert cc_actors == ["alice", "bob", "carol"], cc_actors
+    assert names.count("CC_CREATE") == 3
+    # 每一支 fire 时对应数据都已落库（监听器当场反查得到）
+    assert persisted == {"task_start": True, "cc:alice": True, "cc:bob": True,
+                         "cc:carol": True, "instance_end": True}, persisted
+    # 载荷键按 §11.3 camelCase：终态事件的 state 是落库后的整数（办结 20）
+    assert (await repo.find_instance_by_id(iid)).state == InstanceState.DONE
+
+
+# ─── issues/127 契约位置：抄送腿在**引擎执行路径**里（spec §11.7「与任务更新同事务建 cc 行」）──
+
+class _WriteSpyRepo(MemoryRepository):
+    """记录**写库顺序**的内存仓——证 cc 行的写点落在 ``engine.*`` 这次调用的**内部**。
+
+    本栈的事务约定是 ``JdbcProcessRepository.with_tx``（``contextvars`` 绑连接，spec 05 §7.4）：
+    调用方把 ``engine.start/execute`` 包进 ``with_tx`` 时，只有写点在引擎调用栈内，
+    cc 行才与实例/任务写库同处一个事务。门面在 ``engine.*`` **返回之后**建 cc 行（本轮之前的形状）
+    ⇒ 该事务盖不到 cc 行，且不用门面的调用方根本不建 cc 行。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.writes: list[str] = []
+
+    async def save_instance(self, inst):
+        self.writes.append("save_instance")
+        return await super().save_instance(inst)
+
+    async def update_instance(self, inst):
+        self.writes.append("update_instance")
+        return await super().update_instance(inst)
+
+    async def update_task(self, task):
+        self.writes.append("update_task")
+        return await super().update_task(task)
+
+    async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str):
+        self.writes.append(f"create_cc_instance:{','.join(actor_ids)}")
+        return await super().create_cc_instance(instance_id, creator, *actor_ids)
+
+    def first_cc_write(self) -> int:
+        idx = [i for i, w in enumerate(self.writes) if w.startswith("create_cc_instance")]
+        assert idx, f"cc 行从未落库，写序={self.writes}"
+        return idx[0]
+
+
+@pytest.mark.asyncio
+async def test_cc_leg_lives_in_engine_execution_path():
+    """判据①＋②：**直连引擎 API**（不经门面）带 ``f_ccActors``／``tf_ccActors`` 也建 cc 行、
+    逐人 fire CC_CREATE(4)，且 fire 那一刻 cc 行**已在仓里**（spec §11.2 原则 3／§11.7）。
+
+    基准＝Java ``JeeflowEngineImpl.handleCcActors``（在 ``executeProcessTask`` 的 ``runInTx`` 里）。
+    本轮之前本栈两条腿都在 ``facade``，且排在 ``engine.*`` 返回之后 ⇒ 引擎直用形态（集成层的
+    WSGI↔async 桥、以及任何 ``EngineImpl`` 直调）传 cc 参数**静默零副作用**，跨栈与 go/node 分叉。
+    """
+    repo = _WriteSpyRepo()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    df = load_flow(repo, "02-multi-task.json")
+
+    cc_events: list[ProcessEvent] = []
+    rows_at_fire: list[int] = []
+
+    async def recorder(evt: ProcessEvent):
+        if evt.type is EventType.CC_CREATE:
+            _r, total = await repo.page_cc_instances(1, 10, evt.ccActorId)
+            rows_at_fire.append(total)          # 判据②：fire 时 cc 行必须已落库（摘掉落库只 fire ⇒ 红）
+            cc_events.append(evt)
+
+    eng.set_extensions(EngineExtensions(event_listeners=[recorder]))
+
+    # ① 发起腿·直连引擎：逗号串带空项与重复项 ⇒ trim / 丢空 / 按出现顺序去重后逐人 fire
+    inst = await eng.start_process_instance_by_id(df.id, "applicant",
+                                                  {"f_ccActors": "alice, bob ,,alice"})
+    assert [e.ccActorId for e in cc_events] == ["alice", "bob"], \
+        f"直连引擎的发起腿应建 cc 并逐人 fire，实际 {[e.ccActorId for e in cc_events]}"
+    assert all(e.instanceId == inst.id and e.sourceId == inst.id for e in cc_events), \
+        [e.instanceId for e in cc_events]
+    assert rows_at_fire and all(t >= 1 for t in rows_at_fire), f"fire 时 cc 行还没落库: {rows_at_fire}"
+    # 写序：实例行 insert 先于 cc 行（同一次调用内，故包住的 with_tx 一并盖到）
+    assert "save_instance" in repo.writes
+    assert repo.writes.index("save_instance") < repo.first_cc_write(), repo.writes
+
+    # ② 办理腿·直连引擎：tf_ccActors 与任务更新同一次调用，cc 行写点在 update_task 之后
+    apply = (await repo.find_doing_tasks(inst.id))[0]
+    await repo.add_task_actor(apply.id, ["applicant"])
+    repo.writes.clear(); cc_events.clear(); rows_at_fire.clear()
+    await eng.execute_process_task(apply.id, "applicant",
+                                   {"submitType": 0, "tf_ccActors": ["carol", "dave", "carol"]})
+    assert [e.ccActorId for e in cc_events] == ["carol", "dave"], \
+        f"直连引擎的办理腿应建 cc 并逐人 fire，实际 {[e.ccActorId for e in cc_events]}"
+    assert all(e.instanceId == inst.id for e in cc_events)
+    assert rows_at_fire and all(t >= 1 for t in rows_at_fire), f"fire 时 cc 行还没落库: {rows_at_fire}"
+    assert "update_task" in repo.writes, repo.writes
+    assert repo.writes.index("update_task") < repo.first_cc_write(), \
+        f"cc 行必须与任务更新同序（在 update_task 之后、同一次调用内）: {repo.writes}"
+
+    # ③ 不带 cc 参数的发起/办理：零副作用（纯增量红线，不得凭空建 cc 行）
+    repo.writes.clear()
+    inst2 = await eng.start_process_instance_by_id(df.id, "applicant2")
+    assert not any(w.startswith("create_cc_instance") for w in repo.writes), repo.writes
+    doing2 = (await repo.find_doing_tasks(inst2.id))[0]
+    await repo.add_task_actor(doing2.id, ["applicant2"])
+    repo.writes.clear()
+    await eng.execute_process_task(doing2.id, "applicant2", {"submitType": 0})
+    assert not any(w.startswith("create_cc_instance") for w in repo.writes), repo.writes
+
+
+@pytest.mark.asyncio
+async def test_cc_three_paths_share_one_engine_funnel():
+    """判据③：发起 ``f_ccActors``／办理 ``tf_ccActors``／手动 ``createCCInstance`` **三条路径
+    只有一处实现**——都进 ``engine.handle_cc_actors`` 那一个漏斗，门面不留第二份建行/fire 代码。
+
+    证法＝引擎漏斗打桩计数（三条路径各命中一次、参数逐一对上）＋ 仓储写点计数
+    （每条路径只写一次 cc 行）＋ 门面侧旧实现已摘除。
+    """
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+
+    funnel: list[list[str]] = []
+    create_calls: list[list[str]] = []
+    original_funnel = eng.handle_cc_actors
+    original_create = repo.create_cc_instance
+
+    async def funnel_spy(instance_id, operator, cc_actors):
+        actors = await original_funnel(instance_id, operator, cc_actors)
+        if actors:                      # 不带 cc 参数的引擎调用（返回 []）不算"抄送动作"
+            funnel.append(list(actors))
+        return actors
+
+    async def create_spy(instance_id, creator, *actor_ids):
+        create_calls.append(list(actor_ids))
+        return await original_create(instance_id, creator, *actor_ids)
+
+    eng.handle_cc_actors = funnel_spy
+    repo.create_cc_instance = create_spy
+
+    # 路径一：发起 f_ccActors
+    iid = await _start(facade, define_id, "zhangsan")
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "user9",
+                           "f_ccActors": "p1,p2"})
+    assert r["code"] == 0, r
+    # 路径二：办理 tf_ccActors
+    doing = await repo.find_doing_tasks(int(r["data"]["processInstanceId"]))
+    assert doing, "发起后应有待办"
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": doing[0].id, "operator": "leader",
+                           "submitType": 1, "tf_ccActors": "p3"})
+    assert r["code"] == 0, r
+    # 路径三：手动 createCCInstance（重复项去重后只一人）
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": iid, "operator": "zhangsan",
+                           "actorIds": ["p4", "p4"]})
+    assert r["code"] == 0, r
+
+    assert funnel == [["p1", "p2"], ["p3"], ["p4"]], f"三条路径应各命中漏斗一次: {funnel}"
+    assert create_calls == [["p1", "p2"], ["p3"], ["p4"]], \
+        f"每条路径只应写一次 cc 行（没有第二处建行实现）: {create_calls}"
+    # 门面侧不再有抄送实现：抄送落库 + fire 只在引擎那一处
+    assert not hasattr(JeeflowFacade, "_handle_cc_actors"), "门面仍留着自己的抄送入口（第二处实现）"
+    assert not hasattr(JeeflowFacade, "_notify_cc_create"), "门面仍自己 fire CC_CREATE（第二处实现）"
+
+
+# ─── spec §11.7 边界 2：办理抄送腿的覆盖面**只有 executeProcessTask 一条** ──────────────
+
+async def _cc_leg_probe(at: str, actor: str, submit_type: int, *, extra: dict = None,
+                        cc: str = None, via_facade: bool = True):
+    """02-multi-task 推进到 ``at`` 节点 → 执行一次办理动作，只采集**这一次调用**内的事件名、
+    CC_CREATE 的 ccActorId、cc 写点、该实例的 cc 行数。
+
+    ``via_facade=False`` 走**直连引擎 API**（不经门面）——覆盖面判据必须落在引擎里（§11.7 边界 1
+    同一条理由：挂在门面＝直连引擎的调用方形状不同）。cc 参数用 ``tf_ccActors``。
+    """
+    repo = _WriteSpyRepo()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    names: list[str] = []
+    cc_actors: list[str] = []
+
+    def recorder(evt: ProcessEvent):
+        names.append(evt.name)
+        if evt.type is EventType.CC_CREATE:
+            cc_actors.append(evt.ccActorId)
+
+    eng.set_extensions(EngineExtensions(event_listeners=[recorder]))
+    iid = await _start_multi_task_at(facade, repo, at)
+    tid = await _doing_task_id(repo, iid, at)
+    assert tid, f"应推进到 {at}"
+    await repo.add_task_actor(tid, [actor])
+    names.clear(); cc_actors.clear(); repo.writes.clear()
+
+    args: dict = {"submitType": submit_type}
+    args |= extra or {}
+    if cc is not None:
+        args[KEY_CC_ACTORS] = cc
+    if via_facade:
+        r = await facade.flow("processTask/execute", {"processTaskId": tid, "operator": actor, **args})
+        assert r["code"] == 0, r
+    else:
+        # 直连引擎：门面 submitType 分发的同一张表（facade._processTask_execute）
+        if submit_type == 2:
+            await eng.execute_and_jump_to_end(tid, actor, args)
+        elif submit_type == 3:
+            await eng.execute_and_jump_task(tid, actor, args)
+        elif submit_type == 4:
+            await eng.execute_and_jump_task(tid, actor, args, extra["taskName"])
+        elif submit_type == 6:
+            await eng.execute_and_jump_to_first_task_node(tid, actor, args)
+        else:
+            await eng.execute_process_task(tid, actor, args)
+    return (names, cc_actors,
+            [w for w in repo.writes if w.startswith("create_cc_instance")],
+            repo._cc.get(iid))
+
+
+@pytest.mark.asyncio
+async def test_cc_leg_positive_execute_process_task_fires_exactly_n():
+    """正向格（spec §11.7 边界 2 的"该发的那一支"）：``executeProcessTask`` 带 ``tf_ccActors``
+    ⇒ **恰好 N 支 CC_CREATE(4) ＋ N 行 cc**（N＝去重后抄送人数；重复项折一行一事件）。
+
+    门面与直连引擎两种姿势都要过（钩子在引擎里，不在门面）。
+    """
+    for via in (True, False):
+        tag = "门面" if via else "直连引擎"
+        names, cc_actors, cc_writes, cc_rows = await _cc_leg_probe(
+            "task1", "leader", 1, cc="carol,dave,carol", via_facade=via)
+        assert cc_actors == ["carol", "dave"], f"{tag}：应逐抄送人各 fire 一支 4，实际 {cc_actors}"
+        assert names.count("CC_CREATE") == 2, f"{tag}：N=2 ⇒ 恰好 2 支 4，实际 {names}"
+        assert cc_writes == ["create_cc_instance:carol,dave"], \
+            f"{tag}：cc 行应一次写、每人一行: {cc_writes}"
+        assert cc_rows == ["carol", "dave"], f"{tag}：仓里应是 N=2 行 cc: {cc_rows}"
+        # 这一档原有的 5＋下一节点 3 腿照旧在（cc 是纯增量，不顶掉别的码）
+        assert "TASK_COMPLETE" in names and "PROCESS_TASK_START" in names, names
+
+
+@pytest.mark.asyncio
+async def test_cc_leg_narrow_coverage_jump_reject_builds_no_cc():
+    """四档负向格（spec §11.7 边界 2 钉死的覆盖面）：``executeAndJumpToEnd``（拒绝/跳转）、
+    ``jumpTask``/``rollback``、退回发起人这几条腿带 ``tf_ccActors`` ⇒ **0 支 4 且 0 行 cc**，
+    并且它们原有的 5/6/2 事件腿形状**逐字不变**。
+
+    判据原文（jeeflow-doc spec/11-events.md §11.7 两条本轮钉死的边界 2）：
+    「**覆盖面以 Java 基准为准，只算 `executeProcessTask` 一条**。`executeAndJumpTask` /
+    `jumpToEnd` / `rollbackToOperator` 这类跳转·回退 action 带的 `tf_ccActors`
+    **本轮不建 cc、不发 `CC_CREATE`**；……**单栈自行放宽＝跨栈分叉**」。
+    形状对照＝同一档动作"不带 cc"跑一遍、"带 cc"再跑一遍，两次事件名序列必须完全相等
+    （不是"我以为的样子"，是这一档自己跟自己比）。
+    """
+    #: 每档的既有事件腿形状（本轮之前实测值；带 cc 后必须一字不差）
+    shapes = {
+        2: ["TASK_REJECT", "PROCESS_INSTANCE_END"],        # 拒绝到终点（jumpToEnd）
+        3: ["TASK_REJECT", "PROCESS_TASK_START"],          # ROLLBACK 空 target（血缘回退）
+        4: ["TASK_COMPLETE", "PROCESS_TASK_START"],        # JUMP 命名 target
+        6: ["TASK_REJECT", "PROCESS_TASK_START"],          # 退回发起人
+    }
+    for submit_type, shape in shapes.items():
+        # 只有 JUMP 档需要命名 target；其余档不带 taskName，免得把无关键塞进流程变量
+        extra = {"taskName": "apply"} if submit_type == 4 else {}
+        for via in (True, False):
+            tag = f"submitType={submit_type}{'门面' if via else '直连引擎'}"
+            base_names, *_ = await _cc_leg_probe(
+                "task3", "boss", submit_type, extra=extra, via_facade=via)
+            names, cc_actors, cc_writes, cc_rows = await _cc_leg_probe(
+                "task3", "boss", submit_type, extra=extra,
+                cc="carol,dave,carol", via_facade=via)
+            # ① 0 支 4
+            assert cc_actors == [] and "CC_CREATE" not in names, \
+                f"{tag}：跳转·回退档带 tf_ccActors 不该 fire 码 4，实际 {names}"
+            # ② 0 行 cc
+            assert cc_writes == [] and not cc_rows, \
+                f"{tag}：跳转·回退档带 tf_ccActors 不该建 cc 行，实际 {cc_writes}/{cc_rows}"
+            # ③ 原有 5/6/2 事件腿形状不许变（与"不带 cc"的同档动作逐字对照）
+            assert base_names == shape, f"{tag}：无 cc 基准形状漂了 {base_names} != {shape}"
+            assert names == shape, f"{tag}：带 cc 后形状变了 {names} != {base_names}"
+
+
+@pytest.mark.asyncio
+async def test_cc_leg_untouched_start_and_manual_paths():
+    """回归格（本轮不许动的两支）：发起腿 ``f_ccActors`` 与门面手动 ``createCCInstance``
+    仍各自建 cc 行 + 逐人 fire 码 4 —— 收窄只针对办理腿的覆盖面。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "02-multi-task.json")
+
+    names: list[str] = []
+    eng.set_extensions(EngineExtensions(event_listeners=[lambda evt: names.append(evt.name)]))
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "zhangsan",
+                           "f_ccActors": "alice,bob"})
+    assert r["code"] == 0, r
+    iid = int(r["data"]["processInstanceId"])
+    assert names.count("CC_CREATE") == 2, f"发起腿应 fire 2 支 4: {names}"
+    assert repo._cc.get(iid) == ["alice", "bob"], repo._cc.get(iid)
+
+    names.clear()
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": iid, "operator": "zhangsan",
+                           "actorIds": ["mallory"]})
+    assert r["code"] == 0, r
+    assert names == ["CC_CREATE"], f"手动腿应 fire 一支 4: {names}"
+    assert repo._cc.get(iid) == ["alice", "bob", "mallory"], repo._cc.get(iid)
+
+
+@pytest.mark.asyncio
+async def test_task_reject_and_complete_are_exclusive():
+    """spec §11.3 码 5/6 互斥：同一动作走退回就不再 fire「办掉」；退发起人/会签软拒绝同归 6。
+    实例终态另发码 2，载荷 state 分办结(20)/拒绝(45)（§11.6 收口旧 Finish/Reject 拆分）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+
+    evts: list[ProcessEvent] = []
+    eng.set_extensions(EngineExtensions(event_listeners=[lambda evt: evts.append(evt)]))
+
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "applicant"})
+    assert r["code"] == 0, r
+    iid = int(r["data"]["processInstanceId"])
+    doing = await repo.find_doing_tasks(iid)
+    assert doing[0].taskName == "task1"
+
+    # 同意：只发 5（apply 自动完成那一支 submitType=0 也是"办掉"；此处没有 6）
+    r = await facade.flow("processTask/execute", {"processTaskId": doing[0].id,
+                                                  "operator": "leader", "submitType": 1})
+    assert r["code"] == 0, r
+    assert [e.data["submitType"] for e in evts if e.type is EventType.TASK_COMPLETE] == [0, 1], \
+        [e.name for e in evts]
+    assert not [e for e in evts if e.type is EventType.TASK_REJECT], [e.name for e in evts]
+
+    # 拒绝：只发 6，不再补发 5（互斥）；实例终态发 2 且 state=45
+    iid2 = int((await facade.flow("processInstance/startAndExecute",
+                                  {"processDefineId": define_id, "operator": "user2"}))
+               ["data"]["processInstanceId"])
+    doing2 = await repo.find_doing_tasks(iid2)
+    task1_id = doing2[0].id
+    evts.clear()
+    r = await facade.flow("processTask/execute", {"processTaskId": task1_id,
+                                                  "operator": "leader", "submitType": 2})
+    assert r["code"] == 0, r
+    names = [e.name for e in evts]
+    assert "TASK_REJECT" in names and "TASK_COMPLETE" not in names, names
+    rej = next(e for e in evts if e.type is EventType.TASK_REJECT)
+    assert rej.code == 6 and rej.sourceId == int(task1_id)
+    assert rej.data["submitType"] == 2 and rej.data["instanceId"] == iid2
+    assert rej.data["operator"] == "leader" and rej.data["taskId"] == int(task1_id)
+    end = next(e for e in evts if e.type is EventType.PROCESS_INSTANCE_END)
+    assert end.code == 2 and end.state == int(InstanceState.REJECT)
+    assert (await repo.find_instance_by_id(iid2)).state == InstanceState.REJECT
+
+    # 直连引擎的退回入口（args 里**没有** submitType）也必须发 6 不发 5：
+    # 档由"调用的是哪个引擎方法"决定，不靠调用方塞参数（残留 submitType 也不得误判）
+    iid3 = int((await facade.flow("processInstance/startAndExecute",
+                                   {"processDefineId": define_id, "operator": "user3"}))
+                ["data"]["processInstanceId"])
+    doing3 = await repo.find_doing_tasks(iid3)
+    evts.clear()
+    await eng.execute_and_jump_to_end(doing3[0].id, "leader")
+    names3 = [e.name for e in evts]
+    assert names3 == ["TASK_REJECT", "PROCESS_INSTANCE_END"], names3
+    assert evts[0].data["submitType"] == 2, evts[0].data
+
+
+@pytest.mark.asyncio
+async def test_transfer_fires_task_transfer_after_persist():
+    """spec §11.3 码 7：转办在参与者被替换**并落库之后** fire，载荷带 fromActor/toActor/operator"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    task1 = (await repo.find_doing_tasks(iid))[0]
+
+    seen: list[ProcessEvent] = []
+    readback: dict[str, bool] = {}
+
+    async def listener(evt: ProcessEvent):
+        if evt.type is not EventType.TASK_TRANSFER:
+            return
+        seen.append(evt)
+        actors = await repo.find_task_actors(evt.taskId)   # fire 时替换已落库
+        readback["actors"] = (evt.fromActor not in actors and evt.toActor in actors)
+
+    eng.set_extensions(EngineExtensions(event_listeners=[listener]))
+    r = await facade.flow("processTask/transfer", {"processTaskId": task1.id,
+                                                   "fromActor": "leader", "toActor": "lisi",
+                                                   "reason": "出差", "operator": "leader"})
+    assert r["code"] == 0, r
+    assert len(seen) == 1 and seen[0].code == 7, [e.name for e in seen]
+    assert seen[0].sourceId == int(task1.id)
+    assert seen[0].data == {"instanceId": iid, "taskId": int(task1.id), "fromActor": "leader",
+                            "toActor": "lisi", "operator": "leader", "taskName": "task1"}, seen[0].data
+    assert readback == {"actors": True}, readback
+
+
+@pytest.mark.asyncio
+async def test_withdraw_fires_task_withdraw_once_after_persist():
+    """spec §11.3 码 8：撤回把实例写 30、任务行更新完后 **每轮只 fire 一次**（不逐任务）"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "02-multi-task.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    # 并行会签场景才会一次撤多行；01/02 系是单行，另造一个多 doing 的实例更稳妥：
+    # 这里直接验"每轮一次"＋落库后 fire，多行档由 cs 流程另测（见下方 count 断言）
+    seen: list[ProcessEvent] = []
+    readback: dict[str, bool] = {}
+
+    async def listener(evt: ProcessEvent):
+        if evt.type is not EventType.TASK_WITHDRAW:
+            return
+        seen.append(evt)
+        inst = await repo.find_instance_by_id(evt.instanceId)   # fire 时实例已是 30
+        readback["state"] = (inst is not None and int(inst.state) == int(InstanceState.WITHDRAW))
+
+    eng.set_extensions(EngineExtensions(event_listeners=[listener]))
+    r = await facade.flow("processInstance/withdraw", {"id": iid, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    assert len(seen) == 1 and seen[0].code == 8, [e.name for e in seen]
+    assert seen[0].sourceId == iid and seen[0].data["operator"] == "zhangsan"
+    assert readback == {"state": True}, readback
+
+    # 并行会签多行撤回：仍只 fire 一次（每轮撤回只 fire 一次，不逐任务）
+    cs_define = await _deploy(facade, "05-countersign-parallel.json")
+    cs_iid = await _start(facade, cs_define, "user1")
+    doing = await repo.find_doing_tasks(cs_iid)
+    assert len(doing) > 1, [t.taskName for t in doing]
+    seen.clear()
+    r = await facade.flow("processInstance/withdraw", {"id": cs_iid, "operator": "user1"})
+    assert r["code"] == 0, r
+    assert len(seen) == 1, f"多行撤回应只 fire 一次，实得 {len(seen)}"
+
+
+@pytest.mark.asyncio
+async def test_two_listeners_of_same_code_are_both_called():
+    """spec §11.5「一次 fire 必须把该事件送给**全部**已注册监听器，不得后注册覆盖前注册」——
+    issues/132 本栈单回调病灶的收口判据：同一个 CC_CREATE 码挂两个监听器，两个都要被调到。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+
+    first: list = []
+    second: list = []
+    eng.set_extensions(EngineExtensions(event_listeners=[
+        lambda evt: first.append((evt.name, evt.ccActorId)) if evt.type is EventType.CC_CREATE else None,
+        lambda evt: second.append((evt.name, evt.ccActorId)) if evt.type is EventType.CC_CREATE else None,
+    ]))
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "applicant",
+                           "f_ccActors": "u1,u2"})
+    assert r["code"] == 0, r
+    assert first == [("CC_CREATE", "u1"), ("CC_CREATE", "u2")], first
+    assert second == first, f"同码第二个监听器没被调到: {second}"
+
+    # 运行期再追加第三个（引擎入口 add_event_listener）：追加不覆盖，三个监听器同权
+    third: list = []
+    eng.add_event_listener(lambda evt: third.append(evt.ccActorId)
+                           if evt.type is EventType.CC_CREATE else None)
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": int(r["data"]["processInstanceId"]),
+                           "operator": "applicant", "actorIds": ["u3"]})
+    assert r["code"] == 0, r
+    assert [x for x in first if x[1] == "u3"] and [x for x in second if x[1] == "u3"]
+    # 第三个监听器是运行期才追加的 ⇒ 只收得到追加之后发生的那一支（前两支不回放）
+    assert third == ["u3"], third
+
+
+@pytest.mark.asyncio
+async def test_listener_exception_isolated_per_listener():
+    """spec §11.5 异常隔离（issues/104 P2）：单个监听器抛异常只记日志，
+    ① 不回滚主流程 ② **不中断后续监听器**——旧单回调形态无从表达这条，本轮列表化后必测"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+
+    def boom(evt: ProcessEvent):
+        raise RuntimeError("boom")
+
+    tail: list = []
+    eng.set_extensions(EngineExtensions(event_listeners=[boom,
+                                                          lambda evt: tail.append(evt.name)]))
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "applicant",
+                           "f_ccActors": "alice"})
+    assert r["code"] == 0, f"监听器异常不得影响主流程: {r}"
+    # ① 主流程数据在
+    iid = int(r["data"]["processInstanceId"])
+    assert len((await facade.flow("processInstance/ccList",
+                                  {"operator": "alice"}))["data"]["rows"]) == 1
+    # ② 后续监听器照收每一个事件（含抛异常那一支同码的 CC_CREATE）
+    assert tail[0] == "PROCESS_INSTANCE_START", tail
+    assert tail.count("CC_CREATE") == 1, tail
+    assert len(tail) >= 5 and "PROCESS_TASK_START" in tail and "TASK_COMPLETE" in tail, tail
+
+
+@pytest.mark.asyncio
+async def test_legacy_single_callable_listener_is_still_supported():
+    """旧形状兼容（issues/132 迁移路径·本栈选"保留兼容位"而不是直接删）：
+    三壳的 ``EngineExtensions(event_listener=cb)`` 写法在本轮不改，必须仍收得到全部事件；
+    与 ``event_listeners`` 混用时旧回调排最前，同一个 callable 挂两处只调一次。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+
+    legacy: list = []
+    added: list = []
+    legacy_fn = lambda evt: legacy.append(evt.name)
+    eng.set_extensions(EngineExtensions(event_listener=legacy_fn,
+                                        event_listeners=[lambda evt: added.append(evt.name),
+                                                         legacy_fn]))
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "applicant",
+                           "f_ccActors": "alice"})
+    assert r["code"] == 0, r
+    assert legacy and legacy == added, (legacy, added)   # 旧回调一条不少（同一 callable 不重复调）
+    assert legacy[0] == "PROCESS_INSTANCE_START" and "CC_CREATE" in legacy, legacy
+
+    # 注册顺序＝回调顺序：旧回调在最前，列表按其注册序
+    order: list = []
+    eng2, repo2 = setup()
+    facade2 = JeeflowFacade(eng2, repo2, MemoryExtRepository())
+    define2 = await _deploy(facade2, "01-simple.json")
+
+    async def l1(evt): order.append("l1")
+    async def l2(evt): order.append("l2")
+    eng2.set_extensions(EngineExtensions(event_listener=lambda evt: order.append("legacy"),
+                                         event_listeners=[l1, l2]))
+    await facade2.flow("processInstance/startAndExecute",
+                       {"processDefineId": define2, "operator": "applicant"})
+    assert order[:3] == ["legacy", "l1", "l2"], order
+
+
 def _stats_setup():
     """stats 测试专用 setup：返回 (eng, repo, facade)"""
     eng, repo = setup()
@@ -3093,10 +3726,10 @@ async def test_surrogate_query_four_criteria_memory_repo():
         """同 `add`，但**经门面写侧**（API 形状 `processSurrogate/save`）。
 
         写侧 `_to_int` 在落库前把 `"1"` / `True` 归一成整数 1、把 `""` / `"abc"` 落成 0，
-        而 `add` 走的是 SPI 仓储 `save_surrogate` 原值直存（库里存什么形状就是什么形状）。
-        判据④自 issues/130 案 A 起只认整数 1，内存仓**刻意不做**驱动边界还原
-        （`surrogate.hydrate_enabled` 只挂在内置 SQL 仓装行处），所以"④ `"1"` 等价启用"
-        这一档只能由**写侧门面**兑现 —— 用它做断言却不走门面，漏的就是 helper 这一层。
+        而 `add` 走的是 SPI 仓储 `save_surrogate`——自 owner 2026-09-29 拍"内存仓统一到 node 侧"后，
+        那条边界只把**规范整数串**（`"1"`/`"0"`/`"2"`）落成 int，`"abc"` 这类脏值原样留着。
+        判据④自 issues/130 案 A 起始终只认整数 1（两档边界归一都在**边界**，不在判据里），
+        所以"④ `"1"` 等价启用"由**写侧**（门面或内存仓 save 边界）兑现 —— 门面这一档就用它来钉。
         """
         r = await facade.flow("processSurrogate/save",
                               {"operator": op, "surrogate": sur, "processName": pn,
@@ -3144,8 +3777,10 @@ async def test_surrogate_query_four_criteria_memory_repo():
     for dirty, why in ((0, "零停用"), (None, "NULL非启用"), ("abc", "脏值"), (2, "非1整数")):
         await add("en-" + why, "agent", enabled=dirty, op="c4")
         assert await ext.get_surrogate("c4", "en-" + why) is None, f"④ {why} 不得生效"
-    # "1" 等价启用属**写侧门面**语义（案 A：判据只认整数，门面 _to_int 先把 "1" 折成整数 1 再落库）；
-    # 原值直存 SPI 仓储的 "1" 一律停用，见 test_surrogate_enabled_strict_integer_one_dirty_matrix。
+    # "1" 等价启用属**写侧边界**语义（案 A：判据只认整数，门面 _to_int 先把 "1" 折成整数 1 再落库；
+    # 内存仓 save_surrogate 的写侧边界同形，见 test_surrogate_memory_write_boundary_normalizes_canonical_int）。
+    # 绕过两条写侧边界的原值（update_surrogate 那条不归一出口）一律停用，
+    # 见 test_surrogate_enabled_strict_integer_one_dirty_matrix。
     await add_api("en-str", "agent", enabled="1", op="c4")
     assert (await ext.get_surrogate("c4", "en-str")).surrogate == "agent", '④ "1" 等价启用'
     assert surrogate_enabled_on("abc") is False and surrogate_enabled_on(1) is True
@@ -3173,19 +3808,27 @@ _DIRTY_ENABLED = [
 
 
 async def _row_and_start(enabled):
-    """按给定 ``enabled`` **原值**直存一条窗内委托，发起一单。
+    """把给定 ``enabled`` **原值**盖进台账，建一条窗内委托并发起一单。
 
-    刻意走 ``ext.save_surrogate``（SPI 仓储边界），**不经**门面 ``processSurrogate/save``
-    的 ``_to_int`` 归一——130 §2 说清了：脏值只在自定义 SPI 仓储直传时才显形；
-    走门面的话 `"1"` 早在写入侧被折成整数 1，矩阵就测不到判据本身了。
+    写姿逐字对齐 jeeflow-node ``__tests__/spec.test.ts`` 的脏值矩阵（owner 2026-09-29 拍
+    「python 内存仓统一到 node 侧」之后，台账原值唯一的显形路径）：
+    先 ``save_surrogate`` 落一行，再用**不做写侧归一的** ``update_surrogate`` 把原值整行盖回。
+    内存仓写侧边界自本轮起把**规范整数串** ``'1'`` 折成整数 1（它建模的就是 INT 列，SQL 那一步
+    由数据库做），而 ``update_surrogate`` 是那条有意不对称的原值出口（issues/130 §2）。
+
+    仍**不经**门面 ``processSurrogate/save`` 的 ``_to_int`` 归一 ⇒ 判据④本身照旧被钉住；
+    每档下面那句"台账里真的是这个值/类型"的前置自检保证负向断言不是空转。
     """
     eng, repo = setup()
     ext = MemoryExtRepository()
     facade = JeeflowFacade(eng, repo, ext)
     now = datetime.now()
-    await ext.save_surrogate(ProcessSurrogate(
-        operator="leader", surrogate="lisi", processName="simple",
-        startTime=now - timedelta(days=1), endTime=now + timedelta(days=1), enabled=enabled))
+    s = ProcessSurrogate(operator="leader", surrogate="lisi", processName="simple",
+                         startTime=now - timedelta(days=1), endTime=now + timedelta(days=1),
+                         enabled=enabled)
+    await ext.save_surrogate(s)
+    s.enabled = enabled             # 写侧边界可能已把 '1' 折成整数 1 ⇒ 盖回调用方原值
+    await ext.update_surrogate(s)   # 整行覆盖、不归一（node memory-ext.updateSurrogate 同形）
     iid = await _start(facade, await _deploy(facade, "01-simple.json"), "zhangsan")
     return repo, ext, facade, (await repo.find_doing_tasks(iid))[0]
 
@@ -3225,6 +3868,78 @@ async def test_surrogate_enabled_strict_integer_one_dirty_matrix():
     for dirty in (2, "1", 1.0, True, "x", None, "", -1, 0):
         assert surrogate_enabled_on(dirty) is False, f"判据④：{dirty!r} 不得算启用"
     assert surrogate_enabled_on(1) is True, "判据④：只有整数 1 算启用"
+
+
+@pytest.mark.asyncio
+async def test_surrogate_memory_write_boundary_normalizes_canonical_int():
+    """任务 2（owner 2026-09-29 拍「python 内存仓统一到 node 侧」）：内存仓的**委托写入边界**
+    把规范整数串归一成 int（``'1'→1``、``'0'→0``），**判据④本体一个字不放宽**。
+
+    为什么这是契约面而不是"把测试改绿"：``wf_process_surrogate.enabled`` 是 INT 列
+    （``tests/schema/schema-mysql.sql``），SQL 仓那侧 "1" 进列就被数据库折成整数 1；内存仓是同一张
+    列的替身，却没人做这一步 ⇒ 同一条 ``'1'`` 两栈两答案（node 归一、python 停用），正是
+    issues/130 的遗留分叉。归一补在**边界**（写侧），不是补在**判据**里——
+    ``surrogate_enabled_on`` 仍只认整数 1（下面的负向档 + 脏值矩阵都在钉这一条）。
+
+    与 node ``memory-ext.saveSurrogate`` 的两处同形：
+    ① 只认规范整数串 ``-?(0|[1-9]\\d*)``（``'1.0'``/``' 1'``/``'01'``/``'+1'``/``'abc'`` 原样留着）；
+    ② **只有 save 归一**，``update_surrogate`` 整行覆盖不归一（有意不对称，issues/130 §2 的原值出口）。
+    """
+    ext = MemoryExtRepository()
+    now = datetime.now()
+
+    async def put(enabled, pn):
+        s = ProcessSurrogate(operator="boss", surrogate="agent", processName=pn,
+                             startTime=now - timedelta(days=1), endTime=now + timedelta(days=1),
+                             enabled=enabled)
+        await ext.save_surrogate(s)
+        return await ext.find_surrogate_by_id(s.id)
+
+    # ① 规范整数串 ⇒ 写侧落成 int；生效与否仍由**值**决定（还原只补类型，不放值）
+    row = await put("1", "wb-one")
+    assert type(row.enabled) is int and row.enabled == 1, f"写侧应把 '1' 落成整数 1: {row.enabled!r}"
+    assert (await ext.get_surrogate("boss", "wb-one")).surrogate == "agent", "'1' 归一后按整数 1 生效"
+    row = await put("0", "wb-zero")
+    assert type(row.enabled) is int and row.enabled == 0, f"写侧应把 '0' 落成整数 0: {row.enabled!r}"
+    assert await ext.get_surrogate("boss", "wb-zero") is None, "'0' 归一是补类型，不是补成启用"
+    row = await put("2", "wb-two")
+    assert type(row.enabled) is int and row.enabled == 2, f"'2' 同样还原成整数 2: {row.enabled!r}"
+    assert await ext.get_surrogate("boss", "wb-two") is None, "整数 2 非 1 ⇒ 停用（还原≠判宽）"
+
+    # ② 非规范整数串 / 非字符串 ⇒ **原样留着**交判据停用（接受集合没有放宽）
+    for keep in ("1.0", " 1", "1 ", "01", "+1", "1abc", "abc", "", "true"):
+        row = await put(keep, f"wb-raw-{abs(hash(keep))}")
+        assert row.enabled == keep and type(row.enabled) is str, \
+            f"非规范整数串 {keep!r} 不得被写侧归一，实测 {row.enabled!r}({type(row.enabled).__name__})"
+        assert await ext.get_surrogate("boss", f"wb-raw-{abs(hash(keep))}") is None, \
+            f"非规范整数串 {keep!r} 停用"
+    for keep in (True, False, 1.0, 2.5, None, [1]):
+        pn = f"wb-obj-{abs(hash(str(keep)))}"
+        row = await put(keep, pn)
+        assert row.enabled == keep or (keep is None and row.enabled is None), \
+            f"非字符串入参 {keep!r} 原样透传，实测 {row.enabled!r}"
+        assert await ext.get_surrogate("boss", pn) is None, f"{keep!r} 不得算启用"
+
+    # ③ 正向对照：整数 1 直存照常生效（写侧归一不是唯一能让委托生效的路）
+    row = await put(1, "wb-int-one")
+    assert type(row.enabled) is int and row.enabled == 1
+    assert (await ext.get_surrogate("boss", "wb-int-one")).surrogate == "agent"
+
+    # ④ update_surrogate **不归一**（与 save 有意不对称＝原值显形出口，脏值矩阵走这一路）
+    ext2 = MemoryExtRepository()
+    s = ProcessSurrogate(operator="boss", surrogate="agent", processName="wb-upd",
+                         startTime=now - timedelta(days=1), endTime=now + timedelta(days=1), enabled=1)
+    await ext2.save_surrogate(s)
+    s.enabled = "1"
+    await ext2.update_surrogate(s)
+    back = await ext2.find_surrogate_by_id(s.id)
+    assert back.enabled == "1" and type(back.enabled) is str, \
+        f"update 是整行覆盖的原值出口，不得归一，实测 {back.enabled!r}"
+    assert (await ext2.get_surrogate("boss", "wb-upd")) is None, \
+        "update 归一与否都不放宽判据：台账里是文本 '1' 时判据④仍判停用（本档钉的就是不归一这一半）"
+
+    # ⑤ 判据本体没动（放宽判据 = 把这条红掉）
+    assert surrogate_enabled_on("1") is False, "判据④仍不吃串：归一只发生在写侧边界，不在判据里"
 
 
 # ─── issues/130 案 A 的**读侧另一半**：驱动串化在仓储边界还原（对齐 php cf93d8f）────────
@@ -3446,21 +4161,27 @@ async def test_surrogate_sql_driver_stringified_enabled_is_hydrated_at_boundary(
     assert mem_hit is not None and mem_hit.surrogate == hit.surrogate, \
         f"同一份「整数 1」列值，内存仓与串化驱动的 SQL 仓必须同结论：SQL={hit} 内存={mem_hit}"
 
-    # ⑥ 说明性一格（不是判据放宽，是**列类型事实**）：SPI 直传 "1" 进 INT 列，入库即被折成整数 1，
-    #    于是 SQL 路命中、内存路停用（内存仓没有列亲和性，原值就是 '1'）。两仓对同一个**列值**同答案，
-    #    对同一个 **Python 入参**可以不同答案——这正是脏值矩阵留在内存仓、边界还原留在 SQL 仓的理由。
+    # ⑥ 同一个 **Python 入参** "1"：**两仓同结论**（owner 2026-09-29 拍「内存仓统一到 node 侧」）。
+    #    SQL 路靠 INT 列的列亲和性把 '1' 折成整数 1；内存仓没有驱动，那一步由 save_surrogate 的
+    #    **写侧边界**补上（本台账建模的就是那张 INT 列，node memory-ext.saveSurrogate 同形）。
+    #    两仓都在**边界**补类型、判据④一个字不动 ⇒ 台账里是整数 1 就生效；非规范串（'1.0' / ' 1' /
+    #    '01' / 'abc'）与布尔/浮点仍原样留着判停用（脏值矩阵走 update_surrogate 那条不归一的出口）。
     s3 = ProcessSurrogate(id=900003, operator="opCoerce", surrogate="agentCoerce",
                          processName="flowCoerce", enabled="1",
                          createTime="2026-01-01 00:00:00", updateTime="2026-01-01 00:00:00")
-    await ext.save_surrogate(s3)     # 绕过门面，与原值直存
+    await ext.save_surrogate(s3)     # 绕过门面，原值进写侧边界
     coerced = raw.execute("SELECT typeof(enabled), enabled FROM wf_process_surrogate WHERE id=900003").fetchone()
     assert coerced == ("integer", 1), f"列亲和性自证：INT 列把 '1' 折成整数 1，实测 {coerced}"
     assert (await ext.get_surrogate("opCoerce", "flowCoerce")).surrogate == "agentCoerce", \
         "列里真是整数 1 就必须生效（不管它是写侧归一还是列亲和性折出来的）"
     mem_raw = MemoryExtRepository()
     await mem_raw.save_surrogate(s3)
-    assert await mem_raw.get_surrogate("opCoerce", "flowCoerce") is None, \
-        "内存仓存的是原值字符串 '1'（没有列亲和性）⇒ 判据④停用，脏值矩阵那格同样成立"
+    mem_row = await mem_raw.find_surrogate_by_id(s3.id)
+    assert type(mem_row.enabled) is int and mem_row.enabled == 1, \
+        f"内存仓写侧边界须把规范整数串 '1' 落成整数 1（补的就是 SQL 那侧列亲和性做的一步），" \
+        f"实测 {mem_row.enabled!r}"
+    assert (await mem_raw.get_surrogate("opCoerce", "flowCoerce")).surrogate == "agentCoerce", \
+        "同一份 '1' 两仓必须同结论——本轮收掉的正是这个跨栈分叉（python 不归一 / node 归一）"
 
     # ⑦ 对照组：同一套 SQL、同一份列值，只是**不插**假驱动层（＝本栈 aiomysql/asyncpg 的默认形态）
     #    也必须命中 ⇒ 证明 ① 那格的唯一变量就是"驱动给串"，而不是假驱动层自带了生效能力。

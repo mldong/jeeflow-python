@@ -15,7 +15,8 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_NEXT_NODE_OPERATOR,
+from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_ACTORS_START,
+                     KEY_NEXT_NODE_OPERATOR,
                      KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState
@@ -30,6 +31,15 @@ SUBMIT_JUMP = 4
 SUBMIT_ROLLBACK_TO_OPERATOR = 6
 SUBMIT_TRANSFER = 7  # issues/115：转办留痕（不走 execute，由 processTask/transfer 写）
 SUBMIT_COUNTERSIGN_DISAGREE = 20
+
+# 抄送人入参键（对齐 Java FlowConst.CC_ACTORS_START / CC_ACTORS）：
+# 发起腿 f_ccActors、办理腿 tf_ccActors。**两条腿都在引擎里落 cc 行并 fire CC_CREATE**
+# （spec 11-events §11.7／issues/127：基准＝Java JeeflowEngineImpl.handleCcActors 在 runInTx 内；
+# 办理腿的覆盖面按 §11.7 边界 2 只有 executeProcessTask 一条，见 _processTask_execute 的注释）。
+# 门面只把键随 args 透传给引擎，手动腿 createCCInstance 也调同一个 engine.handle_cc_actors——
+# 门面不再持有第二份实现（本轮从门面搬走的就是这个）。常量以引擎侧为单一来源，此处保留原名导出。
+CC_ACTORS_START = KEY_CC_ACTORS_START
+CC_ACTORS = KEY_CC_ACTORS
 
 
 class JeeflowFacade:
@@ -161,22 +171,9 @@ class JeeflowFacade:
         operator = self._operator_arg(args)
         flow_args = {k: v for k, v in args.items() if k not in ("processDefineId", "operator")}
         inst = await self._engine.start_process_instance_by_id(define_id, operator, flow_args)
-        # issues/56 E28：发起时抄送（f_ccActors）创建 cc 实例（对齐 Java enableCcActors 语义）
-        cc = flow_args.get("f_ccActors")
-        if cc is not None:
-            if isinstance(cc, str):
-                cc_list = [x.strip() for x in cc.split(",") if x.strip()]
-            elif isinstance(cc, (list, tuple)):
-                cc_list = [str(x) for x in cc]
-            else:
-                cc_list = []
-            if cc_list:
-                await self._repo.create_cc_instance(inst.id, operator, *cc_list)
-                # issues/102：CC 实例落库后逐抄送人 fire CC_CREATE（ccActorId 直传事件体，
-                # 在 start 事务内；监听器据此落抄送知会 NOTICE）
-                for actor in cc_list:
-                    await self._engine.fire_event(
-                        ProcessEvent(type=EventType.CC_CREATE, instanceId=inst.id, ccActorId=actor))
+        # issues/56 E28 → issues/127：发起时抄送（f_ccActors）**不在这里**——键随 flow_args 进引擎，
+        # 由 engine.handle_cc_actors 在实例行 insert 的同一次调用栈里落 cc 行并逐人 fire CC_CREATE
+        # （spec §11.7；本轮把腿从门面搬进引擎，直连引擎 API 的调用方同样生效）。
         # startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
         doing = await self._repo.find_doing_tasks(inst.id)
         for task in doing:
@@ -296,6 +293,10 @@ class JeeflowFacade:
         for t in withdrawn:
             await self._repo.update_task(t)
         await self._repo.update_instance(inst)
+        # TASK_WITHDRAW（码 8）：实例 state 写 30 落库 + 被撤回任务行更新完成后 fire 一次
+        # （spec §11.3：每轮撤回只 fire 一次，不逐任务）
+        await self._engine.fire_event(ProcessEvent(EventType.TASK_WITHDRAW, instance_id,
+                                                   operator=operator, state=int(inst.state)))
         return None
 
     async def _can_withdraw(self, inst, operator: str, doing: list) -> bool:
@@ -348,19 +349,28 @@ class JeeflowFacade:
         flow_args["submitType"] = submit_type
         # boot3 execute 分发（spec §11.2）
         if submit_type == SUBMIT_REJECT:
-            await self._engine.execute_and_jump_to_end(task_id, operator, flow_args)
+            inst = await self._engine.execute_and_jump_to_end(task_id, operator, flow_args)
         elif submit_type == SUBMIT_ROLLBACK:
-            await self._engine.execute_and_jump_task(task_id, operator, flow_args)
+            inst = await self._engine.execute_and_jump_task(task_id, operator, flow_args)
         elif submit_type == SUBMIT_JUMP:
-            await self._engine.execute_and_jump_task(task_id, operator, flow_args,
-                                                     str(args.get("taskName", "")))
+            inst = await self._engine.execute_and_jump_task(task_id, operator, flow_args,
+                                                             str(args.get("taskName", "")))
         elif submit_type == SUBMIT_ROLLBACK_TO_OPERATOR:
-            await self._engine.execute_and_jump_to_first_task_node(task_id, operator, flow_args)
+            inst = await self._engine.execute_and_jump_to_first_task_node(task_id, operator, flow_args)
         elif submit_type == SUBMIT_COUNTERSIGN_DISAGREE:
             flow_args["countersignDisagreeFlag"] = 1
-            await self._engine.execute_process_task(task_id, operator, flow_args)
+            inst = await self._engine.execute_process_task(task_id, operator, flow_args)
         else:  # 0 APPLY / 1 AGREE / 5 重新提交
-            await self._engine.execute_process_task(task_id, operator, flow_args)
+            inst = await self._engine.execute_process_task(task_id, operator, flow_args)
+        # issues/127 办理时抄送（tf_ccActors）**不在这里**——键随 flow_args 进引擎，由
+        # engine.handle_cc_actors 在任务更新（update_task）的同一次调用栈里落 cc 行、
+        # 落库后逐人 fire CC_CREATE(4)（spec §11.7）。
+        # ⚠️ 覆盖面按 §11.7 边界 2 只有 submitType=0/1/5/20 那两条走 ``execute_process_task`` 的腿：
+        # 引擎把 cc 做成 ``_prepare_execute_task(on_task_updated=…)`` 钩子、只由该腿注入，
+        # 上面 2/3/4/6 四档（reject/rollback/jump/退发起人）**不注入 ⇒ 带 tf_ccActors 也不建 cc、
+        # 不发码 4**（与 java/go 基准同形）。门面不需要区分档位，也不在此处补发（§11.1 严禁补发）。
+        # 此前本栈在 engine.* **返回之后**、无事务包裹地在门面建 cc 行 ⇒ 直连引擎 API 的调用方
+        # 传 tf_ccActors 不建行，且与 go/node/java 三栈形状不一致（本轮搬掉）。
         return None
 
     # ── 流程设计（需扩展仓储） ───────────────────────────────────────────────
@@ -902,11 +912,10 @@ class JeeflowFacade:
         actor_ids = self._to_str_list(args.get("actorIds"))
         if not instance_id or not actor_ids:
             raise ValueError("processInstanceId/actorIds 缺失")
-        await self._repo.create_cc_instance(instance_id, operator, *actor_ids)
-        # issues/102：手动 CC 与发起路径同语义——逐抄送人 fire CC_CREATE
-        for actor in actor_ids:
-            await self._engine.fire_event(
-                ProcessEvent(type=EventType.CC_CREATE, instanceId=instance_id, ccActorId=actor))
+        # 手动 CC 与发起/办理两条腿**同一个漏斗**（spec §11.2 原则 1：码值表达"发生了什么事实"，
+        # 不表达"谁触发的"；§11.7 三条路径同判）。门面不再自己 create_cc_instance、不再自己
+        # fire CC_CREATE —— 落库 + 逐人 fire 都在 engine.handle_cc_actors 那一处。
+        await self._engine.handle_cc_actors(instance_id, operator, actor_ids)
         return None
 
     async def _processInstance_updateCCStatus(self, args: dict) -> dict:
@@ -1148,6 +1157,11 @@ class JeeflowFacade:
         task.updateTime = now
         task.updateUser = operator
         await self._repo.update_task(task)
+        # TASK_TRANSFER（码 7）：任务参与者被替换并落库之后 fire（spec §11.3 触发时机列），
+        # 载荷带 fromActor/toActor/operator —— 监听器免反查任务行即知"谁转给了谁"
+        await self._engine.fire_event(ProcessEvent(EventType.TASK_TRANSFER,
+                                                   task.processInstanceId, task.id, task.taskName,
+                                                   operator, fromActor=from_actor, toActor=to_actor))
         return None
 
     async def _processTask_latest(self, args: dict) -> dict:

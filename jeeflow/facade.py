@@ -20,7 +20,8 @@ from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_AC
                      KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState
-from .spi import ProcessExtRepository, ProcessRepository, QueryCondition, normalize_cc_actors
+from .spi import (ProcessExtRepository, ProcessRepository, QueryCondition,
+                  normalize_actors, normalize_actor_value)
 
 # submitType 枚举（对齐 boot3）
 
@@ -915,27 +916,30 @@ class JeeflowFacade:
     async def _processInstance_createCCInstance(self, args: dict) -> dict:
         instance_id = self._to_int(args.get("processInstanceId"))
         operator = self._operator_arg(args)
-        actor_ids = normalize_cc_actors(self._to_str_list(args.get("actorIds")))
+        actor_ids = self._to_actor_ids(args.get("actorIds"))
         if not instance_id or not actor_ids:
             raise ValueError("processInstanceId/actorIds 缺失")
         # 手动 CC 与发起/办理两条腿**同一个漏斗**（spec §11.2 原则 1：码值表达"发生了什么事实"，
         # 不表达"谁触发的"；§11.7 三条路径同判）。门面不再自己 create_cc_instance、不再自己
         # fire CC_CREATE —— 落库 + 逐人 fire 都在 engine.handle_cc_actors 那一处。
         #
-        # issues/141 G10「空不创建行」（spec 06 §2.10）：判空**之前**先过 normalize_cc_actors
-        # （与引擎腿 parse_cc_actors 共用那一支归一腿）——`actorIds=[""]`／`["  "]` 这类
-        # "非空但全是空元素"的形态，丢完为空 ⇒ 与上面那条**"空 actorIds"同档**（沿用既有
-        # ``processInstanceId/actorIds 缺失`` 文案，不新造错误码/文案），不再"报错没报、行也没建"。
-        # 逗号串与数组两形同判据：_to_str_list 的 str 分支已经丢过空段，list 分支只 str() 不丢，
-        # 归一放在这里两形才都盖住。
+        # issues/141 G10「空不创建行」（spec 06 §2.10）：判空**之前**先过归一单点
+        # （`spi.normalize_actors`，与引擎腿 parse_cc_actors、任务侧 addCandidate/transfer 同一枚）
+        # ——`actorIds=[""]`／`["  "]` 这类"非空但全是空元素"的形态，丢完为空 ⇒ 与上面那条
+        # **"空 actorIds"同档**（沿用既有 ``processInstanceId/actorIds 缺失`` 文案，不新造错误码/文案），
+        # 不再"报错没报、行也没建"。逗号串与数组两形在这一枚里同判据。
         await self._engine.handle_cc_actors(instance_id, operator, actor_ids)
         return None
 
     async def _processInstance_updateCCStatus(self, args: dict) -> dict:
         instance_id = self._to_int(args.get("processInstanceId"))
-        operator = self._operator_arg(args)
         if not instance_id:
             raise ValueError("processInstanceId 缺失或非法")
+        # issues/142 B 批（spec 06 §2.11 写点表第 4 行）：operator **归一后再交给仓储比**——
+        # 不 trim 则 " lisi " 判成另一个人（已读打不上）；空值档由仓储写侧那层兜成 no-op，
+        # 免得把 state=1 批量打到历史 actor_id='' 的脏行上（issues/129 那族的写侧对偶）。
+        # `_operator_arg` 的 demo 缺省（缺失/空串 ⇒ user1）是 issues/129/141 G1 钉过的行为，不动。
+        operator = normalize_actor_value(self._operator_arg(args))
         await self._repo.update_cc_status(instance_id, operator)
         return None
 
@@ -1097,8 +1101,18 @@ class JeeflowFacade:
         return await self._taskAddActor(args)
 
     async def _taskAddActor(self, args: dict) -> dict:
+        """``processTask/addCandidate`` 与 ``processTask/surrogate`` 同体（只追加不清空，issues/115）。
+
+        issues/142 B 批（spec 06 §2.11）：``actorIds`` 走**与 cc 支同一枚**归一单点——逐元素
+        trim、空串/纯空白/``None`` 丢弃、同次调用折叠，逗号串与数组**两形同判据**（旧形状数组腿
+        ``[str(x) for x in v]`` 不 trim、不丢空、``None`` 串化成字符串 ``"None"`` 直接落进归属列）。
+        丢完为空 ⇒ 与"空 actorIds"**同档报错**（既有 ``processTaskId/actorIds 缺失`` 信封，
+        不新造码/文案）；``processTaskId`` 属**主键档**，缺失/空串/0 一律响亮报错，不拿 ``''``/``0`` 落库。
+        仓储写侧（两仓 ``add_task_actor``）还有一层同样判据的兜底——绕过门面直连仓储的调用方
+        同样灌不进空值（要求①「两层都挡」）。
+        """
         task_id = self._to_int(args.get("processTaskId"))
-        actor_ids = self._to_str_list(args.get("actorIds"))
+        actor_ids = self._to_actor_ids(args.get("actorIds"))
         if not task_id or not actor_ids:
             raise ValueError("processTaskId/actorIds 缺失")
         await self._repo.add_task_actor(task_id, actor_ids)
@@ -1116,14 +1130,20 @@ class JeeflowFacade:
         task_id = self._to_int(args.get("processTaskId"))
         if not task_id:
             raise ValueError("processTaskId 缺失或非法")
-        from_actor = str(args.get("fromActor") or "").strip()
-        to_actor = str(args.get("toActor") or "").strip()
-        if not from_actor:
+        # issues/142 B 批（spec 06 §2.11 写点表第 2 行）：from/to/operator **归一后再用**，判据仍然
+        # 只有 `spi.normalize_actor_value` 那一枚（内部即 §2.10 落地的 normalize_actors 单点）。
+        # 旧形状 `str(args.get("fromActor") or "")` 用的是**语言自带假值判据**——int `0` 被折成
+        # "没填"而报 `toActor 必填`，而 "0" 恰是要求④点名的反向哨兵（"看起来像空"的正常 id）。
+        # trim 必须同时覆盖三处：① 权限比较（operator 与 fromActor 是同一个人）
+        # ② 摘人/加人写进 wf_process_task_actor 的值 ③ 留痕（tf_transferTo／文案／tf_transferHistory）。
+        from_actor = normalize_actor_value(args.get("fromActor"))
+        to_actor = normalize_actor_value(args.get("toActor"))
+        if from_actor == "":
             raise ValueError("fromActor 必填")
-        if not to_actor:
+        if to_actor == "":
             raise ValueError("toActor 必填")
-        operator = str(args.get("operator") or "").strip()
-        if not operator:
+        operator = normalize_actor_value(args.get("operator"))
+        if operator == "":
             raise ValueError("operator 必填")
         task = await self._repo.find_task_by_id(task_id)
         if not task:
@@ -1205,12 +1225,19 @@ class JeeflowFacade:
         return s if s.strip() else "user1"
 
     @staticmethod
-    def _to_str_list(v) -> list:
-        if isinstance(v, (list, tuple)):
-            return [str(x) for x in v]
-        if isinstance(v, str):
-            return [s.strip() for s in v.split(",") if s.strip()]
-        return []
+    def _to_actor_ids(v) -> list:
+        """归属值入参 → ``list[str]``（**门面各条腿共用**：addCandidate/surrogate、手动 createCCInstance）。
+
+        issues/142 B 批（spec 06 §2.11）：判据**不在这里**，单点只有 ``spi.normalize_actors``
+        （§2.10 已落地的那一枚，cc 支继续走同一个对象）——本函数是薄转发，**严禁再抄第二份**。
+        旧形状 ``[str(x) for x in v]`` 数组腿不 trim、不丢空、``None`` 串化成字符串 ``"None"``，
+        与逗号串腿（strip＋过滤）是两把尺子；改后两形同判据，数字元素 ``str()`` 后仍 trim，
+        ``"0"`` 这类"看起来像空"的正常 id 照样保住（判空只用 ``strip() == ""``）。
+        """
+        return normalize_actors(v)
+
+    # 旧私有名保留为别名（既有注释/集成壳引用过它）——指向**同一枚**判据，不是第二份。
+    _to_str_list = _to_actor_ids
 
     # ── 工具 ─────────────────────────────────────────────────────────────────
 

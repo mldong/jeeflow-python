@@ -1057,6 +1057,122 @@ async def main():
         check("⑯ process_name=NULL 的兜底行真落库（SQL 侧 NULL 与 '' 同属兜底）",
               int(n_null_flow) == len(null_ids), f"{n_null_flow}/{len(null_ids)}")
 
+        # ── ⑰ issues/142 B 批（spec 06-facade.md §2.11）：任务参与者写侧归属值归一——真库取证
+        #    本栈普查实读（issues/142 §2 B 表 python 行）：门面/引擎的**数组腿** `[str(x) for x in v]`
+        #    不 trim、不丢空、None 串化成字符串 "None"，逗号串腿才 strip＋过滤；两仓 add_task_actor
+        #    **判重不判空** ⇒ ""/"  "/None 全放行。owner 拍「两形同判据＋写侧兜底＋trim＋哨兵」。
+        #    断言纪律同 ⑬：一律直读 wf_process_task_actor / wf_process_cc_instance 的真实行，
+        #    不看"返回码 0"——返回码 0 但把脏值灌进归属列，正是本案要钉死的形状。
+        async def _actors_of(task_id):
+            return [r[0] for r in await raw_rows(
+                adapter, "SELECT actor_id FROM wf_process_task_actor WHERE process_task_id=?"
+                         " ORDER BY id ASC", [task_id])]
+
+        async def _exec(sql, args=()):
+            conn = await adapter.acquire()
+            try:
+                await conn.execute(sql_of(adapter, sql), args)
+            finally:
+                await adapter.release(conn)
+
+        inst142 = await eng.start_process_instance_by_id(
+            DEFINE_ID, "zhangsan", {"BUSINESS_NO": f"BIZ-{DB}-142b"})
+        _a142, t142 = await _to_task1(inst142.id, tag="⑰")
+        check("⑰ 基线：task1 参与者为 leader（真库行）", await _actors_of(t142.id) == ["leader"],
+              str(await _actors_of(t142.id)))
+
+        # ⑰.1 门面 addCandidate：数组腿与逗号串腿**同一判据**（trim／丢空／折叠＋哨兵 "0"）
+        r = await facade_bc.flow("processTask/addCandidate",
+                                 {"processTaskId": t142.id,
+                                  "actorIds": [" 142a ", "", "  ", None, "142a", "0"]})
+        check("⑰ addCandidate 数组腿归一后 code=0", r["code"] == 0, str(r))
+        check("⑰ 真落库＝trim＋丢空＋同次折叠＋哨兵 '0'（无 ''/'  '/'None' 行）",
+              await _actors_of(t142.id) == ["leader", "142a", "0"], str(await _actors_of(t142.id)))
+        r = await facade_bc.flow("processTask/surrogate",
+                                 {"processTaskId": t142.id, "actorIds": " 142b ,, 142c , 142b"})
+        check("⑰ surrogate 逗号串形同判据（两形两把尺子＝本案主病灶）",
+              r["code"] == 0 and await _actors_of(t142.id) == ["leader", "142a", "0", "142b", "142c"],
+              str(await _actors_of(t142.id)))
+
+        # ⑰.2 空入参档：丢完为空 ⇒ 与既有"空 actorIds"同档报错（不新造码/文案）＋零副作用
+        for bad in ([""], ["  "], [None], "", "   ", " , "):
+            r = await facade_bc.flow("processTask/addCandidate",
+                                     {"processTaskId": t142.id, "actorIds": bad})
+            if not check(f"⑰ actorIds={bad!r} 与空 actorIds 同档报错",
+                         r["code"] == 99999999 and "actorIds 缺失" in r["msg"], str(r)):
+                break
+        check("⑰ 空档零副作用：参与者一条没变",
+              await _actors_of(t142.id) == ["leader", "142a", "0", "142b", "142c"],
+              str(await _actors_of(t142.id)))
+        n_blank = await raw_count(
+            adapter, "SELECT COUNT(*) FROM wf_process_task_actor a JOIN wf_process_task t"
+                     " ON a.process_task_id = t.id WHERE t.process_instance_id = ?"
+                     " AND (a.actor_id = '' OR a.actor_id IS NULL OR TRIM(a.actor_id) = '')",
+            [inst142.id])
+        check("⑰ 本实例零空归属值行（''／纯空白／NULL 一律没灌进去）", int(n_blank) == 0, str(n_blank))
+
+        # ⑰.3 主键另判一档：processTaskId 缺失/空串/0 ⇒ 响亮报错，不得拿 ''/0 当 id 落库
+        for bad_id in (0, "", "   ", None, "0"):
+            r = await facade_bc.flow("processTask/addCandidate",
+                                     {"processTaskId": bad_id, "actorIds": ["142x"]})
+            if not check(f"⑰ 主键 {bad_id!r} 缺失/非法必须报错",
+                         r["code"] == 99999999 and "processTaskId" in r["msg"], str(r)):
+                break
+        raised = 0
+        for bad_id in (0, "", "   ", None, "0"):
+            try:
+                await repo.add_task_actor(bad_id, ["142x"])
+            except ValueError:
+                raised += 1
+        check("⑰ 仓储写侧同样挡空主键（绕过门面直连仓储也报 ValueError）", raised == 5, f"{raised}/5")
+
+        # ⑰.4 transfer：fromActor/toActor 归一后再用（权限比较／摘加落库／留痕三处都吃 trim）
+        r = await facade_bc.flow("processTask/transfer",
+                                 {"processTaskId": t142.id, "fromActor": " 142a ",
+                                  "toActor": " 142d ", "operator": "142a"})
+        check("⑰ transfer：' 142a ' 与 '142a' 是同一个人（归一后才判得对）", r["code"] == 0, str(r))
+        check("⑰ transfer 摘/加都写 trim 后的值",
+              await _actors_of(t142.id) == ["leader", "0", "142b", "142c", "142d"],
+              str(await _actors_of(t142.id)))
+        row142 = await _one("SELECT variable FROM wf_process_task WHERE id=?", [t142.id])
+        tv142 = json.loads(row142[0]) if row142[0] else {}
+        hop142 = (tv142.get("tf_transferHistory") or [{}])[-1]
+        check("⑰ 留痕 tf_transferTo／账本条目都是 trim 后的值",
+              tv142.get("tf_transferTo") == "142d" and hop142.get("fromActor") == "142a"
+              and hop142.get("toActor") == "142d", json.dumps(tv142, ensure_ascii=False)[:200])
+
+        # ⑰.5 消费腿 tf_nextNodeOperator 数组形（engine._resolve_actors 那把第二尺子）
+        inst142c = await eng.start_process_instance_by_id(
+            DEFINE_ID, "zhangsan", {"BUSINESS_NO": f"BIZ-{DB}-142c"})
+        apply142c = [t for t in await repo.find_doing_tasks(inst142c.id) if t.taskName == "apply"][0]
+        await repo.add_task_actor(apply142c.id, ["zhangsan"])
+        await eng.execute_process_task(apply142c.id, "zhangsan",
+                                       {"submitType": 1,
+                                        "tf_nextNodeOperator": [" 9001 ", "", None, "9001", "0"]})
+        task142c = [t for t in await repo.find_doing_tasks(inst142c.id) if t.taskName == "task1"]
+        check("⑰ nextNodeOperator 数组腿真落库同判据",
+              len(task142c) == 1 and await _actors_of(task142c[0].id) == ["9001", "0"],
+              str(await _actors_of(task142c[0].id)) if task142c else "无 task1")
+
+        # ⑰.6 updateCCStatus 的 operator：归一后再比；空 operator 是 no-op，不碰历史脏行
+        await repo.create_cc_instance(inst142.id, "zhangsan", " 142cc ")
+        await _exec("INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state)"
+                    " VALUES (?,?,?,0)", [9_430_110, inst142.id, ""])
+        for blank in ("", "   ", "\t", None):
+            await repo.update_cc_status(inst142.id, blank)
+        states = {r[0]: r[1] for r in await raw_rows(
+            adapter, "SELECT actor_id, state FROM wf_process_cc_instance WHERE process_instance_id=?",
+            [inst142.id])}
+        check("⑰ 空 operator ⇒ no-op（历史脏行 actor_id='' 不被批量打勾）",
+              states == {"142cc": 0, "": 0}, str(states))
+        await repo.update_cc_status(inst142.id, " 142cc ")
+        states = {r[0]: r[1] for r in await raw_rows(
+            adapter, "SELECT actor_id, state FROM wf_process_cc_instance WHERE process_instance_id=?",
+            [inst142.id])}
+        check("⑰ ' 142cc ' 归一后打得上已读，脏行仍不动",
+              states == {"142cc": 1, "": 0}, str(states))
+        await _exec("DELETE FROM wf_process_cc_instance WHERE id = ?", [9_430_110])
+
         # 清理本轮委托台账行（按显式 id，不碰别人的数据）
         conn = await adapter.acquire()
         try:

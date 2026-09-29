@@ -5,7 +5,7 @@ from .extensions import EngineExtensions, FlowInterceptor, HandlerRegistry, Even
 from .memory import MemoryRepository
 from .repository import JdbcRepository, TsIDGenerator, MySqlAdapter, PostgresAdapter
 from .spi import (ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator,
-                  normalize_cc_actors)
+                  normalize_actors, normalize_cc_actors, normalize_actor_value, require_present_id)
 from .builtin import (register_builtin_assignments, OperatorAssignmentHandler, FormFieldAssigneeHandler,
                       DeptLeaderAssignmentHandler, DeptMainLeaderAssignmentHandler,
                       ApplicantDeptLeaderAssignmentHandler, ApplicantDeptMainLeaderAssignmentHandler,

@@ -43,12 +43,24 @@ class MyRepository(ProcessRepository):
 > **空不创建行**（issues/141 G10 · [规范 06 · 门面](../../spec/06-facade) §2.10）：抄送人集合里的
 > **空串、纯空白、`None` 一律丢弃**，落库与比较值一律取 **trim 后的串**（`" 123 "` 与 `"123"` 是
 > 同一个人）；丢完为空 ⇒ 不建任何 cc 行、也**不 fire `CC_CREATE`（码 4）**。判据落在**两层**：
-> 漏斗层 `engine.parse_cc_actors`（逗号串与数组两形共用 `spi.normalize_cc_actors` 那一支），
+> 漏斗层 `engine.parse_cc_actors`（逗号串与数组两形共用 `spi.normalize_actors` 那一支——§2.11 起
+> 它是**任务侧与抄送侧共用的唯一判据点**，旧名 `normalize_cc_actors` 保留为同一对象的别名），
 > 以及**写侧兜底**——`create_cc_instance_if_absent` 的 default、两仓的 `create_cc_instance`
 > 各自再挡一次。**集成方自实现 `create_cc_instance` 时同样要丢空值并 trim**（绕过引擎/门面直连
 > 仓储的调用方不得把空归属值灌进 `actor_id`，那是 issues/129 那族"空 operator 读全库"的病根）。
 > 反向哨兵：`"0"` 是正常 id，**不是**空值，不许丢。手动腿 `createCCInstance` 丢完为空时与
 > "空 `actorIds`"同档（报 `processInstanceId/actorIds 缺失`，不新造错误码/文案）。
+
+> **任务参与者写侧同一条尺子**（issues/142 B 批 · [规范 06 · 门面](../../spec/06-facade) §2.11）：
+> 上面那四点逐字搬到 `wf_process_task_actor.actor_id`。四条腿都过同一枚 `spi.normalize_actors`
+> ——门面 `processTask/addCandidate`·`surrogate`（`_to_actor_ids`）、`processTask/transfer` 的
+> `fromActor`/`toActor`（标量档 `spi.normalize_actor_value`，判空写 `== ""`，**严禁 `if not x`**，
+> 否则 `"0"`／int `0` 被吃掉）、引擎 `f_`/`tf_nextNodeOperator`（逗号串与数组两形同判据，全空档
+> 回落节点 `assignee`）、`processInstance/updateCCStatus` 的 `operator`（归一后再比，空值 ⇒ no-op，
+> 不把 `state=1` 打到历史 `actor_id=''` 的脏行）。**集成方自实现 `add_task_actor` 时同样要
+> trim＋丢空＋判重**（见 `ProcessRepository.add_task_actor` 的 docstring 义务清单），并且
+> **主键另判一档**：`task_id` 缺失/空串/`0` 一律 `ValueError`（`spi.require_present_id`），
+> 不得拿 `''`/`0` 当 id 落库——归属值可有可无，主键没有就是调用方写错了。
 
 > 开箱即用：
 > - `MemoryRepository`（`jeeflow/memory.py`）供演示/测试；

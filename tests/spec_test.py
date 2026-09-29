@@ -6849,3 +6849,465 @@ async def test_i142_62_custom_handler_own_exception_still_propagates():
     assert r2["code"] != 0 and "handler-boom" in str(r2.get("msg", "")), \
         f"处理器自身炸不得被吞成成功: {r2}"
 
+
+# ═══ Test 142 B 批：任务参与者写侧归属值归一（契约 06 §2.11）═══════════════════════
+#
+# 立法逐字依据（jeeflow-doc/docs/spec/06-facade.md §2.11，只读；普查底稿 issues/142 §2 B 表
+# python 那一行）——owner 2026-09-30 原话：「八栈一起收：两形同判据＋写侧兜底＋trim＋哨兵」。
+# §2.11 把 §2.10（抄送侧，本栈已由 `spi.normalize_cc_actors` 那一枚单点落地）的四点实现要求
+# **逐字搬到任务侧**，覆盖写点：
+#   `processTask/addCandidate`＋`surrogate`／`processTask/transfer` 的 fromActor·toActor／
+#   `f_nextNodeOperator`·`tf_nextNodeOperator`（逗号串与数组两形）／`updateCCStatus` 的 operator／
+#   两仓 `add_task_actor` 的仓储写侧兜底。
+# 四条硬要求：① 两层都挡（漏斗＋仓储写侧，只修门面则绕过门面直连仓储的调用方照样灌空值）；
+#   ② 落库与比较一律取 **trim 后的值**；③ 空入参档**沿用本栈既有的"缺参数"错误信封**
+#   （`processTaskId/actorIds 缺失`，不新造码/文案）；④ 反向哨兵 `"0"` 不得被丢掉，且
+#   **严禁语言自带的假值判据**（python 的 `if not x` 会吃掉 `'0'`）——判空一律 `str(x).strip() == ""`。
+# 主键类参数**另判一档**：`processTaskId` 缺失/空串必须响亮报错，不得拿 `''`/`0` 当 id 落库。
+# 判据单点：spec 明文「不要再抄第二份」——本栈把 §2.10 那一枚改名成通用的 `normalize_actors`，
+# cc 支继续走**同一个对象**（`normalize_cc_actors` 留作别名），全仓不得出现第二把尺子。
+
+_I142B_TABLE_DDL = (
+    # §2.11 的 SQL 通道用到的两张表（列名逐字对齐 tests/schema/schema-mysql.sql 与 base.py 的 SQL）；
+    # 形状照 _cc141_sql_repo 的先例：真 SQLite ＋真 JdbcRepository，不用内存假仓。
+    "CREATE TABLE wf_process_task_actor (id INTEGER PRIMARY KEY, process_task_id INTEGER,"
+    " actor_id TEXT, create_time TEXT, create_user TEXT)",
+    "CREATE TABLE wf_process_cc_instance (id INTEGER PRIMARY KEY, process_instance_id INTEGER,"
+    " actor_id TEXT, state INTEGER DEFAULT 0, create_time TEXT, create_user TEXT,"
+    " update_time TEXT, update_user TEXT)",
+)
+
+
+def _i142b_sql_repo():
+    """真 SQLite ＋真 `JdbcRepository`——§2.11 的"两仓同一判据"必须在 SQL 通道也钉住
+    （只钉内存仓＝spec §2.10 要求①明写的"只修一层不算修完"，也复现 issues/117 场景 27
+    那把"同栈两仓两个答案"的尺子）。"""
+    from jeeflow.repository.base import JdbcRepository
+    raw = sqlite3.connect(":memory:")
+    for ddl in _I142B_TABLE_DDL:
+        raw.execute(ddl)
+    return raw, JdbcRepository(_SqliteAdapter(raw), _TestIDGen())
+
+
+def _i142b_actor_rows(raw, task_id) -> list[str]:
+    """actor 表取证：某任务落库的**真实** actor_id 行（按插入序）——不看返回码，只看库里的行。"""
+    return [r[0] for r in raw.execute(
+        "SELECT actor_id FROM wf_process_task_actor WHERE process_task_id=?"
+        " ORDER BY id ASC", (task_id,)).fetchall()]
+
+
+def _i142b_cc_states(raw, instance_id):
+    """cc 表取证：[(actor_id, state)]，供 updateCCStatus 的归一腿与"空 operator 不打脏行"两档。"""
+    return [(r[0], r[1]) for r in raw.execute(
+        "SELECT actor_id, state FROM wf_process_cc_instance WHERE process_instance_id=?"
+        " ORDER BY id ASC", (instance_id,)).fetchall()]
+
+
+# ── 判据点：单点复用，不许有第二份 ──────────────────────────────────────────────
+
+def test_i142_b1_single_point_is_reused_not_recopied():
+    """§2.11 收尾那句「复用 §2.10 已落地的那一枚单点，不要再抄第二份」钉成断言：
+    cc 支（引擎漏斗 `parse_cc_actors`）与任务支（门面 `_to_actor_ids`）必须**逐输入同答案**，
+    且 `normalize_cc_actors` 就是 `normalize_actors` 同一个对象（改名而非另立）。"""
+    from jeeflow.engine import parse_cc_actors
+    from jeeflow.spi import normalize_actors, normalize_cc_actors
+
+    assert normalize_cc_actors is normalize_actors, \
+        "cc 支必须继续走同一枚（别名同一对象），另立一份判据迟早分叉（spec §2.11 点名 php 实证）"
+
+    matrix = [None, [], (), "", "   ", " , ", "a,,b", "a,", ["a", "", "  ", None],
+              [1, " 1 "], ["0"], "0", [" 8123 ", "8123"], ("a", "a"), {"a": 1}]
+    for raw in matrix:
+        expect = normalize_actors(raw)
+        assert parse_cc_actors(raw) == expect, f"cc 漏斗与单点分叉: {raw!r}"
+        assert JeeflowFacade._to_actor_ids(raw) == expect, f"门面任务腿与单点分叉: {raw!r}"
+        assert JeeflowFacade._to_str_list(raw) == expect, f"旧私有名指向了另一把尺子: {raw!r}"
+
+
+def test_i142_b1_array_leg_criteria_trim_drop_fold_and_zero_sentinel():
+    """本栈普查实测的病灶那一格（issues/142 §2 B 表 python 行）：`_to_str_list` 数组腿是
+    `[str(x) for x in v]` ⇒ **不 trim、不丢空、None 串化成字符串 "None"**，只有逗号串腿才
+    strip＋过滤。改后两形**同一判据**：逐元素 trim、空串/纯空白/None 丢弃、同一次调用折叠、
+    数字元素 str() 后仍 trim；**"0" 这类"看起来像空"的正常 id 不得丢**。"""
+    from jeeflow.spi import normalize_actors, normalize_actor_value
+
+    assert normalize_actors(["a", "", "  ", None, "  b "]) == ["a", "b"]
+    assert normalize_actors([None]) == []
+    assert normalize_actors(["", ""]) == []
+    assert normalize_actors(["\t", "\n "]) == [], "纯空白与空串同档（§2.10 逐字搬到任务侧）"
+    assert "None" not in normalize_actors([None, "x"]), "None 绝不能再被串化成字符串 \"None\""
+    assert normalize_actors([123, " 123 "]) == ["123"], "数字元素 str() 后仍 trim＋折叠"
+    assert normalize_actors([" 0 ", "0", "00", "a"]) == ["0", "00", "a"], \
+        "反向哨兵（要求④）：'0'/'00'/'a' 是三个不同的人，判重不得松散、判空不得吃 '0'"
+    assert normalize_actors(("a", "a", " a ")) == ["a"], "同一次调用内折叠重复（trim 后才判得准）"
+    assert normalize_actors(["zhangsan", None, "lisi"]) == ["zhangsan", "lisi"]
+
+    # 逗号串腿（原本只有这条腿是对的）——两形同判据
+    assert normalize_actors("") == []
+    assert normalize_actors("   ") == []
+    assert normalize_actors(" , ") == []
+    assert normalize_actors("a,,b") == ["a", "b"]
+    assert normalize_actors("a,") == ["a"]
+    assert normalize_actors(" 8123 , 8123 ") == ["8123"], "trim 判等：' 8123 ' 与 '8123' 同一个人"
+    assert normalize_actors("0") == ["0"]
+
+    assert normalize_actors(None) == []
+    assert normalize_actors([]) == []
+    assert normalize_actors(0) == ["0"], "标量 0 也是一个人，不得被假值判据折成没填"
+
+    # 单个归属值（transfer 的 fromActor/toActor、updateCCStatus 的 operator）
+    assert normalize_actor_value(" 8123 ") == "8123"
+    assert normalize_actor_value("  7101") == "7101"
+    assert normalize_actor_value(None) == ""
+    assert normalize_actor_value("   ") == ""
+    assert normalize_actor_value("\t") == ""
+    assert normalize_actor_value("0") == "0", "哨兵：单个值 '0' 不是空"
+    assert normalize_actor_value(0) == "0", "哨兵：int 0 归一成 '0'，不得当成没填"
+
+
+# ── 门面腿：addCandidate / surrogate ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_i142_b1_facade_add_candidate_and_surrogate_two_forms_same_ruler():
+    """要求①②④（addCandidate 与 surrogate 同体两条 action）：数组里的空串/纯空白/None 丢弃、
+    有效项 trim 后落库、同次调用折叠；逗号串形同判据；**"0" 必须保住**。
+
+    改前红在本格：`[" 8123 ", "", None, "8123"]` 走成 `[" 8123 ", "", "None", "8123"]`
+    ——不 trim（与既有行判成两个人，把 issues/141 G2 那把写侧判重打穿）、空串落库、
+    None 变成字符串 "None" 落进归属列（正是 issues/129 那族"空归属值读全库"的进水口）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+    assert await repo.find_task_actors(tid) == ["leader"]
+
+    r = await facade.flow("processTask/addCandidate",
+                          {"processTaskId": tid, "actorIds": [" 8123 ", "", "  ", None, "8123"]})
+    assert r["code"] == 0, r
+    assert await repo.find_task_actors(tid) == ["leader", "8123"], \
+        f"trim＋丢空＋同次折叠：{await repo.find_task_actors(tid)}"
+
+    r = await facade.flow("processTask/surrogate", {"processTaskId": tid, "actorIds": " 9101 ,, 9102 ,"})
+    assert r["code"] == 0, r
+    assert await repo.find_task_actors(tid) == ["leader", "8123", "9101", "9102"], \
+        "逗号串与数组两形同判据（只修一条腿＝跨形分叉）"
+
+    r = await facade.flow("processTask/addCandidate", {"processTaskId": tid, "actorIds": ["0", " 0 "]})
+    assert r["code"] == 0, r
+    assert await repo.find_task_actors(tid) == ["leader", "8123", "9101", "9102", "0"], \
+        f'哨兵 "0" 必须落库且只一行：{await repo.find_task_actors(tid)}'
+
+    # 原人保留（issues/115 回归：加签是"只追加不清空"，本批不得顺手改语义）
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": tid, "operator": "leader", "submitType": 1})
+    assert r["code"] == 0, r
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_facade_add_candidate_empty_after_drop_is_the_missing_params_case():
+    """要求③：`actorIds` 丢完为空 ⇒ 与本栈**既有的"空 actorIds"档同判**
+    （99999999 ＋ msg 含 `actorIds 缺失`，沿用 `_taskAddActor` 现成信封，不新造码/文案），
+    且零副作用——参与者集合一条没变。
+
+    改前红在本格：`[""]` 经旧 `_to_str_list` 得到**非空 list** ⇒ 过了判空闸门、进了仓储写侧
+    落一条 `actor_id=''` 的行 ⇒ "报成功但灌进脏值"。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+
+    for bad in ([""], ["  "], ["", "  "], ["\t"], [None], [None, ""], "", "   ", " , "):
+        r = await facade.flow("processTask/addCandidate", {"processTaskId": tid, "actorIds": bad})
+        assert r["code"] == 99999999, f"{bad!r} 应与空 actorIds 同档报错: {r}"
+        assert "actorIds 缺失" in r["msg"], f"{bad!r} 沿用既有文案: {r}"
+    assert await repo.find_task_actors(tid) == ["leader"], "空档必须零副作用"
+
+    # 既有那两档不破（回归）：真空 list／缺键同样报同一句
+    for bad_args in ({"actorIds": []}, {}):
+        r = await facade.flow("processTask/addCandidate", {"processTaskId": tid, **bad_args})
+        assert r["code"] == 99999999 and "actorIds 缺失" in r["msg"], (bad_args, r)
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_facade_process_task_id_is_the_other_tier():
+    """主键**另判一档**（§2.11 末段）：归属值为空 ⇒ 丢弃；`processTaskId` 缺失/空串 ⇒ 响亮报错，
+    严禁拿 `''`/`0` 当 id 往下落库（静默接受会把脏数据钉进表里）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+
+    for args in ({"actorIds": ["x"]}, {"processTaskId": "", "actorIds": ["x"]},
+                 {"processTaskId": "   ", "actorIds": ["x"]}, {"processTaskId": 0, "actorIds": ["x"]},
+                 {"processTaskId": None, "actorIds": ["x"]}, {"processTaskId": "abc", "actorIds": ["x"]}):
+        r = await facade.flow("processTask/addCandidate", args)
+        assert r["code"] == 99999999, f"主键缺失/非法必须报错: {args} → {r}"
+        assert "processTaskId" in r["msg"], f"沿用既有'缺参数'文案: {args} → {r}"
+        r = await facade.flow("processTask/surrogate", args)
+        assert r["code"] == 99999999 and "processTaskId" in r["msg"], (args, r)
+
+    # 零参与者行也没被顺手建出来（'id=0 落库'那一档）
+    assert await repo.find_task_actors(tid) == ["leader"]
+    assert await repo.find_task_actors(0) == []
+
+
+# ── 门面腿：transfer ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_i142_b1_transfer_normalizes_from_and_to_actor():
+    """§2.11 写点表第 2 行：transfer 的 `fromActor`/`toActor` **归一后再用**（普查：各栈只
+    `isBlank` 判必填、存的是未 trim 的原值）。三处都得吃到 trim：
+    ① 权限比较（` operator != from_actor`）② 摘人/加人的值③ 留痕（tf_transferTo／文案／账本）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    tid = (await repo.find_doing_tasks(iid))[0].id
+
+    r = await facade.flow("processTask/transfer",
+                          {"processTaskId": tid, "fromActor": " leader ", "toActor": " lisi ",
+                           "reason": " 出差一周 ", "operator": " leader "})
+    assert r["code"] == 0, f"归一后 fromActor 与 operator 是同一个人，不该判成越权: {r}"
+    assert await repo.find_task_actors(tid) == ["lisi"], \
+        f"摘/加都取 trim 后的值: {await repo.find_task_actors(tid)}"
+    task = await repo.find_task_by_id(tid)
+    assert task.variables["tf_transferTo"] == "lisi", task.variables
+    assert "leader 转办给 lisi" in task.variables["tf_approvalComment"], task.variables
+    hop = task.variables["tf_transferHistory"][-1]
+    assert hop["fromActor"] == "leader" and hop["toActor"] == "lisi", hop
+
+    # 哨兵：toActor="0"（含 int 0）是正常 id，不得被假值判据折成"必填"报错
+    for zero_like in ("0", 0, " 0 "):
+        eng2, repo2 = setup()
+        facade2 = JeeflowFacade(eng2, repo2, MemoryExtRepository())
+        did2 = await _deploy(facade2, "01-simple.json")
+        iid2 = await _start(facade2, did2, "zhangsan")
+        tid2 = (await repo2.find_doing_tasks(iid2))[0].id
+        r = await facade2.flow("processTask/transfer",
+                               {"processTaskId": tid2, "fromActor": "leader",
+                                "toActor": zero_like, "operator": "leader"})
+        assert r["code"] == 0, f'"0" 不是空值，不该走"toActor 必填"档: {zero_like!r} → {r}'
+        assert await repo2.find_task_actors(tid2) == ["0"], \
+            f"落库值归一（int 0 ⇒ '0'）: {await repo2.find_task_actors(tid2)}"
+
+    # 空值档仍是既有文案（要求③：不新造码/文案）
+    for bad_args, keyword in (({"fromActor": "  ", "toActor": "lisi", "operator": "leader"}, "fromActor 必填"),
+                              ({"fromActor": "", "toActor": "lisi", "operator": "leader"}, "fromActor 必填"),
+                              ({"fromActor": "leader", "toActor": "   ", "operator": "leader"}, "toActor 必填"),
+                              ({"fromActor": "leader", "toActor": "\t", "operator": "leader"}, "toActor 必填"),
+                              ({"fromActor": "leader", "toActor": "lisi"}, "operator 必填"),
+                              ({"fromActor": "leader", "toActor": "lisi", "operator": "  "}, "operator 必填")):
+        bad_args = {"processTaskId": tid, **bad_args}
+        r = await facade.flow("processTask/transfer", bad_args)
+        assert r["code"] == 99999999 and keyword in r["msg"], (bad_args, r)
+    assert await repo.find_task_actors(tid) == ["0"] or await repo.find_task_actors(tid) == ["lisi"], \
+        "负向档不得改动参与者"
+
+
+# ── 消费腿：f_ / tf_nextNodeOperator 两形 ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_i142_b1_next_node_operator_array_leg_same_ruler_as_comma_leg():
+    """§2.11 写点表第 3 行（`engine._resolve_actors` 的 next_op 腿，普查实读同款第二把尺子）：
+    逗号串腿 trim＋丢空，**数组腿 `[str(a) for a in next_op]` 不 trim、不丢空、None 变 "None"**。
+    改后两形同判据（数组元素不得被静默丢弃或串化成类型名/`"None"`）。"""
+    for value, expect in (
+            (["BOSS1", "", "  ", None, " BOSS2 "], ["BOSS1", "BOSS2"]),
+            (["BOSS1", "BOSS1", " BOSS1 "], ["BOSS1"]),
+            ("BOSS1,, BOSS2,", ["BOSS1", "BOSS2"]),
+            (["0"], ["0"]),
+            ("0", ["0"]),
+            ([1, " 1 ", 2], ["1", "2"]),
+    ):
+        eng, repo = setup()
+        facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+        define_id = await _deploy(facade, "01-simple.json")
+        inst = await eng.start_process_instance_by_id(define_id, "zhangsan")
+        apply_task = (await repo.find_doing_tasks(inst.id))[0]
+        await repo.add_task_actor(apply_task.id, ["zhangsan"])
+        await eng.execute_process_task(apply_task.id, "zhangsan",
+                                       {"submitType": 0, "tf_nextNodeOperator": value})
+        doing = await repo.find_doing_tasks(inst.id)
+        assert len(doing) == 1, f"办理后应有 task1 待办: {doing}"
+        assert await repo.find_task_actors(doing[0].id) == expect, \
+            f"nextNodeOperator {value!r} 两形同判据: {await repo.find_task_actors(doing[0].id)}"
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_start_leg_f_next_node_operator_is_the_same_ruler():
+    """发起腿 `f_nextNodeOperator`（门面转成 tf_ 后进同一支消费腿）：数组里的空元素/None
+    不得落进归属列，"0" 必须保住。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "zhangsan",
+                           "f_nextNodeOperator": [" 9001 ", "", None, "9001", "0"]})
+    assert r["code"] == 0, r
+    iid = int(r["data"]["processInstanceId"])
+    doing = await repo.find_doing_tasks(iid)
+    assert doing, "发起后应有 task1 待办"
+    assert await repo.find_task_actors(doing[0].id) == ["9001", "0"], \
+        f"{await repo.find_task_actors(doing[0].id)}"
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_next_node_operator_all_blank_falls_back_to_node_assignee():
+    """全空档：`tf_nextNodeOperator` 丢完为空 ⇒ 与"没带这个参数"同形 ⇒ 回落到节点 assignee
+    （01-simple 的 task1 是 `leader`）。旧形状把 `[""]` 当成有效指派 ⇒ 落一条 `actor_id=''`。"""
+    for value in ([""], ["  ", None], "", "   ", ["\t"]):
+        eng, repo = setup()
+        facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+        define_id = await _deploy(facade, "01-simple.json")
+        inst = await eng.start_process_instance_by_id(define_id, "zhangsan")
+        apply_task = (await repo.find_doing_tasks(inst.id))[0]
+        await repo.add_task_actor(apply_task.id, ["zhangsan"])
+        await eng.execute_process_task(apply_task.id, "zhangsan",
+                                       {"submitType": 0, "tf_nextNodeOperator": value})
+        doing = await repo.find_doing_tasks(inst.id)
+        assert len(doing) == 1, f"空指派不得打断建单: {value!r}"
+        assert await repo.find_task_actors(doing[0].id) == ["leader"], \
+            f"空指派应回落 assignee（{value!r}）: {await repo.find_task_actors(doing[0].id)}"
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_rollback_leg_uses_the_same_ruler():
+    """`_sync_resolve_actors`（ROLLBACK 腿的 next_op 支）是普查点名的**同款第二把尺子**
+    （`engine.py` 两处数组臂逐字一样），必须走同一枚单点。"""
+    from jeeflow.engine import KEY_NEXT_NODE_OPERATOR
+    eng, repo = setup()
+    node = _i137b_node(load_flow(repo, "01-simple.json").content, "task1")
+    for value, expect in (
+            (["BOSS1", "", None, " BOSS1 "], ["BOSS1"]),
+            ("BOSS2, ,BOSS3", ["BOSS2", "BOSS3"]),
+            (["0"], ["0"]),
+            # 全空档 ⇒ 与"没带这个参数"同形 ⇒ 回落节点 assignee（01-simple 的 task1 是 leader）。
+            # 旧形状这一格返回 ['None', ''] ⇒ 两条 actor_id='None'/'' 的脏行直接落进归属列。
+            ([None, ""], ["leader"]),
+            ([" 9001 "], ["9001"]),
+    ):
+        inst = ProcessInstance(id=1, defineId=1, operator="zhangsan",
+                               variables={KEY_NEXT_NODE_OPERATOR: value})
+        assert eng._sync_resolve_actors(node, inst, "zhangsan") == expect, \
+            f"退回腿与办理腿分叉: {value!r}"
+
+
+# ── 仓储写侧兜底：两仓同一判据 ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_i142_b1_memory_repo_write_side_blocks_blanks_and_trims():
+    """要求①（内存仓）：绕过门面/引擎**裸调** `add_task_actor` ⇒ 空串/纯空白/None 一律不落，
+    落库值取 trim 后的串，同次调用与跨调用都判重。"""
+    repo = MemoryRepository()
+    await repo.add_task_actor(501, ["", "  ", "\t", None])
+    assert await repo.find_task_actors(501) == [], "空值一律不落"
+    await repo.add_task_actor(501, [" 8123 ", "", "8123", None])
+    assert await repo.find_task_actors(501) == ["8123"], f"trim＋折叠: {await repo.find_task_actors(501)}"
+    await repo.add_task_actor(501, ["8123"])
+    assert await repo.find_task_actors(501) == ["8123"], "跨调用判重不吃空格"
+    await repo.add_task_actor(501, ["0", "00", "a"])
+    assert await repo.find_task_actors(501) == ["8123", "0", "00", "a"], "哨兵三人都保住"
+    await repo.add_task_actor(502, " 9101 ,, 9102 ,")
+    assert await repo.find_task_actors(502) == ["9101", "9102"], "裸调逗号串形同判据"
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_sql_repo_write_side_blocks_blanks_and_trims():
+    """要求①②（SQL 仓一路真 SQLite）：同一批入参在 SQL 通道给出**与内存仓相同**的答案，
+    断言直读 `wf_process_task_actor` 的真实行。"""
+    raw, sql = _i142b_sql_repo()
+    await sql.add_task_actor(701, ["", "  ", "\t", None])
+    assert _i142b_actor_rows(raw, 701) == [], "空值一律不落行"
+    await sql.add_task_actor(701, [" 8123 ", "", None])
+    assert _i142b_actor_rows(raw, 701) == ["8123"], "落库值取 trim 后的串"
+    await sql.add_task_actor(701, ["8123"])
+    assert _i142b_actor_rows(raw, 701) == ["8123"], "同一人不许因前后空格落两行"
+    await sql.add_task_actor(701, [" 8123 ", "8123", "0", "00", "a"])
+    assert _i142b_actor_rows(raw, 701) == ["8123", "0", "00", "a"], \
+        f"同次调用折叠＋哨兵保住: {_i142b_actor_rows(raw, 701)}"
+    await sql.add_task_actor(702, " 9101 ,, 9102 ,")
+    assert _i142b_actor_rows(raw, 702) == ["9101", "9102"]
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_two_repos_same_answer():
+    """两仓同答案（issues/117 场景 27 那把尺子，spec §2.11 明写"含 createCcInstance 同款写侧兜底"）：
+    同一批"带空值/带空格/像空"的入参逐对灌进内存仓与 SQL 仓，落出的 actor 集必须逐字相同——
+    只修一边在这一格红。"""
+    matrix = [[""], ["  "], ["a", ""], [" b "], ["b"], ["0"], [" 0 "], [None],
+              ["c", "c", " c "], [123, " 123 "], ["0", "00"]]
+    mem = MemoryRepository()
+    raw, sql = _i142b_sql_repo()
+    for i, actors in enumerate(matrix, start=1):
+        await mem.add_task_actor(i, actors)
+        await sql.add_task_actor(i, actors)
+    mem_ans = {i: await mem.find_task_actors(i) for i in range(1, len(matrix) + 1)}
+    sql_ans = {i: _i142b_actor_rows(raw, i) for i in range(1, len(matrix) + 1)}
+    assert mem_ans == sql_ans, f"两仓判据分叉:\n 内存仓 {mem_ans}\n SQL 仓 {sql_ans}"
+    assert mem_ans[1] == [] and mem_ans[2] == [] and mem_ans[8] == [], "空档两仓都是零行"
+    assert mem_ans[3] == ["a"] and mem_ans[4] == ["b"] and mem_ans[5] == ["b"], "trim 判等两仓同尺"
+    assert mem_ans[6] == ["0"] and mem_ans[7] == ["0"], "哨兵 0 两仓都保住"
+    assert mem_ans[10] == ["123"], "数字元素 str() 后仍 trim 并折叠"
+    assert mem_ans[11] == ["0", "00"], "'0' 与 '00' 是两个人（判重不得松散）"
+
+
+@pytest.mark.asyncio
+async def test_i142_b1_repo_write_side_rejects_blank_task_id():
+    """主键另判一档也在**仓储写侧**落一层（绕过门面直连仓储的调用方同样不得把 `''`/`0` 当 id
+    钉进表里）：两仓一律响亮报错。"""
+    mem = MemoryRepository()
+    raw, sql = _i142b_sql_repo()
+    for bad_id in (None, "", "   ", 0, "0"):
+        for label, repo in (("内存仓", mem), ("SQL 仓", sql)):
+            with pytest.raises(ValueError) as ei:
+                await repo.add_task_actor(bad_id, ["zhangsan"])
+            assert "processTaskId" in str(ei.value), f"{label} 沿用主键缺失文案: {ei.value}"
+    assert _i142b_actor_rows(raw, 0) == [] and await mem.find_task_actors(0) == []
+
+
+# ── updateCCStatus 的 operator（同一枚尺子换到已读写侧） ────────────────────────
+
+@pytest.mark.asyncio
+async def test_i142_b1_update_cc_status_operator_normalized_and_blank_is_noop():
+    """§2.11 写点表第 4 行：`updateCCStatus` 的 `operator` **入参归一后再比**——否则
+    `" lisi "` 判成另一个人（已读打不上），而空 operator 会把 `state=1` 打到历史
+    `actor_id=''` 的脏行上（issues/129 那族"空归属值"的读侧对偶）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    await repo.create_cc_instance(iid, "zhangsan", "lisi")
+    assert repo.cc_rows_for_test(iid)[0].state == 0
+
+    r = await facade.flow("processInstance/updateCCStatus",
+                          {"processInstanceId": iid, "operator": " lisi "})
+    assert r["code"] == 0, r
+    assert repo.cc_rows_for_test(iid)[0].state == 1, "归一后再比：' lisi ' 就是 lisi"
+
+    # 写侧兜底（内存仓）：裸调仓储的空 operator 是 no-op，不把已读打到任何行上；有效值 trim 后再比
+    mem2 = MemoryRepository()
+    await mem2.create_cc_instance(61, "zhangsan", " 8123 ")
+    assert [str(r) for r in mem2.cc_rows_for_test(61)] == ["8123"], "cc 写侧本就 trim（G10 已落）"
+    for blank in ("", "   ", "\t", None):
+        await mem2.update_cc_status(61, blank)
+    assert mem2.cc_rows_for_test(61)[0].state == 0, "空 operator 不得打勾任何行"
+    await mem2.update_cc_status(61, "8123 ")
+    assert mem2.cc_rows_for_test(61)[0].state == 1, "内存仓写侧同样 trim 后再比"
+
+    # 写侧兜底（SQL 仓）：历史脏行（actor_id=''）不得被空 operator 批量打勾
+    raw, sql = _i142b_sql_repo()
+    iid2 = 9_430_001
+    await sql.create_cc_instance(iid2, "zhangsan", "lisi")
+    raw.execute("INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state)"
+                " VALUES (?,?,?,0)", (9_430_999, iid2, ""))
+    assert ("", 0) in _i142b_cc_states(raw, iid2), "夹具：一行历史脏数据"
+    for blank in ("", "   ", "\t", None):
+        await sql.update_cc_status(iid2, blank)
+    assert _i142b_cc_states(raw, iid2) == [("lisi", 0), ("", 0)], \
+        f"空 operator 必须 no-op（脏行不被批量打勾）: {_i142b_cc_states(raw, iid2)}"
+    await sql.update_cc_status(iid2, " lisi ")
+    assert _i142b_cc_states(raw, iid2) == [("lisi", 1), ("", 0)], "SQL 仓写侧同样 trim 后再比"
+

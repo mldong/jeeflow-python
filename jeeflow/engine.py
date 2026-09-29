@@ -12,7 +12,7 @@ from .model import (
     parse_flow_model,
 )
 from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
-from .spi import normalize_cc_actors
+from .spi import normalize_actors
 from .extensions import EngineExtensions, EventType, ProcessEvent
 
 KEY_SUBMIT_TYPE   = "submitType"
@@ -69,9 +69,10 @@ def parse_cc_actors(value: Any) -> list[str]:
     逗号串、``list``/``tuple``、单个标量都吃 → ``list[str]``；逐项 ``str``＋trim、丢空项、
     **按出现顺序去重**；``None``/空串/空集合 → ``[]``（零副作用）。
 
-    **issues/141 G10「空不创建行」**（spec 06 §2.10）：逐元素的 trim/丢空/折叠重复收在
-    ``spi.normalize_cc_actors`` 单点（java 的 ``StringUtils.normalizeCcActors`` 同构），本函数只做
-    **形态适配**（逗号串拆成元素）——逗号串与数组两形在这条上同判据，缺一条腿就是分叉。
+    **issues/141 G10「空不创建行」**（spec 06 §2.10）：判据单点在
+    ``spi.normalize_actors``（旧名 ``normalize_cc_actors``，同一枚对象；java 的
+    ``StringUtils.normalizeCcActors`` 同构），本函数保留为**薄转发**（既有 API 名不动）——
+    形态适配（逗号串拆成元素）也已收进那一枚，两形共用同一条尺子，这里不再留第二支。
     ``""`` 拆出来的是**一个空元素**（python 与 java 同病），归一后为 ``[]`` ⇒ 调用方
     （``handle_cc_actors``）既不建 cc 行也不 fire 码 4；``"0"`` 这类正常 id **不是**空值，不得丢。
     漏斗只是**第一层**，写侧（两仓 ``create_cc_instance`` ＋ SPI default ``create_cc_instance_if_absent``）
@@ -81,15 +82,7 @@ def parse_cc_actors(value: Any) -> list[str]:
     （spec §11.3 码 4「逐抄送人 fire 一次」）。同一人传两次在内存仓会被 ``dict.fromkeys`` 折成一行，
     事件却发两条 ⇒「一行两事件」破掉粒度；SQL 仓那侧更是直接双写 cc 行。
     """
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        raw: list[Any] = list(value)
-    elif isinstance(value, str):
-        raw = value.split(",")
-    else:
-        raw = [value]
-    return normalize_cc_actors(raw)
+    return normalize_actors(value)
 
 
 class Engine:
@@ -558,13 +551,11 @@ class EngineImpl(Engine):
     def _sync_resolve_actors(self, node: FlowNode, inst: ProcessInstance, operator: str) -> list[str]:
         """_resolve_actors 同步子集（ROLLBACK 场景：无 ext 注册表/处理器回调，
         仅 tf_nextNodeOperator / assignee token 解析，对齐 Java rejectTask 语义）"""
-        next_op = inst.variables.get(KEY_NEXT_NODE_OPERATOR)
+        # 退回腿与办理腿必须是**同一枚**归一单点（issues/142 §2 B 表：本栈两处数组臂逐字一样，
+        # 是同一把第二尺子的两个副本；只修一处就是同栈内分叉）
+        next_op = normalize_actors(inst.variables.get(KEY_NEXT_NODE_OPERATOR))
         if next_op:
-            if isinstance(next_op, str):
-                return [a.strip() for a in next_op.split(",") if a.strip()]
-            if isinstance(next_op, (list, tuple)):
-                return [str(a) for a in next_op]
-            return [str(next_op)]
+            return next_op
         assignee = node.properties.get("assignee", "")
         if assignee:
             actors = []
@@ -890,13 +881,16 @@ class EngineImpl(Engine):
 
     async def _resolve_actors(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict) -> list[str]:
         # 1. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
-        next_op = vars_.get(KEY_NEXT_NODE_OPERATOR)
+        #
+        # 两形同判据（issues/142 B 批 · spec 06 §2.11 写点表第 3 行）：旧形状这里挂着**第二把尺子**
+        # ——逗号串臂 trim＋丢空，而数组臂 `[str(a) for a in next_op]` 不 trim、不丢空、
+        # `None` 串化成字符串 "None"（spec 点名的反面正是 java 的 String.valueOf(null)→"null"）。
+        # 判据单点只有 `spi.normalize_actors` 那一枚（与 cc 支同一枚，不另抄）。
+        # 全空档（[""]／"  "／None）归一成 [] ⇒ 与"没带这个参数"同形 ⇒ 回落下面的 assignee 解析，
+        # 绝不拿空数组当有效指派往 actor_id 里灌空值。
+        next_op = normalize_actors(vars_.get(KEY_NEXT_NODE_OPERATOR))
         if next_op:
-            if isinstance(next_op, str):
-                return [a.strip() for a in next_op.split(",") if a.strip()]
-            if isinstance(next_op, (list, tuple)):
-                return [str(a) for a in next_op]
-            return [str(next_op)]
+            return next_op
         assignee = node.properties.get("assignee", "")
         if assignee:
             actors = []

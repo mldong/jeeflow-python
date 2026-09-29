@@ -22,7 +22,8 @@ from typing import Any, Optional, Protocol, Sequence
 from ..spi import QueryCondition
 
 from ..model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate, InstanceStatsRow, TaskStatsRow)
-from ..spi import IDGenerator, ProcessRepository, ProcessExtRepository, normalize_cc_actors
+from ..spi import (IDGenerator, ProcessRepository, ProcessExtRepository,
+                   normalize_actors, normalize_cc_actors, require_present_id)
 
 # 当前协程上下文绑定的事务连接
 _tx_conn_var: contextvars.ContextVar = contextvars.ContextVar("jeeflow_tx_conn", default=None)
@@ -480,6 +481,18 @@ class JdbcRepository(ProcessRepository):
             return [r[0] for r in rows]
 
     async def add_task_actor(self, task_id: int, actors: list[str]) -> None:
+        """SQL 仓写侧兜底（issues/142 B 批 · spec 06 §2.11 要求①「两层都挡」）：
+        判据与内存仓 ``MemoryRepository.add_task_actor`` **逐字同一条**（两仓分叉＝issues/117 场景 27），
+        且复用 §2.10 落地的同一枚单点 ``spi.normalize_actors``，不另抄一份。
+
+        旧形状只判重不判空、不 trim ⇒ ``""``/``"  "``/``None`` 全放行（普查实读：
+        "仓储写侧普遍判重不判空"）；绕过门面直连仓储的调用方照样能把空归属值灌进
+        ``wf_process_task_actor.actor_id``——那正是 issues/129 那族"空 operator 读全库"的进水口。
+        """
+        # 主键另判一档：task_id 缺失/空串/0 响亮报错，不得拿 ''/0 当 id 落库（§2.11 末段）
+        task_id = require_present_id(task_id)
+        # 归属值：逐元素 trim、空串/纯空白/None 丢弃、同次调用折叠；"0" 是正常 id 不得丢（要求④）
+        actors = normalize_actors(actors)
         if not actors:
             return
         async with self._conn() as conn:
@@ -488,6 +501,8 @@ class JdbcRepository(ProcessRepository):
                 "SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id ASC"),
                 (task_id,))
             existing = {r[0] for r in rows}
+            # 比较取 trim 后的值（要求②）：入参已归一，" 123 " 与 "123" 判成同一个人，
+            # 不会因前后空格把上一轮 G2 那把写侧判重打穿成同一人两行
             to_add = [a for a in actors if a not in existing]
             if to_add:
                 await self._insert_task_actors(conn, task_id, to_add)
@@ -538,12 +553,22 @@ class JdbcRepository(ProcessRepository):
         return [r[0] for r in rows]
 
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None:
+        """抄送置已读（issues/142 B 批 · spec 06 §2.11 写点表第 4 行「入参归一后再比」）。
+
+        ``actor_id`` 先过 ``normalize_actors`` 单点再绑进 WHERE：① 不 trim 则 ``" lisi "`` 判成
+        另一个人，已读永远打不上；② **空/纯空白/None ⇒ 直接 no-op**——这句 UPDATE 的
+        ``actor_id = ?`` 一旦绑上空串，会把 ``state=1`` 批量打到历史 ``actor_id=''`` 的脏行上
+        （issues/129 那族"空归属值读全库"的写侧对偶）。判空只用 ``== ""``，不用 ``if not x``
+        （``"0"`` 是正常 id，必须照样能置已读）。与内存仓同判据。"""
         import datetime
+        normalized = normalize_actors([actor_id])
+        if not normalized:
+            return
         async with self._conn() as conn:
             await conn.execute(self._sql(
                 "UPDATE wf_process_cc_instance SET state=1, update_time=?"
                 " WHERE process_instance_id=? AND actor_id=?"),
-                (datetime.datetime.now(), instance_id, actor_id))
+                (datetime.datetime.now(), instance_id, normalized[0]))
 
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
                                 actor_id: Optional[str] = None,

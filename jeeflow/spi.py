@@ -14,36 +14,82 @@ class QueryCondition:
 from .model import (ProcessDefine, ProcessInstance, ProcessTask, ProcessDesign, ProcessDesignHis, ProcessSurrogate, UserInfo, CcInstanceRow, DefineRow, InstanceRow, TaskRow, InstanceStatsRow, TaskStatsRow)
 
 
-def normalize_cc_actors(raw) -> list[str]:
-    """抄送人集合归一（issues/141 G10「空不创建行」，spec 06-facade.md §2.10）——
+def normalize_actors(raw) -> list[str]:
+    """**归属值归一的唯一判据点**（issues/141 G10「空不创建行」spec 06-facade.md §2.10 ＋
+    issues/142 B 批 spec 06-facade.md §2.11「归属值写侧归一」）——
     逐元素 ``str``＋trim，**空串与纯空白丢弃**，同一次调用内的重复折叠（顺序保持）。
 
-    形状基准＝jeeflow-java ``StringUtils.normalizeCcActors``（commit ``5fbd5ac``）。
-    本仓把它放在 **spi 层**（与 ``ProcessRepository`` 同模块）而不是 engine 层，理由和 java
-    放在 ``StringUtils`` 一样：这条判据要同时被**漏斗**（``engine.parse_cc_actors``／门面手动腿）
-    和**写侧**（``create_cc_instance_if_absent`` default、两仓 ``create_cc_instance``）吃到，
-    而仓储实现不该反向依赖引擎模块——只修漏斗时，绕过门面/引擎直连仓储的调用方照样能把
-    空归属值灌进 ``actor_id``（issues/129 那族"空 operator 读全库"的病根）。
+    形状基准＝jeeflow-java ``StringUtils.normalizeCcActors``（commit ``5fbd5ac``），
+    §2.11 把它逐字搬到任务侧。本仓把它放在 **spi 层**（与 ``ProcessRepository`` 同模块）而不是
+    engine 层，理由和 java 放在 ``StringUtils`` 一样：这条判据要同时被**漏斗**
+    （``engine.parse_cc_actors``／门面 ``addCandidate``/``surrogate``/``transfer``／
+    引擎 ``_resolve_actors`` 的 nextNodeOperator 两支）和**写侧**（``create_cc_instance_if_absent``
+    default、两仓 ``create_cc_instance``、两仓 ``add_task_actor``）吃到，而仓储实现不该反向依赖
+    引擎模块——只修漏斗时，绕过门面/引擎直连仓储的调用方照样能把空归属值灌进 ``actor_id``
+    （issues/129 那族"空 operator 读全库"的病根）。
+
+    **改名而非另立**（§2.11 收尾那句「复用 §2.10 已落地的那一枚单点……不要再抄第二份」）：
+    本函数原名 ``normalize_cc_actors``，只挂在抄送一支时任务侧的三条腿各自另长了一把尺子
+    （python 实测：数组腿 ``[str(x) for x in v]`` 不 trim、不丢空、``None`` 串化成 ``"None"``）。
+    ``normalize_cc_actors`` 保留为**同一个对象的别名**，cc 支继续走这一枚。
 
     判据要点：
-    - **逗号串不在这里拆**——拆串是漏斗的形态适配（``parse_cc_actors`` 的 str 分支），
-      本函数只管"逐元素 trim/丢空/折叠重复"，两形共用同一条尺子；
-    - **落库与比较一律取 trim 后的值**：``" 123 "`` 与 ``"123"`` 是同一个人，不 trim 就会
-      把 G2 的写侧判重（``create_cc_instance_if_absent``）打穿成同一人两行；
-    - **``"0"`` 这类"看起来像空"的正常 id 不得丢掉**——只按 ``strip()`` 后是否为空串判，
-      严禁写成 ``if not actor``（反向哨兵见 tests/spec_test.py 的 G10 段）。
+    - **两形同判据在这一点上完成**：``raw`` 是逗号串时在这里拆成元素（与数组同一处过 trim/丢空/折叠，
+      两形不可能分叉）；``list``/``tuple`` 逐元素；标量按单个值；``None``/空集合 ⇒ ``[]``；
+    - **落库与比较一律取 trim 后的值**：``" 123 "`` 与 ``"123"`` 是同一个人，不 trim 就会与
+      §4 的写侧判重错开，同一人落两行；
+    - **``"0"`` 这类"看起来像空"的正常 id 不得丢掉**——只按 ``str(x).strip() == ""`` 判，
+      **严禁 ``if not x`` 这种语言自带假值判据**（它会吃掉 ``'0'``；反向哨兵见
+      tests/spec_test.py 的 §2.10／§2.11 两段）。
     """
     out: list[str] = []
     if raw is None:
         return out
-    for item in raw:
+    if isinstance(raw, str):
+        items: Any = raw.split(",")        # 逗号串腿：拆串与 trim/丢空/折叠同一枚尺子
+    elif isinstance(raw, (list, tuple)):
+        items = raw                        # 数组腿
+    else:
+        items = [raw]                      # 标量（含数字 id）按单个归属值
+    for item in items:
         if item is None:
             continue
         actor = str(item).strip()
-        if not actor or actor in out:
+        # 判空只用 strip 后是否为空串；``if not actor`` 会把 '0' 当空吃掉（spec §2.11 要求④）
+        if actor == "" or actor in out:
             continue
         out.append(actor)
     return out
+
+
+# §2.11 收尾要求复用同一枚单点：cc 支的旧名保留为**别名**（同一个函数对象，不是第二份判据）。
+normalize_cc_actors = normalize_actors
+
+
+def normalize_actor_value(value) -> str:
+    """**单个**归属值归一（§2.11 写点表里 transfer 的 ``fromActor``/``toActor``、
+    ``updateCCStatus`` 的 ``operator`` 这类标量档）：``str``＋trim，空/纯空白/``None`` ⇒ ``""``。
+
+    判据不在这里另立——内部调 ``normalize_actors``（``"0"``/int ``0`` 都归一成 ``"0"`` 保住，
+    绝不被假值判据折成"没填"）。调用方判空一律写 ``== ""``，不写 ``if not x``。
+    """
+    out = normalize_actors([value])
+    return out[0] if out else ""
+
+
+def require_present_id(value, label: str = "processTaskId"):
+    """主键类参数**另判一档**（spec 06 §2.11 末段）：``processTaskId`` 缺失/空串/``0`` 必须响亮报错。
+
+    与"归属值为空 ⇒ 丢弃"是两件事：归属值可有可无，主键没有就是调用方写错了，静默接受会把脏数据
+    钉进表里（现读 php ``JeeflowFacade.php:546`` 不校验 taskId、``addTaskActor('', …)`` 照跑，属反面）。
+    错误沿用本栈既有的 ``ValueError`` → 门面 ``{code:99999999, msg}`` 信封，不新造错误码/文案。
+    """
+    if value is None:
+        raise ValueError(f"{label} 缺失或非法: {value!r}")
+    text = str(value).strip()
+    if text == "" or text == "0":
+        raise ValueError(f"{label} 缺失或非法: {value!r}")
+    return value
 
 
 class ProcessRepository(ABC):
@@ -83,7 +129,30 @@ class ProcessRepository(ABC):
     @abstractmethod
     async def find_task_actors(self, task_id: int) -> list[str]: ...
     @abstractmethod
-    async def add_task_actor(self, task_id: int, actors: list[str]) -> None: ...
+    async def add_task_actor(self, task_id: int, actors: list[str]) -> None:
+        """追加任务参与者（**只追加不清空**，issues/03 语义）。
+
+        **归属值写侧归一**（issues/142 B 批 · spec 06-facade.md §2.11「归属值写侧归一」）——
+        义务与 ``create_cc_instance`` 上那条**逐字同源**，只是换到 ``wf_process_task_actor.actor_id``
+        这张表上（``actor_id`` 是 §2.5 口径表里的归属列，空串/``"  "``/``"None"`` 落进去就是
+        issues/129 那族"空归属值读全库"的进水口）：
+
+        ① 入参先过 ``normalize_actors``（**与 cc 支同一枚单点**，不许另抄一份）——逐元素
+        ``str``＋trim，空串/纯空白/``None`` **一律丢弃**，同一次调用内的重复折叠；
+        逗号串与数组**两形同判据**（``"a, ,b"`` 与 ``["a", "", "b"]`` 必须得到同一个答案）；
+        ② **落库与判重一律取 trim 后的值**——``" 123 "`` 与 ``"123"`` 是同一个人，不 trim 就会
+        把判重打穿成同一人两行；
+        ③ 丢完为空 ⇒ **不写任何行**（与"空 actors"同形，不报错也不落脏值）；
+        ④ 反向哨兵：``"0"`` 这类"看起来像空"的正常 id **不得**被丢掉，判空一律
+        ``str(x).strip() == ""``，**严禁 ``if not x``** 这种语言自带假值判据；
+        ⑤ **主键另判一档**：``task_id`` 缺失/空串/``0`` 必须**响亮报错**（本栈 ``ValueError``），
+        不得拿 ``''``/``0`` 当 id 落库——归属值可有可无，主键没有就是调用方写错了。
+
+        这条义务要钉在**实现方**而不只钉在门面/引擎漏斗里：绕过门面直连仓储的调用方（集成层、
+        第三方仓储消费者）同样不得把空归属值灌进 ``actor_id``。本仓两仓（SQL 仓
+        ``JdbcRepository`` / 内存仓 ``MemoryRepository``）同判据——**两仓分叉就是 issues/117
+        场景 27 那把尺子**（rust 实测：sqlx 仓盲插、同栈内存仓判重，两个答案）。"""
+        ...
     @abstractmethod
     async def remove_task_actor(self, task_id: int, actors: list[str]) -> None: ...
     @abstractmethod
@@ -106,7 +175,17 @@ class ProcessRepository(ABC):
         （SQL 仓 `JdbcRepository` / 内存仓 `MemoryRepository`）同判据，第三方实现按本 docstring 自守。"""
         ...
     @abstractmethod
-    async def update_cc_status(self, instance_id: int, actor_id: str) -> None: ...
+    async def update_cc_status(self, instance_id: int, actor_id: str) -> None:
+        """抄送置已读（``processInstance/updateCCStatus``）。
+
+        **入参归一后再比**（issues/142 B 批 · spec 06-facade.md §2.11 写点表第 4 行）：
+        ``actor_id`` 先过 ``normalize_actors``/``normalize_actor_value``（同一枚单点）再与库里的
+        ``cc.actor_id`` 比较——① 不 trim 则 ``" lisi "`` 判成另一个人，已读打不上；
+        ② **空/纯空白/``None`` 的 operator 是 no-op**，不得退化成"这条条件不加"而把 ``state=1``
+        批量打到历史 ``actor_id=''`` 的脏行上（issues/129 那族"空归属值读全库"的写侧对偶）。
+        判空一律 ``== ""``，严禁 ``if not x``（``"0"`` 是正常 id，必须照样能置已读）。
+        两仓同判据。"""
+        ...
 
     async def find_cc_actor_ids(self, instance_id: int) -> list[str]:
         """某实例**已存在**的 cc 行 actor id（issues/141 G2 写侧判重的读侧）。

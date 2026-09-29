@@ -7,7 +7,7 @@ from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, Inst
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate,
                     InstanceStatsRow, TaskStatsRow)
 from .spi import ProcessRepository, ProcessExtRepository
-from .spi import normalize_cc_actors
+from .spi import normalize_actors, normalize_cc_actors, require_present_id
 from .surrogate import hydrate_enabled, to_datetime   # 判据本身已收口到 ProcessSurrogate.is_effective（issues/123）
 
 class CcRow(str):
@@ -114,8 +114,20 @@ class MemoryRepository(ProcessRepository):
         return [deepcopy(t) for t in self._tasks.values() if t.processInstanceId == instance_id]
     async def find_task_actors(self, task_id): return list(self._actors.get(task_id, []))
     async def add_task_actor(self, task_id, actors):
+        """内存仓写侧兜底（issues/142 B 批 · spec 06 §2.11 要求①「两层都挡」）：
+        判据与 SQL 仓 ``JdbcRepository.add_task_actor`` **逐字同一条**（两仓分叉＝issues/117
+        场景 27；rust 实测就是 sqlx 仓盲插、同栈内存仓判重的两个答案），复用 §2.10 落地的
+        同一枚单点 ``spi.normalize_actors``。旧形状只判重不判空、不 trim ⇒
+        ``""``/``"  "``/``None`` 全放行。"""
+        # 主键另判一档：task_id 缺失/空串/0 响亮报错，不拿 ''/0 当 key 落库（§2.11 末段）
+        task_id = require_present_id(task_id)
+        # 归属值：trim／空串·纯空白·None 丢弃／同次调用折叠；"0" 不得丢（要求④）
+        actors = normalize_actors(actors)
+        if not actors:
+            return
         existing = self._actors.get(task_id, [])
         for a in actors:
+            # 比较取 trim 后的值（要求②）：入参已归一 ⇒ " 123 " 与 "123" 是同一个人，只一行
             if a not in existing: existing.append(a)
         self._actors[task_id] = existing
     async def remove_task_actor(self, task_id, actors):
@@ -146,8 +158,16 @@ class MemoryRepository(ProcessRepository):
         # 已读：state 0→1 ＋ 刷 update_time（对齐 wf_process_cc_instance.state 语义与 SQL 仓那句
         # UPDATE）。issues/141 G2 之前这里是 `pass`——内存仓的 cc 行不带 state/时间，
         # "重复抄送不重置未读 / 不刷原行时间"两档根本照不出来，只能空转断言。
+        #
+        # issues/142 B 批（spec 06 §2.11 写点表第 4 行）：**入参归一后再比**——不 trim 则
+        # " lisi " 判成另一个人（已读打不上）；空/纯空白/None ⇒ **整个 no-op**，不得退化成
+        # "这条条件不加"而把历史 actor_id='' 的脏行批量打勾（与 SQL 仓同判据；
+        # 判空只用 == ""，"0" 是正常 id）。
+        normalized = normalize_actors([actor_id])
+        if not normalized:
+            return
         for row in self._cc.get(instance_id, []):
-            if row == actor_id:
+            if row == normalized[0]:
                 row.state = 1
                 row.update_time = datetime.now()
 

@@ -712,20 +712,26 @@ class EngineImpl(Engine):
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict,
                            process_name: str = "", parent_id: int = 0, is_first: bool = False):
         actors = await self._resolve_actors(node, inst, operator, vars_)
-        if not actors:
-            # issues/141 G5→G9：这一支现在**只服务任务类节点**——记录类（snaker:custom）已在
-            # ``_execute_node`` 按类型分流到 ``_exec_custom_node``（spec 02 §6.1，owner 2026-09-29
-            # 裁定「自定义类型这种记录类的，不会有参与人，是正常形态」），不再进这里，
-            # 也就不再产生"记录类兜底挂操作人 ⇒ 伪造一条不该收到的待办"那个形状。
-            # 任务类保持 G5 的既有口径不动：参与者解析为空**不丢 token**，仍要建一行 DOING
-            # （java CreateTaskHandler 无条件建单；本栈按 ``or [operator]`` 的既有兜底口径
-            # 挂给当前操作人，使这一行真实可办——与 _rollback_actors / _sync_resolve_actors 同款。
-            # 注：spec §6.1 硬结论 1「兜底挂当前操作人八栈一律不许有」若也适用于任务类，
-            # 需要 owner 另行拍板改成"零参与者建单"，本轮按指令只动记录类那一侧）。
-            fallback = operator or inst.operator
-            if not fallback:
-                return
-            actors = [fallback]
+        # issues/141 G5→G9→**硬结论 1**（spec 02 §6.1，owner 2026-09-30 拍；issues/142 §5.3 第 3 问）：
+        # **任务类**节点参与者解析为空 ⇒ **照常建这一行 DOING、参与者集合为空**，
+        # 不再 `fallback = operator or inst.operator` 兜底挂当前操作人。
+        # 上一笔 ``f9f6ca8`` 只按 §6.1 拆干净了**记录类**那一腿，任务类这条腿当时留话"若也适用于
+        # 任务类需 owner 另行拍板"——现在拍了：§6.1 硬结论 1 原文「"参与者为空 ⇒ 兜底挂给当前
+        # 操作人"这种写法**八栈一律不许有**」不分节点类型。兜底的坏处是**伪造**一条当前操作人
+        # 不该收到的待办（他既没被指派、也没申请过这一格，待办列表里却多一条，且他能真办掉）。
+        # 旧形状另一半更糟：`if not fallback: return` —— 操作人为空时**既不建行也不推进**，
+        # 实例停在 state=10 却零可办行，正是 §6.1 点名的死锁黑洞，一并收掉。
+        # 新形状与 java `CreateTaskHandler.handle`（:38-63）**逐字同形**：resolveActors 返回空
+        # list 也照样 `instance.createTask(...)` ＋ `execution.addTasks(tasks)`，行建出来、
+        # 参与者列就是空集合（java `ProcessTask.create` :63 ⇒ `actorIds = new ArrayList<>()`）。
+        # ⚠️ "零参与者"≠"参与者为空就不建单"——要的是**建行且不挂人**（go/node/rust/moon 四栈
+        # 现在是"一行不建"那一侧，本栈不许跟过去）。
+        # 谁也办不动是**设计如此**：``ProcessTask.is_allowed`` 对空集合恒 False，所以这一行
+        # 是"看得见、办不动"的显性堵点（可由 addTaskActor/transfer 补人，或 flow.admin/
+        # flow.auto 逃生口办理），比"静默消失＋实例卡死"可诊断得多。
+        # 重入安全：本腿只建**一行**、不推进令牌（推进由 execute_process_task 驱动），
+        # 零参与者行既过不了 JOIN 的"无 DOING 即前进"判据（它自己就是 DOING，反而卡住 JOIN，
+        # 与 java 同形），也不会被会签 merged 分支反复唤醒 ⇒ 不存在自动重入环。
         # performType 容错解析（对齐 Java codeOf，issue 42）：int 优先；
         # 字符串 'ALL'/'COUNTERSIGN'（设计器面板格式，大小写不敏感）映射为会签；未知回落 0
         _pt = node.properties.get("performType", 0)
@@ -740,7 +746,10 @@ class EngineImpl(Engine):
         expire_expr = node.properties.get("expireTime")
         if perform_type == 1 and ct:
             if ct == "PARALLEL":
-                for a in actors:
+                # ``actors or [""]``：零参与者会签同样**必须建一行**（§6.1 表第一行"任务类含会签"），
+                # 循环吃空列表 ⇒ 一行不建 = §6.1 禁的死锁形状。这一档 java 是零行
+                # （createCountersignTasks 的 for 循环吃空 list），见本轮报告"基准自身缺口"。
+                for a in (actors or [""]):
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     # 写点③「并行会签全员」：每位成员各算一次（Java createCountersignTasks 并行循环）
                     _apply_expire_time(nt, expire_expr, inst.variables)
@@ -749,7 +758,10 @@ class EngineImpl(Engine):
                     # PROCESS_TASK_START（码 3）：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
                     await self._fire_task_start(inst, nt, node.id, operator)
             elif ct == "SEQUENTIAL":
-                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
+                # 零参与者时 primary 取 ""（⇒ create_task 落**空**参与者集合）：java 这一支是
+                # `actorIds.get(0)`，空 list 直接 IndexOutOfBoundsException（基准自身缺口，报告单列），
+                # 本栈按 §6.1"任务类零参与者必须建 DOING 行"建一行不挂人，不跟着炸。
+                nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0] if actors else "", operator, form, now, parent_id, is_first, 1)
                 # 写点②「串行会签首位成员」（Java createCountersignTasks SEQUENTIAL 分支）。
                 # 串行会签**推进**出的下一位成员是第五处写点（execute_process_task 的 SEQUENTIAL 分支
                 # 里另有一次 _apply_expire_time）：基准侧 boot2 推进时回调 createCountersignTask
@@ -760,7 +772,8 @@ class EngineImpl(Engine):
                 await self.repo.save_task(nt)
                 await self._fire_task_start(inst, nt, node.id, operator)
             else:
-                for a in actors:
+                # 同 PARALLEL 档：零参与者也要落一行，不吃空列表
+                for a in (actors or [""]):
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     # 未知/比例会签档（RATIO_* 等）＝ Java 的"非 SEQUENTIAL 一律并行全员"循环
                     _apply_expire_time(nt, expire_expr, inst.variables)
@@ -769,7 +782,9 @@ class EngineImpl(Engine):
                     await self._fire_task_start(inst, nt, node.id, operator)
         else:
             # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
+            # 零参与者档（硬结论 1）：primary 取 "" ⇒ create_task 落**空**参与者集合
+            # （model.create_task 对 "" 不再写出 [""] 那种空串归属值，见该函数注释）。
+            nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0] if actors else "", operator, form, now, parent_id, is_first)
             # 写点①「普通建单」（Java createTask：本轮把占位 now() 换成按表达式真算）
             _apply_expire_time(nt, expire_expr, inst.variables)
             if len(actors) > 1:
@@ -803,12 +818,15 @@ class EngineImpl(Engine):
         Java 类名），故与 **C# 栈同策**：集成方 ``HandlerRegistry.register_custom(<clazz 原样串>,
         handler)`` 按名注册，引擎按名解析后调用，返回值非 ``None`` 时写进执行变量的 ``val``
         （缺省键 ``custom_return_val``，对齐 java ``FlowConst.CUSTOM_RETURN_VAL``）。
-        ⚠️ **与 java/C# 的一处刻意分歧**：java 与 C# 在"clazz 不可解析"时**显式报错**
-        （``自定义模型[class=...]实例化对象失败``）。本栈未注册时**记 WARNING 日志后继续**——
-        因为本栈根本没有"能不能反射到某个 Java 类"这件事可判，报错会让任何沿用共享夹具
-        （``08-custom-node.json`` 的 JVM 类名）的流程在 python 上必然失败，那是**栈限制**不是
-        **语义缺陷**；而"建行＋继续推进"才是 §6.1 要钉的形状。要 java/C# 同策（显式报错）
-        需 owner 另行拍板，见本轮报告。
+        ⚠️ **与 java/C# 的一处刻意的栈分歧（owner 2026-09-30 已拍，spec 02 §6.2 第 2 条）**：
+        java 与 C# 在"clazz 不可解析"时**显式报错**（``自定义模型[class=...]实例化对象失败``），
+        本栈**记 WARNING 日志后照常落历史行＋续流**——因为本栈根本没有"能不能反射到某个 Java 类"
+        这件事可判，报错会让任何沿用共享夹具（``08-custom-node.json`` 的 JVM 类名）的流程在
+        python 上必然失败，那是**栈限制**不是**语义缺陷**；而"建行＋继续推进"才是 §6.1 要钉的形状。
+        §6.2 第 2 条同时把这一条定为本栈形状（原文「python 已经是这个形状（记 WARNING 后继续），
+        保持」），java/c# 跟改；要 python 回到报错档需 owner 重新拍。
+        ⇒ 附带要求已落实：**"未注册处理器"与"clazz 为空串/缺失"分两档日志**（两条都照常
+        落历史行＋续流，只是文案分别可诊断）；处理器**自身执行失败**不在豁免内，照旧外抛。
 
         不发 ``PROCESS_TASK_START``（码 3）：码 3 表达"新待办产生"，本腿建行即已完成态，
         对齐 java——``persistTasks`` 只对 ``exec.getProcessTaskList()``（新建的 DOING 单）
@@ -827,8 +845,17 @@ class EngineImpl(Engine):
             if ret is not None:
                 vars_[var_key] = ret
         elif clazz:
-            logging.warning("[jeeflow] custom 节点 clazz=%s 未注册处理器，跳过执行只落历史行"
-                            "（本栈按名注册：HandlerRegistry.register_custom）", clazz)
+            # 档 1「clazz 非空但未注册」：可诊断到**具体类名/处理器名**，集成方一眼看出是
+            # 忘了 register_custom 还是名字写错（spec 02 §6.2 第 2 条要求这一档与档 2 分开）。
+            logging.warning("[jeeflow] custom 节点 %s 的 clazz=%s 未注册处理器，跳过执行、"
+                            "照常落历史行并续流（本栈按名注册：HandlerRegistry.register_custom"
+                            "(clazz, handler)）", node.id, clazz)
+        else:
+            # 档 2「clazz 为空串／属性缺失」：这是**定义配错**（设计器里没填或填了空），
+            # 与"填了名字但注册表里没有"是两种病，日志文案必须能分别诊断（§6.2 第 2 条）。
+            # 上一版这里只有 `elif clazz:` 一档 ⇒ 空串 clazz 静默无日志，配置错误照不出来。
+            logging.warning("[jeeflow] custom 节点 %s 未配置 clazz（属性缺失或空串），跳过执行、"
+                            "照常落历史行并续流；流程定义请补 properties.clazz", node.id)
         now = datetime.now()
         ht = inst.create_history_task(self._next_id(), node.id, node.text.get("value", ""),
                                       operator, now, parent_id,

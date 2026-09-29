@@ -6537,3 +6537,315 @@ async def test_i141_g9_task_node_with_empty_actors_still_creates_doing_row():
     inst = await repo.find_instance_by_id(iid)
     assert int(inst.state) == 10, "任务类空参与者仍停在进行中"
 
+
+# ═══ Test 142 A 批（python 两腿）：任务类零参与者**建行不挂人** ＋ clazz 两档分开 ═══════════
+#
+# 立法依据（jeeflow-doc/docs/spec/02-flow-definition.md，只读）——
+#   §6.1 硬结论 1：「"参与者为空 ⇒ 兜底挂给当前操作人"这种写法**八栈一律不许有**」。
+#     上一笔 commit `f9f6ca8` 只按 §6.1 拆干净了**记录类**那一腿，任务类这条腿当时的注释留话
+#     "若也适用于任务类，需要 owner 另行拍板"——owner 2026-09-30 拍了：**适用于任务类**
+#     （issues/142 §5 第 3 问）。⇒ 撤掉 `engine._create_task` 的
+#     `fallback = operator or inst.operator`，改成与 java `CreateTaskHandler`
+#     （:38-63 无条件建单，actors 为空也 `instance.createTask(...)`）**逐字同形**的
+#     "建一行 DOING、参与者为空集合"。旧形状的两个病灶各自有牙钉着：
+#       ① 兜底挂当前操作人 ＝ **伪造**一条他不该收到的待办（他自己能办掉一个没指派给他的节点）；
+#       ② `if not fallback: return` ＝ 操作人为空时既不建行也不推进 ⇒ 实例停在 state=10
+#          却零可办行，正是 §6.1 点名的死锁黑洞（本栈那一支曾为消 demo_reset 红引入）。
+#     ⚠️ "零参与者"与"参与者为空就不建单"是两件事：要的是**建行且不挂人**
+#     （go/node/rust/moon 现在是"一行不建"那一侧，本栈不许跟过去）。
+#   §6.2 第 2 条：clazz 解析不了 ⇒ 记日志 + 照常落历史行 + 令牌继续流转；
+#     **"未注册处理器"与"clazz 为空串"要分档**（两条都继续，但日志文案分别可诊断）；
+#     处理器**自身执行失败**不在豁免内 ⇒ 照旧外抛（那是业务错误不是配错形状）。
+#     上一版只有 `elif clazz:` 一档 ⇒ 空串/缺失 clazz **静默无日志**。
+# 这一批**不顶任何既有格**：`test_i141_g9_task_node_with_empty_actors_still_creates_doing_row`
+# 只钉"行建出来"（不钉参与者），撤兜底后照样绿；下面每一格都在改前实测会红（见交付报告）。
+
+_I142_START_NODE = {"id": "start", "type": "snaker:start", "text": {"value": "开始"}, "properties": {}}
+_I142_APPLY_NODE = {"id": "apply", "type": "snaker:task", "text": {"value": "发起申请"},
+                    "properties": {"assignee": "applicant"}}
+_I142_END_NODE = {"id": "end", "type": "snaker:end", "text": {"value": "结束"}, "properties": {}}
+
+
+def _i142_chain(mid_nodes: list) -> tuple:
+    """start → apply(applicant，被 startAndExecute 自动办结) → *中间节点* → end。
+
+    中间节点**刻意不接在 start 后面**：门面的 `_startAndExecute` 会对"发起后所有 DOING 行"
+    补 `add_task_actor(当前操作人)` 再自动办理（那是 applicant 的申请腿机制，八栈同形、本轮不动），
+    首节点直接就是待测节点会让那层机制先替我们把人挂上，照不到引擎的形状。"""
+    nodes = [_I142_START_NODE, _I142_APPLY_NODE] + mid_nodes + [_I142_END_NODE]
+    seq = ["start", "apply"] + [n["id"] for n in mid_nodes] + ["end"]
+    edges = [{"id": f"e{i}", "sourceNodeId": a, "targetNodeId": b, "properties": {}}
+             for i, (a, b) in enumerate(zip(seq, seq[1:]), start=1)]
+    return nodes, edges
+
+
+async def _i142_start(facade, name: str, nodes: list, edges: list) -> int:
+    """部署＋发起一气呵成，回实例 id（operator 固定 zhangsan＝"当前操作人"，兜底 once 挂的就是他）。"""
+    content = json.dumps({"name": name, "displayName": name, "type": "approval",
+                          "nodes": nodes, "edges": edges})
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    assert r["code"] == 0, r
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": int(r["data"]["processDefineId"]), "operator": "zhangsan"})
+    assert r["code"] == 0, f"发起不得被零参与者/clazz 配错打断: {r}"
+    return int(r["data"]["processInstanceId"])
+
+
+@pytest.mark.asyncio
+async def test_i142_hr1_zero_actor_task_row_is_created_but_not_attached_to_operator():
+    """硬结论 1 的正腿：任务类节点参与者解析为空 ⇒ **有这一行**（task_state=10）、
+    参与者是**真空集合**、**当前操作人不在里面**（最后这条才是撤兜底的牙——只数行数照不出来，
+    旧兜底形状同样是"一行 DOING"，只是行上挂着 zhangsan）。"""
+    _eng, repo, facade, events, _reg = _i141g9_harness()
+    nodes, edges = _i142_chain([{"id": "task2", "type": "snaker:task",
+                                 "text": {"value": "没人可派的审批"}, "properties": {}}])
+    iid = await _i142_start(facade, "i142-hr1-empty-actors", nodes, edges)
+
+    doing = await repo.find_doing_tasks(iid)
+    assert [t.taskName for t in doing] == ["task2"], \
+        f"任务类零参与者必须建一行 DOING（不许回成『一行不建』那一侧）: {doing}"
+    t2 = doing[0]
+    assert int(t2.taskState) == 10, f"建行状态必须是进行中: {t2.taskState}"
+    # 参与者＝真空集：既不是 ["zhangsan"]（旧兜底），也不是 [""]（空串归属值，issues/142 B 表那族垃圾）
+    assert list(t2.actorIds) == [], f"零参与者行的 actorIds 必须是空集: {t2.actorIds}"
+    assert await repo.find_task_actors(t2.id) == [], \
+        f"落库的 wf_process_task_actor 必须零行: {await repo.find_task_actors(t2.id)}"
+    assert "zhangsan" not in t2.actorIds and t2.actorId != "zhangsan", \
+        f"当前操作人不在这一行的参与者里——兜底挂人＝伪造一条他不该收到的待办: {t2.actorIds}"
+
+    # token 没被丢掉：实例照旧停在"进行中"，等 addTaskActor/transfer 补人或 flow.admin 逃生
+    inst = await repo.find_instance_by_id(iid)
+    assert int(inst.state) == 10, f"实例应停在进行中（既不丢令牌也不办结）: {inst.state}"
+
+    # 用户可感知面：zhangsan 的待办列表里**查不到**这一行（伪造待办的形状没了）
+    todo = await facade.flow("processTask/todoList",
+                             {"operator": "zhangsan", "pageNum": 1, "pageSize": 50})
+    names = [row.get("taskName") for row in (todo.get("data") or {}).get("rows") or []]
+    assert "task2" not in names, f"伪造待办又回来了: {names}"
+
+    # 码 3（PROCESS_TASK_START）照发（"新待办产生"这一事实成立），但载荷 actors 为空——事件侧不臆造人
+    starts = [e for e in events if e.type is EventType.PROCESS_TASK_START and int(e.taskId) == int(t2.id)]
+    assert len(starts) == 1, f"零参与者行仍要发一次码 3: {[(e.taskId, e.taskName) for e in events]}"
+    assert list(starts[0].actors) == [], f"码 3 载荷不得带上臆造的参与者: {starts[0].actors}"
+
+
+@pytest.mark.asyncio
+async def test_i142_hr1_zero_actor_row_is_not_executable_and_does_not_reenter_create():
+    """硬结论 1 的负腿 ＋ 死循环复核：零参与者行是"**看得见、办不动**"的显性堵点。
+    ① 当前操作人办不动它（旧兜底形状下他能一键办掉一个没指派给他的节点——那才是真危害）；
+    ② 办失败**不产生第二行**、也不重入建单（自动推进/会签计数那类逻辑不被零参与者行反复唤醒）。"""
+    _eng, repo, facade, _events, _reg = _i141g9_harness()
+    nodes, edges = _i142_chain([{"id": "task2", "type": "snaker:task",
+                                 "text": {"value": "没人可派的审批"}, "properties": {}}])
+    iid = await _i142_start(facade, "i142-hr1-not-executable", nodes, edges)
+    t2 = (await repo.find_doing_tasks(iid))[0]
+
+    r = await facade.flow("processTask/execute",
+                          {"processTaskId": str(t2.id), "operator": "zhangsan", "submitType": 1})
+    assert r["code"] != 0, f"零参与者行不该被非参与者办掉（兜底回来就会红在这一格）: {r}"
+    assert "not allowed" in str(r.get("msg", "")), f"报错应是参与者判据: {r}"
+
+    after = await repo.find_doing_tasks(iid)
+    assert [t.id for t in after] == [t2.id], f"失败路径不得再建一行/重入建单: {after}"
+    assert await repo.find_task_actors(t2.id) == [], \
+        "办失败不得顺手把人补进参与者（那等于把兜底换个位置塞回来）"
+    assert int((await repo.find_instance_by_id(iid)).state) == 10, "实例仍停在进行中"
+
+
+@pytest.mark.asyncio
+async def test_i142_hr1_empty_operator_still_leaves_a_row_not_the_zero_row_black_hole():
+    """§6.1 死锁黑洞的**另一半**（上一笔 commit 的注释里那支 `if not fallback: return`）：
+    操作人也为空时旧形状"**既不建行也不推进**" ⇒ 实例停在 state=10、库里一行可办行都没有，
+    用户在任何列表里都看不见这一格，只能靠对账捞回来。撤兜底后必须是"**有一行、行上没人**"。
+
+    走**引擎直用**（不经门面）：门面的 `_startAndExecute` 会对发起后的 DOING 行补
+    `add_task_actor(当前操作人)` 再自动办理（applicant 申请腿机制，八栈同形、本轮不动），
+    经它发起就把这一支照不到了；同理中间节点直接挂在 start 后面也会被那层机制补人。"""
+    eng, repo, facade, _events, _reg = _i141g9_harness()
+    nodes = [_I142_START_NODE,
+             {"id": "task2", "type": "snaker:task", "text": {"value": "没人可派也没操作人"},
+              "properties": {}},
+             _I142_END_NODE]
+    edges = [{"id": "e1", "sourceNodeId": "start", "targetNodeId": "task2", "properties": {}},
+             {"id": "e2", "sourceNodeId": "task2", "targetNodeId": "end", "properties": {}}]
+    r = await facade.flow("processDefine/deploy",
+                          {"content": json.dumps({"name": "i142-hr1-no-operator",
+                                                  "displayName": "无操作人零参与者", "type": "approval",
+                                                  "nodes": nodes, "edges": edges})})
+    assert r["code"] == 0, r
+    did = int(r["data"]["processDefineId"])
+
+    inst = await eng.start_process_instance_by_id(did, "", {})
+    assert inst is not None and int(inst.state) == 10, f"实例应停在进行中: {inst.state}"
+    doing = await repo.find_doing_tasks(inst.id)
+    assert [t.taskName for t in doing] == ["task2"], \
+        f"操作人为空也必须留一行 DOING（旧形状这里 return ⇒ 零可办行的死锁黑洞）: {doing}"
+    assert list(doing[0].actorIds) == [] and await repo.find_task_actors(doing[0].id) == [], \
+        f"这一行不挂人、也不落空串归属值: {doing[0].actorIds}"
+
+
+@pytest.mark.asyncio
+async def test_i142_hr1_zero_actor_row_blocks_join_without_reentry():
+    """任务里点名的"别把状态机弄成死循环"那一问：fork 出两条边，一条有人办、一条**零参与者**，
+    办结有人那条后 ⇒
+      · JOIN **不前推**（`find_doing_tasks` 非空，零参与者行自己就是那条 DOING，与 java 同形）；
+      · 不重入建单（join 之后的节点没被建出、任务行总数不涨、码 3 不重复 fire）。
+    即这一行是"卡住但安静"的堵点，不是自动重入的引信——推进的唯一驱动是 `execute_process_task`，
+    而零参与者行谁也办不动（`ProcessTask.is_allowed` 对空集恒 False）。
+
+    走引擎直用（`start_process_instance_by_id` ＋ `execute_process_task`），
+    免得门面的发起自动申请腿把那层补人机制混进来。"""
+    eng, repo, facade, events, _reg = _i141g9_harness()
+    nodes = [
+        _I142_START_NODE,
+        {"id": "fork", "type": "snaker:fork", "text": {"value": "并行"}, "properties": {}},
+        {"id": "tok", "type": "snaker:task", "text": {"value": "有人办"},
+         "properties": {"assignee": "leader"}},
+        {"id": "tempty", "type": "snaker:task", "text": {"value": "没人办"}, "properties": {}},
+        {"id": "join", "type": "snaker:join", "text": {"value": "汇合"}, "properties": {}},
+        {"id": "after", "type": "snaker:task", "text": {"value": "汇合之后"},
+         "properties": {"assignee": "boss"}},
+        _I142_END_NODE,
+    ]
+    pairs = [("start", "fork"), ("fork", "tok"), ("fork", "tempty"),
+             ("tok", "join"), ("tempty", "join"), ("join", "after"), ("after", "end")]
+    edges = [{"id": f"e{i}", "sourceNodeId": a, "targetNodeId": b, "properties": {}}
+             for i, (a, b) in enumerate(pairs, start=1)]
+    r = await facade.flow("processDefine/deploy",
+                          {"content": json.dumps({"name": "i142-hr1-join", "displayName": "并行含零参与者",
+                                                  "type": "approval", "nodes": nodes, "edges": edges})})
+    assert r["code"] == 0, r
+    did = int(r["data"]["processDefineId"])
+
+    inst = await eng.start_process_instance_by_id(did, "zhangsan", {})
+    doing = {(t.taskName): t for t in await repo.find_doing_tasks(inst.id)}
+    assert set(doing) == {"tok", "tempty"}, f"fork 两臂都该建行: {sorted(doing)}"
+    assert list(doing["tempty"].actorIds) == [], f"零参与者臂不挂人: {doing['tempty'].actorIds}"
+    rows_before, starts_before = len(repo._tasks), sum(
+        1 for e in events if e.type is EventType.PROCESS_TASK_START)
+
+    inst2 = await eng.execute_process_task(doing["tok"].id, "leader", {"submitType": 1})
+    left = await repo.find_doing_tasks(inst2.id)
+    assert [t.taskName for t in left] == ["tempty"], f"有人那条办完后只剩零参与者那条卡着: {left}"
+    all_rows = await repo.find_history_tasks(inst2.id)
+    assert not [t for t in all_rows if t.taskName == "after"], \
+        "JOIN 不得因为『另一臂没人』就当前推进（卡住是设计如此），更不得反复重入建 after 行"
+    assert len(repo._tasks) == rows_before, \
+        f"任务行不得增长（重入建单的唯一可见痕迹）: {rows_before} → {len(repo._tasks)}"
+    assert sum(1 for e in events if e.type is EventType.PROCESS_TASK_START) == starts_before, \
+        "重入建单会重复 fire 码 3——不得出现"
+    assert int(inst2.state) == 10, f"实例停在进行中（显性堵点，不是黑洞）: {inst2.state}"
+
+
+@pytest.mark.asyncio
+async def test_i142_hr1_zero_actor_countersign_still_creates_exactly_one_row():
+    """§6.1 表第一行的"含会签"那一半：会签节点（PARALLEL／SEQUENTIAL）参与者为空时
+    **同样建一行**、`perform_type` 仍是 1、参与者空集。
+    ⚠️ 形状对照：java `createCountersignTasks` 在空 list 上并不等价——PARALLEL 那支 for 循环
+    吃空列表 ⇒ **零行**（§6.1 禁的死锁形状），SEQUENTIAL 那支 `actorIds.get(0)` ⇒
+    IndexOutOfBoundsException（打断建单）。两档都是**基准自身缺口**（案文 §1 A 段同款），
+    本栈按 §6.1 正文"任务类含会签 ⇒ 建待办行、参与者可以为零"落一行不挂人，不跟基准一起炸。"""
+    for ct in ("PARALLEL", "SEQUENTIAL"):
+        _eng, repo, facade, _events, _reg = _i141g9_harness()
+        nodes, edges = _i142_chain([{"id": "cs", "type": "snaker:task",
+                                     "text": {"value": f"没人可签的会签（{ct}）"},
+                                     "properties": {"performType": 1, "countersignType": ct}}])
+        iid = await _i142_start(facade, f"i142-hr1-cs-{ct}", nodes, edges)
+
+        doing = await repo.find_doing_tasks(iid)
+        assert [t.taskName for t in doing] == ["cs"], f"[{ct}] 零参与者会签仍要留一行: {doing}"
+        assert len(doing) == 1, f"[{ct}] 只建一行，不得按空成员列表铺开: {doing}"
+        t = doing[0]
+        assert int(t.performType) == 1, \
+            f"[{ct}] 会签档不许因为零参与者掉回普通任务（perform_type 列要真）: {t.performType}"
+        assert list(t.actorIds) == [] and await repo.find_task_actors(t.id) == [], \
+            f"[{ct}] 参与者必须是空集（不是 [''] 也不是 ['zhangsan']）: {t.actorIds}"
+        assert int((await repo.find_instance_by_id(iid)).state) == 10, f"[{ct}] 实例停在进行中"
+
+
+@pytest.mark.asyncio
+async def test_i142_62_clazz_unregistered_and_clazz_empty_are_two_separate_logs(caplog):
+    """§6.2 第 2 条的"分档"：
+    · 档 1 clazz 非空但**未注册** ⇒ 日志带 clazz 值、文案指"未注册处理器"；
+    · 档 2 clazz **空串／属性缺失** ⇒ 日志指"未配置 clazz"（定义配错），文案里不该有"未注册"；
+    两档共同点：**照常落 DONE 历史行 + 令牌继续流转**，且记录类行仍**不发码 3**。
+    改前只有 `elif clazz:` 一档 ⇒ 档 2 静默零日志（这一格照的就是这个）。"""
+    import logging
+
+    async def _run(node_id: str, props: dict, flow_name: str):
+        _eng, repo, facade, events, _reg = _i141g9_harness()   # 不注册任何 custom handler
+        nodes, edges = _i142_chain([{"id": node_id, "type": "snaker:custom",
+                                     "text": {"value": "留痕节点"}, "properties": props}])
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            iid = await _i142_start(facade, flow_name, nodes, edges)
+        inst = await repo.find_instance_by_id(iid)
+        row = next((t for t in inst.tasks if t.taskName == node_id), None)
+        warnings = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING
+                    and "custom 节点" in rec.getMessage()]
+        return row, inst, events, warnings
+
+    # ── 档 1：clazz 非空但未注册 ──────────────────────────────────────────────
+    row, inst, events, warns = await _run("c1", {"clazz": "com.example.NoSuchHandler"},
+                                          "i142-62-unregistered")
+    assert any("未注册处理器" in m and "clazz=com.example.NoSuchHandler" in m for m in warns), \
+        f"档 1 应有可诊断到 clazz 值的未注册日志: {warns}"
+    assert not any("未配置 clazz" in m for m in warns), f"档 1 不该被报成配置缺失: {warns}"
+    assert row is not None, f"clazz 解析不了仍要落历史行（不得丢留痕）: {inst.tasks}"
+    assert int(row.taskState) == 20, f"记录类只落 DONE 行: {row.taskState}"
+    assert int(inst.state) == 20, f"令牌照旧续流到 end: {inst.state}"
+    assert not [e for e in events if e.type is EventType.PROCESS_TASK_START
+                and int(e.taskId) == int(row.id)], "记录类行仍不得发码 3"
+
+    # ── 档 2a：clazz 为空串 ─────────────────────────────────────────────────
+    row, inst, events, warns = await _run("c2", {"clazz": ""}, "i142-62-empty-clazz")
+    assert any("未配置 clazz" in m for m in warns), f"档 2（空串）应有独立一档日志: {warns}"
+    assert not any("未注册处理器" in m for m in warns), \
+        f"档 2 不该跟档 1 合成同一句话（两病要分别可诊断）: {warns}"
+    assert row is not None and int(row.taskState) == 20 and int(inst.state) == 20, \
+        f"档 2 同样照常落历史行＋续流: row={row and row.taskState} inst={inst.state}"
+    assert not [e for e in events if e.type is EventType.PROCESS_TASK_START
+                and int(e.taskId) == int(row.id)], "记录类行仍不得发码 3"
+
+    # ── 档 2b：clazz 属性整个缺失 ───────────────────────────────────────────
+    row, inst, _ev, warns = await _run("c3", {}, "i142-62-missing-clazz")
+    assert any("未配置 clazz" in m for m in warns), f"缺失档与空串档同判（都算定义没配）: {warns}"
+    assert row is not None and int(row.taskState) == 20 and int(inst.state) == 20, \
+        f"缺失档同样落行＋续流: row={row and row.taskState} inst={inst.state}"
+
+
+@pytest.mark.asyncio
+async def test_i142_62_custom_handler_own_exception_still_propagates():
+    """负向对照：§6.2 第 2 条的豁免**只覆盖"clazz 解析不了"**（配错形状），
+    处理器**自身执行失败**（解析到了、跑炸了）照旧外抛——不许顺手降级成"记日志继续"，
+    那是业务错误，吞掉就把数据写脏了。"""
+    from jeeflow.extensions import ICustomHandler
+
+    class _Boom(ICustomHandler):
+        def handle(self, node, instance, operator, vars_):
+            raise RuntimeError("handler-boom")
+
+    eng, repo, facade, _events, reg = _i141g9_harness()
+    reg.register_custom("com.example.Boom", _Boom())
+    nodes, edges = _i142_chain([{"id": "c1", "type": "snaker:custom",
+                                 "text": {"value": "会炸的留痕节点"},
+                                 "properties": {"clazz": "com.example.Boom"}}])
+    r = await facade.flow("processDefine/deploy",
+                          {"content": json.dumps({"name": "i142-62-boom", "displayName": "处理器炸",
+                                                  "type": "approval", "nodes": nodes, "edges": edges})})
+    assert r["code"] == 0, r
+    did = int(r["data"]["processDefineId"])
+
+    # 引擎直用：异常必须原样外抛。注意记录类节点在 apply **之后**，
+    # 所以要把申请腿办掉才会真的走到 c1（`start_process_instance_by_id` 只建到 apply 那行）。
+    inst = await eng.start_process_instance_by_id(did, "zhangsan", {})
+    apply_task = (await repo.find_doing_tasks(inst.id))[0]
+    with pytest.raises(RuntimeError, match="handler-boom"):
+        await eng.execute_process_task(apply_task.id, "zhangsan", {"submitType": 1})
+
+    # 门面腿：不外抛但**绝不报成功**（顶层 catch 把消息原样送出，不是 code=0 静默）
+    r2 = await facade.flow("processInstance/startAndExecute",
+                           {"processDefineId": did, "operator": "zhangsan"})
+    assert r2["code"] != 0 and "handler-boom" in str(r2.get("msg", "")), \
+        f"处理器自身炸不得被吞成成功: {r2}"
+

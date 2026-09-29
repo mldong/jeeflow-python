@@ -208,10 +208,15 @@ class ProcessInstance:
         """创建任务（子实体工厂）——perform_type：0 普通 / 1 会签（issues/52 E24 落库对齐 Java）
 
         建单不变量（issues/121 P1）：必写 parentTaskId（发起 execution 无当前任务⇒0）
-        与行级 isFirstTaskNode。二者无默认值，漏传即 TypeError，不留静默路径。"""
+        与行级 isFirstTaskNode。二者无默认值，漏传即 TypeError，不留静默路径。
+
+        ``actor=""`` ⇒ **空参与者集合**（issues/142 §5.3 / spec 02 §6.1 硬结论 1：任务类零参与者
+        照样建单但行上不挂人）。这里不收空串是刻意的：``[""]`` 会往 ``wf_process_task_actor``
+        灌一条空 ``actor_id`` 归属值，正是 issues/142 B 表点名那族垃圾形状（五种空值形态之一），
+        而"零参与者"要的是**一条 actor 行都不写**。"""
         task = ProcessTask(id=task_id, processInstanceId=self.id,
                            taskName=task_name, displayName=display_name,
-                           taskState=TaskState.DOING, actorIds=[actor],
+                           taskState=TaskState.DOING, actorIds=[actor] if actor else [],
                            formKey=form_key, performType=perform_type,
                            parentTaskId=parent_task_id,
                            createTime=now, updateTime=now,

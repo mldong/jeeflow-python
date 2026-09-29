@@ -100,6 +100,15 @@ async def raw_count(adapter, sql, args=()):
         await adapter.release(conn)
 
 
+async def raw_rows(adapter, sql, args=()):
+    """直查数据库多行取证（issues/141 G2 的①②③档要看原行 id/state/时间，单行 raw_count 照不出）"""
+    conn = await adapter.acquire()
+    try:
+        return await conn.fetchall(sql_of(adapter, sql), args)
+    finally:
+        await adapter.release(conn)
+
+
 async def apply_schema(adapter):
     """执行本仓 tests/schema/schema-<db>.sql 建表（IF NOT EXISTS，幂等）"""
     path = os.path.join(SCHEMA_DIR, f"schema-{DB}.sql")
@@ -443,6 +452,110 @@ async def main():
               ccrows[0].defineName if ccrows else "EMPTY")
         cc2, cc2total = await repo.page_cc_instances(1, 10, "nobody")
         check("page_cc_instances 非抄送人空", cc2total == 0 and len(cc2) == 0, f"total={cc2total}")
+
+        # ── ⑩.6 issues/141 G1＋G2：抄送分页归属必填 ＋ cc 写侧判重＝幂等空操作（真库一路）──
+        # 判据与 T0 的 tests/spec_test.py「Test 141 G1＋G2」逐字同一条：同一栈的 SQL 仓与内存仓
+        # 必须给同一个答案（spec 06-facade.md §2.5，issues/117 场景 27 那把尺子），
+        # 而 G2 的四档（①不新增行 ②不重置未读 ③不刷原行时间 ④不发码 4）里①②③要在
+        # **裸写入口 create_cc_instance** 上照——走漏斗时 SPI default 已把子集算好，
+        # 摘掉仓储里的判重照样绿（本轮实测踩过这个洞）。④那一档由 T0 的漏斗格钉（真库不重跑事件腿）。
+        from datetime import datetime as _dt141
+        from jeeflow.model import ProcessInstance as _PI141
+        cc141_a, cc141_b = DEFINE_ID + 7, DEFINE_ID + 8          # 独立实例 id 段（defineId 挂 DEFINE_ID，随 cleanup 清）
+        cc141_now = _dt141.now()
+        for _iid, _biz, _actor in ((cc141_a, "I141-MINE", "i141user1"),
+                                   (cc141_b, "I141-THEIRS", "i141user2")):
+            await repo.save_instance(_PI141(
+                id=_iid, defineId=DEFINE_ID, state=InstanceState.DOING, operator="zhangsan",
+                businessNo=_biz, variables={}, createTime=cc141_now, updateTime=cc141_now,
+                createUser="py-test", updateUser="py-test"))
+            await repo.create_cc_instance(_iid, "zhangsan", _actor)
+
+        _cc_sql = ("SELECT id, actor_id, state, create_time, update_time FROM wf_process_cc_instance"
+                   " WHERE process_instance_id = ? AND actor_id = ? ORDER BY id")
+
+        # G1：归属条件必填——缺条件/空值三形 ⇒ 空页；只给条件形 ⇒ 命中（改前这一格是红的：
+        # 旧代码恒拼 `WHERE cc.actor_id = ?` 绑 None ⇒ `= NULL` 恒不命中，与内存仓两个答案）
+        _rows141, _t141 = await repo.page_cc_instances(1, 10, None)
+        check("⑩.6 G1 缺归属条件 ⇒ 空页", _t141 == 0 and len(_rows141) == 0, f"total={_t141}")
+        _rows141, _t141 = await repo.page_cc_instances(1, 10)
+        check("⑩.6 G1 整条查询不带归属 ⇒ 空页", _t141 == 0 and len(_rows141) == 0, f"total={_t141}")
+        for _blank in ("", "   "):
+            _rows141, _t141 = await repo.page_cc_instances(1, 10, _blank)
+            check(f"⑩.6 G1 空值入参 {_blank!r} ⇒ 空页", _t141 == 0 and len(_rows141) == 0, f"total={_t141}")
+        _rows141, _t141 = await repo.page_cc_instances(
+            1, 10, None, [QueryCondition("cc.actor_id", "EQ", None)])
+        check("⑩.6 G1 条件 EQ None ⇒ 空页", _t141 == 0 and len(_rows141) == 0, f"total={_t141}")
+        _rows141, _t141 = await repo.page_cc_instances(
+            1, 10, None, [QueryCondition("cc.actor_id", "IN", [])])
+        check("⑩.6 G1 条件 IN 空集合 ⇒ 空页", _t141 == 0 and len(_rows141) == 0, f"total={_t141}")
+        _rows141, _t141 = await repo.page_cc_instances(
+            1, 10, None, [QueryCondition("cc.actor_id", "EQ", "i141user1")])
+        check("⑩.6 G1 只给条件形（不给入参）⇒ 命中 1 行＝与内存仓同答案",
+              _t141 == 1 and len(_rows141) == 1 and _rows141[0].id == cc141_a,
+              f"total={_t141} ids={[x.id for x in _rows141]}")
+        _rows141, _t141 = await repo.page_cc_instances(
+            1, 10, "i141user1", [QueryCondition("t.business_no", "LIKE", "")])
+        check("⑩.6 G1 非归属列空值仍按没填忽略（可选过滤不许一起收掉）",
+              _t141 == 1 and len(_rows141) == 1, f"total={_t141}")
+        _rows141, _t141 = await repo.page_cc_instances(
+            1, 10, "i141user1", [QueryCondition("t.business_no", "LIKE", "NO-SUCH")])
+        check("⑩.6 G1 非归属列真值仍生效（上一格不是假绿）",
+              _t141 == 0 and len(_rows141) == 0, f"total={_t141}")
+
+        # G2①＋同调用折叠：裸写入口重复给同一个人 ⇒ 仍是 1 行、原行 id 不变（没有删旧插新）
+        _before = await raw_rows(adapter, _cc_sql, [cc141_a, "i141user1"])
+        await repo.create_cc_instance(cc141_a, "zhangsan", "i141user1", "i141user1")
+        _after = await raw_rows(adapter, _cc_sql, [cc141_a, "i141user1"])
+        check("⑩.6 G2 ①重复抄送不新增行（同一次调用内的重复也只落一行）",
+              len(_before) == 1 and len(_after) == 1 and _after[0][0] == _before[0][0],
+              f"before={_before} after={_after}")
+        check("⑩.6 G2 ③原行 create_time/update_time 逐字不变（不碰 UPDATE、不重插）",
+              _after and _after[0][3] == _before[0][3] and _after[0][4] == _before[0][4],
+              f"{_before[0][3:]} → {_after[0][3:] if _after else None}")
+
+        # G2②＋③（已读档）：真 SQL 置读 state=1 后重复抄送，既不许抹回未读也不许刷时间
+        await repo.update_cc_status(cc141_a, "i141user1")
+        _read = await raw_rows(adapter, _cc_sql, [cc141_a, "i141user1"])
+        check("⑩.6 G2 置读后 state=1（取证基线）", _read[0][2] == 1, f"row={_read}")
+        await repo.create_cc_instance(cc141_a, "zhangsan", "i141user1")
+        _read2 = await raw_rows(adapter, _cc_sql, [cc141_a, "i141user1"])
+        check("⑩.6 G2 ②重复抄送不把已读抹回未读（也不冒出第二行未读盖住它）",
+              len(_read2) == 1 and _read2[0][2] == 1, f"row={_read2}")
+        check("⑩.6 G2 ③已读行被重复抄送时 update_time 不被刷",
+              _read2[0][4] == _read[0][4], f"{_read[0][4]} → {_read2[0][4]}")
+
+        # G2 子集返回：已知人剔掉、新人留下、同调用重复折叠 ⇒ 漏斗据此只 fire 这一支
+        _fresh = await repo.create_cc_instance_if_absent(
+            cc141_a, "zhangsan", ["i141user1", "i141user2", "i141new", "i141new"])
+        _cnt_a = int(await raw_count(adapter,
+            "SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ?", [cc141_a]))
+        _actors_a = sorted(await repo.find_cc_actor_ids(cc141_a))
+        _actors_b = await repo.find_cc_actor_ids(cc141_b)
+        _cnt_b = int(await raw_count(adapter,
+            "SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ?", [cc141_b]))
+        check("⑩.6 G2 create_cc_instance_if_absent 返回实际新建子集",
+              _fresh == ["i141user2", "i141new"], f"created={_fresh}")
+        check("⑩.6 G2 子集只落对应的那些行（cc141_a 共 3 行）", _cnt_a == 3, f"count={_cnt_a}")
+        check("⑩.6 G2 find_cc_actor_ids 读侧＝库里的真行集",
+              _actors_a == ["i141new", "i141user1", "i141user2"], f"actors={_actors_a}")
+        check("⑩.6 G2 判重作用域按实例不按全局（cc141_b 上同一个人照旧只有它自己那一行）",
+              _actors_b == ["i141user2"] and _cnt_b == 1, f"b={_actors_b}/{_cnt_b}")
+        _actors_none = await repo.find_cc_actor_ids(9_999_999_999)
+        check("⑩.6 G2 空实例读侧为空集", _actors_none == [], f"{_actors_none}")
+        # 全重复 ⇒ 子集空（漏斗据此整支不发码 4）
+        _again = await repo.create_cc_instance_if_absent(cc141_a, "zhangsan", ["i141user1", "i141new"])
+        check("⑩.6 G2 全重复时子集为空（④不发码 4 的依据）", _again == [], f"created={_again}")
+
+        # 本轮取证行按实例 id 清干净（零残留；实例行由收尾的 cleanup 按 define_id 兜）
+        conn = await adapter.acquire()
+        try:
+            for _iid in (cc141_a, cc141_b):
+                await conn.execute(
+                    sql_of(adapter, "DELETE FROM wf_process_cc_instance WHERE process_instance_id = ?"),
+                    [_iid])
+        finally:
+            await adapter.release(conn)
 
         # ── ⑪ find_define_by_name（v1.1.0 deploy 版本管理用）──
         latest = await repo.find_define_by_name("py-simple")

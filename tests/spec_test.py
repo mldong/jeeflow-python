@@ -18,7 +18,7 @@ from jeeflow.surrogate import (NullSurrogateApplier, hydrate_enabled, surrogate_
 from jeeflow.model import (ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance,
                            ProcessSurrogate, ProcessTask, TaskState, InstanceState, UserInfo,
                            parse_flow_model)
-from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator
+from jeeflow.spi import UserProvider, IDGenerator, ExpressionEvaluator, QueryCondition, ProcessRepository
 
 import flows_resolver
 FLOW_DIR = flows_resolver.dir()
@@ -5417,4 +5417,679 @@ async def test_i137b_create_task_with_actors_applies_surrogate_and_fires_task_st
         f"直调的码 3 必须落在它自己新建的那行上: {last}"
     assert list(last.actors) == direct_actors, \
         f"码 3 载荷 actors 取落库那份（含代理人）: {last.actors}"
+
+
+# ═══ Test 141 G1＋G2：抄送分页归属条件必填 ＋ cc 写侧判重＝幂等空操作 ═══════════════
+#
+# 立法逐字依据（jeeflow-doc/docs/spec）：
+# · **06-facade.md §2.5「抄送分页同一条尺子」**（issues/141 G1 · 2026-09-29 owner 拍）：
+#   `pageCcInstances` 这类"抄送我"取数入口，归属条件（`cc.actor_id`）**必填**——条件缺失或为空值时
+#   **返回空页**，不得退化成"这条不加"而返回全部实例；这条义务要**同时钉在 SQL 仓与内存仓**上
+#   （同一栈两仓必须同答案＝issues/117 场景 27 那把尺子），只修一边不算修完。
+# · **06-facade.md §4「写侧判重＝幂等空操作」**（issues/141 G2 · owner 拍）：同一 `(实例, 被抄送人)`
+#   已存在 cc 行时再次抄送 ⇒ ①不新增行 ②不重置未读状态（state）③不更新原行时间
+#   ④**不 fire CC_CREATE（码 4）**（11-events.md §11.2 原则 1「码值表达发生了什么事实」）。
+#   逐人 fire 的入参＝**实际新建的子集**，子集为空整支不发。判重在写侧：查询侧不引入 `DISTINCT`、
+#   历史重复行不清理（owner 拍为接受既成事实）。
+# · 形状基准＝jeeflow-java 本地 commit `3d1fc98`（`CcPageOwnershipTest`／`CcWriteIdempotentTest`／
+#   `JdbcCcOwnershipIdempotentTest`）——同一套判据表在本栈**内存仓与 SQL 仓各钉一遍**。
+#
+# 本栈与 java 的一处形状差（不是判据差）：java 的归属只有 `PageQuery.conditions` 一形，本栈
+# `page_cc_instances` 多一个**专用入参 `actor_id`**（门面 ccList 走的就是它）。两形任一给了有效值
+# 即"归属条件齐了"，两形都没给才算缺——`_has_cc_ownership` 里两仓同判据。
+
+_CC141_TABLE_DDL = (
+    # 本案 SQL 仓一路用到的三张表（列名逐字对齐 tests/schema/schema-mysql.sql 与 base.py 的 SQL）；
+    # 形状照 _surrogate_sql_ext 的先例：真 SQLite ＋ 真 JdbcRepository，不用内存假仓。
+    "CREATE TABLE wf_process_define (id INTEGER PRIMARY KEY, name TEXT, display_name TEXT,"
+    " type TEXT, state INTEGER, content TEXT, version INTEGER, create_time TEXT, create_user TEXT,"
+    " update_time TEXT, update_user TEXT)",
+    "CREATE TABLE wf_process_instance (id INTEGER PRIMARY KEY, parent_id INTEGER,"
+    " process_define_id INTEGER, state INTEGER, parent_node_name TEXT, business_no TEXT,"
+    " operator TEXT, expire_time TEXT, variable TEXT, create_time TEXT, create_user TEXT,"
+    " update_time TEXT, update_user TEXT)",
+    "CREATE TABLE wf_process_cc_instance (id INTEGER PRIMARY KEY, process_instance_id INTEGER,"
+    " actor_id TEXT, state INTEGER, create_time TEXT, create_user TEXT, update_time TEXT,"
+    " update_user TEXT)",
+)
+
+
+def _cc141_sql_repo():
+    """真 SQLite ＋ 真 `JdbcRepository`——G1/G2 的 SQL 仓一路在 **T0** 就得钉住（只钉内存仓
+    ＝spec 06 §2.5 明写的"只修一边不算修完"），T1 那一路见 tests/jdbc_test.py 的 ⑩.6 段。"""
+    from jeeflow.repository.base import JdbcRepository
+    raw = sqlite3.connect(":memory:")
+    for ddl in _CC141_TABLE_DDL:
+        raw.execute(ddl)
+    return raw, JdbcRepository(_SqliteAdapter(raw), _TestIDGen())
+
+
+def _cc141_cc_rows(raw, instance_id, actor_id=None):
+    """cc 表取证：某实例（可指定人）的真实行 [id, actor_id, state, create_time, update_time]。"""
+    sql = ("SELECT id, actor_id, state, create_time, update_time FROM wf_process_cc_instance"
+           " WHERE process_instance_id=?")
+    args: list = [instance_id]
+    if actor_id is not None:
+        sql += " AND actor_id=?"
+        args.append(actor_id)
+    return raw.execute(sql + " ORDER BY id", tuple(args)).fetchall()
+
+
+async def _cc141_seed(repo, pairs, *, sql_repo: bool, define_name: str = "i141"):
+    """两仓共用的灌数据姿势：每对 (抄送人, business_no) 一条实例 ＋ 一行 cc，**直连仓储写侧**
+    （把判据钉在"分页/写侧"上而不是抄送流程上）。business_no 一律给非空值——空值列在 SQL 三值逻辑里
+    是"恒不命中"档，会让"非归属列空值仍被忽略"那一格在两仓各说各话（java 同款留档）。"""
+    now = datetime.now()
+    if sql_repo:
+        d = ProcessDefine(name=define_name, displayName="抄送归属流程", type="test", state=1,
+                          version=1, content="{}", createUser="zhangsan", updateUser="zhangsan")
+        await repo.save_define(d)
+    else:
+        d = ProcessDefine(name=define_name, displayName="抄送归属流程", type="test", state=1,
+                          version=1, content="{}")
+        repo.add_define(d)
+    mine = None
+    for idx, (actor, biz) in enumerate(pairs):
+        iid = 9_410_000 + idx if sql_repo else 0     # SQL 仓显式 id；内存仓交给自增序列
+        inst = ProcessInstance(id=iid, defineId=d.id, state=InstanceState.DOING, operator="zhangsan",
+                               businessNo=biz, variables={}, createTime=now, updateTime=now,
+                               createUser="zhangsan", updateUser="zhangsan")
+        await repo.save_instance(inst)
+        await repo.create_cc_instance(inst.id, "zhangsan", actor)
+        if actor == "user1":
+            mine = inst.id
+    return d.id, mine
+
+
+# 判据表（spec 06 §2.5 的 G1 那一套）：标签 / actor_id 入参 / conditions / 契约答案行数。
+# ⚠️ 表里**故意没有** "cc.actor_id IN 非空集合（不给入参）"这一格：内存仓的 IN 分支按**标量列**
+# 语义实现（`str(v) not in [...]`，v 是集合时永不命中），SQL 仓则拼真 `IN (...)`——那是 issues/05-5
+# 通用条件匹配的既有分叉（java 内存仓同样分叉），不属 G1 的范围，本案不新增依赖它的断言。
+_CC141_G1_TABLE = (
+    ("正向对照：归属入参给有效值 ⇒ 只出我的那一行", "user1", None, 1),
+    ("缺条件：入参 None 且一条条件都不给 ⇒ 空页", None, [], 0),
+    ("空串入参 ⇒ 空页（issues/129 那一档，G1 后同判据）", "", [], 0),
+    ("全空白入参与空串同档 ⇒ 空页", "   ", [], 0),
+    ("整条查询都不带（默认参数）⇒ 空页", None, None, 0),
+    ("条件形给有效值（入参不给）⇒ 命中，两仓同答案", None,
+     [QueryCondition("cc.actor_id", "EQ", "user1")], 1),
+    ("条件形 EQ 空串 ⇒ 空页", None, [QueryCondition("cc.actor_id", "EQ", "")], 0),
+    ("条件形 EQ 全空白 ⇒ 空页", None, [QueryCondition("cc.actor_id", "EQ", "   ")], 0),
+    ("条件形 EQ None ⇒ 空页", None, [QueryCondition("cc.actor_id", "EQ", None)], 0),
+    ("条件形 IN 空集合 ⇒ 空页（空集＝没有人）", None,
+     [QueryCondition("cc.actor_id", "IN", [])], 0),
+    ("归属有效 ＋ 非归属列空值 ⇒ 空值仍按没填忽略", "user1",
+     [QueryCondition("t.business_no", "LIKE", "")], 1),
+)
+
+_CC141_G1_PAIRS = [("user1", "I141-MINE"), ("user2", "I141-THEIRS")]
+
+
+@pytest.mark.asyncio
+async def test_i141_g1_memory_cc_page_requires_ownership_condition():
+    """G1（内存仓）：`page_cc_instances` 归属条件必填，缺则空页。
+
+    改前的红格是"缺条件/整条不带"那两档——本仓旧形状只放"有 cc 行的实例"，`actor_id=None`
+    时把它们**全部**放出（旧代码 `if _ownership_blank(actor_id)` 只收空串，None 被当成
+    "本次不带归属过滤"）。SQL 仓一路见下一格，两仓逐格比对见 `..._two_repos_same_answer`。
+    """
+    repo = MemoryRepository()
+    _, mine = await _cc141_seed(repo, _CC141_G1_PAIRS, sql_repo=False)
+    assert mine, "夹具应能读出 user1 那条实例 id"
+
+    rows, total = await repo.page_cc_instances(1, 50, "user1")
+    assert (len(rows), total) == (1, 1), f"带归属条件应只出我的那 1 条: {len(rows)}/{total}"
+    assert rows[0].id == mine, f"命中的应是我的实例: {rows[0].id} != {mine}"
+    assert rows[0].businessNo == "I141-MINE", rows[0].businessNo
+
+    for tag, args in (("零条件 + 空 conditions", (1, 50, None, [])),
+                      ("整条查询都不带默认参数", (1, 10))):
+        rows, total = await repo.page_cc_instances(*args)
+        assert (len(rows), total) == (0, 0), f"{tag}：缺归属条件必须返回空页: {len(rows)}/{total}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g1_memory_cc_page_blank_and_non_ownership_rows():
+    """G1（内存仓）：空值三形＋空 IN 与"整条没给"同档；**非归属列**的空值放行不许一起收掉。
+
+    改前在这一格红：条件形 `cc.actor_id EQ None`——内存仓的 `_match_conditions` 对 `expect is None`
+    是"整条跳过"（放行），旧归属判据又只收空串 ⇒ `actor_id=None` ＋空值条件把两条实例全放出。
+    其余空值档（入参 ""/"   "/条件 ""/"   "/IN 空集）旧代码碰巧也给 0，G1 后一律走同一条短路。
+    """
+    repo = MemoryRepository()
+    await _cc141_seed(repo, _CC141_G1_PAIRS, sql_repo=False)
+
+    for blank in ("", "   ", "\t\n"):
+        rows, total = await repo.page_cc_instances(1, 50, blank)
+        assert (len(rows), total) == (0, 0), f"空串档应空页: {blank!r} → {len(rows)}/{total}"
+    for conds in ([QueryCondition("cc.actor_id", "EQ", "")],
+                  [QueryCondition("cc.actor_id", "EQ", "   ")],
+                  [QueryCondition("cc.actor_id", "EQ", None)],
+                  [QueryCondition("cc.actor_id", "IN", [])]):
+        rows, total = await repo.page_cc_instances(1, 50, None, conds)
+        assert (len(rows), total) == (0, 0), f"空值条件档应空页: {conds} → {len(rows)}/{total}"
+
+    # 改动面哨兵：只收归属谓词。非归属列（m_LIKE_business_no 这类可选过滤）传空串仍按"没填"忽略
+    rows, total = await repo.page_cc_instances(
+        1, 50, "user1", [QueryCondition("t.business_no", "LIKE", "")])
+    assert (len(rows), total) == (1, 1), f"非归属列空值仍应被忽略: {len(rows)}/{total}"
+    # 反向：非归属列给了**真值**时照旧生效（证明上面那格不是"条件全被忽略"的假绿）
+    rows, total = await repo.page_cc_instances(
+        1, 50, "user1", [QueryCondition("t.business_no", "LIKE", "NO-SUCH")])
+    assert (len(rows), total) == (0, 0), f"非归属列真值仍应过滤: {len(rows)}/{total}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g1_sql_cc_page_requires_ownership_condition():
+    """G1（SQL 仓，真 SQLite）：同一套判据表逐格钉一遍。
+
+    改前的红格是**条件形**那一档：旧代码无条件拼 `WHERE cc.actor_id = ?` 并绑定 `actor_id` 入参，
+    入参为 None 时那句是 `cc.actor_id = NULL`（SQL 三值逻辑恒不命中）⇒ 明明给了合法的
+    `cc.actor_id EQ 'user1'` 条件也返 0 行，而内存仓返 1 行——两仓两个答案，正是本条要收的。
+    "缺条件"档旧代码碰巧也返 0（因为同一句 NULL），G1 后由显式短路给同一答案，不再依赖 NULL 巧合。
+    """
+    raw, repo = _cc141_sql_repo()
+    _, mine = await _cc141_seed(repo, _CC141_G1_PAIRS, sql_repo=True)
+
+    rows, total = await repo.page_cc_instances(1, 50, "user1")
+    assert (len(rows), total) == (1, 1), f"带归属入参应只出我的那 1 条: {len(rows)}/{total}"
+    assert rows[0].id == mine, (rows[0].id, mine)
+    assert rows[0].defineName == "i141", rows[0].defineName   # join 定义列照旧在
+
+    rows, total = await repo.page_cc_instances(1, 50, None,
+                                               [QueryCondition("cc.actor_id", "EQ", "user1")])
+    assert (len(rows), total) == (1, 1), f"条件形同样应命中: {len(rows)}/{total}"
+
+    rows, total = await repo.page_cc_instances(1, 50)
+    assert (len(rows), total) == (0, 0), f"缺归属条件必须空页: {len(rows)}/{total}"
+    rows, total = await repo.page_cc_instances(1, 50, None, [])
+    assert (len(rows), total) == (0, 0), f"空 conditions 同样空页: {len(rows)}/{total}"
+    # 短路必须真的短路：库里两条实例都在，缺条件时连 SQL 都不该放出行（不是靠 NULL 巧合）
+    n_inst = raw.execute("SELECT COUNT(*) FROM wf_process_instance").fetchone()[0]
+    assert n_inst == 2, f"夹具应真有 2 条实例: {n_inst}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g1_sql_cc_page_blank_and_non_ownership_rows():
+    """G1（SQL 仓）：空值三形＋空 IN ⇒ 空页；非归属列空值仍按没填忽略。
+
+    改前在这一格红：末尾那格"只给条件形＋非归属列空值"——恒绑的 `WHERE cc.actor_id = ?`（None ⇒
+    `= NULL`）把合法的 `cc.actor_id EQ 'user1'` 折成 0 行，与内存仓的 1 行分叉。
+    """
+    _raw, repo = _cc141_sql_repo()
+    await _cc141_seed(repo, _CC141_G1_PAIRS, sql_repo=True)
+
+    for blank in ("", "   ", "\t\n"):
+        rows, total = await repo.page_cc_instances(1, 50, blank)
+        assert (len(rows), total) == (0, 0), f"空串档应空页: {blank!r} → {len(rows)}/{total}"
+    for conds in ([QueryCondition("cc.actor_id", "EQ", "")],
+                  [QueryCondition("cc.actor_id", "EQ", "   ")],
+                  [QueryCondition("cc.actor_id", "EQ", None)],
+                  [QueryCondition("cc.actor_id", "IN", [])]):
+        rows, total = await repo.page_cc_instances(1, 50, None, conds)
+        assert (len(rows), total) == (0, 0), f"空值条件档应空页: {conds} → {len(rows)}/{total}"
+
+    rows, total = await repo.page_cc_instances(
+        1, 50, "user1", [QueryCondition("t.business_no", "LIKE", "")])
+    assert (len(rows), total) == (1, 1), f"非归属列空值仍应被忽略: {len(rows)}/{total}"
+    rows, total = await repo.page_cc_instances(
+        1, 50, None, [QueryCondition("cc.actor_id", "EQ", "user1"),
+                      QueryCondition("t.business_no", "LIKE", "")])
+    assert (len(rows), total) == (1, 1), f"条件形＋可选空值同样应命中: {len(rows)}/{total}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g1_cc_page_two_repos_same_answer():
+    """G1 的**两仓同答案**那一半：同一份数据、同一张判据表，SQL 仓与内存仓逐格读数必须相等。
+
+    只钉一边不算修完（spec 06 §2.5 原话），而"各自都绿"也不等于"两边一致"——本格把整张表喂给
+    两仓后逐格比 rows/total，再逐格比契约期望值（两个方向都钉，任一侧单独漂就红）。
+    """
+    mem = MemoryRepository()
+    await _cc141_seed(mem, _CC141_G1_PAIRS, sql_repo=False, define_name="i141")
+    _raw, sql = _cc141_sql_repo()
+    await _cc141_seed(sql, _CC141_G1_PAIRS, sql_repo=True, define_name="i141")
+
+    for label, actor_id, conds, want in _CC141_G1_TABLE:
+        m_rows, m_total = await mem.page_cc_instances(1, 50, actor_id, conds)
+        s_rows, s_total = await sql.page_cc_instances(1, 50, actor_id, conds)
+        assert (m_total, s_total) == (want, want), f"{label}：契约期望 {want} 行，实得 内存 {m_total} / SQL {s_total}"
+        assert len(m_rows) == len(s_rows) == want, f"{label}：rows 数与 total 同口径，实得 内存 {len(m_rows)} / SQL {len(s_rows)}"
+        assert sorted(r.businessNo for r in m_rows) == sorted(r.businessNo for r in s_rows), \
+            f"{label}：两仓命中的必须是同一批实例（按 businessNo 比，两仓各用自己的 id 段）"
+
+
+@pytest.mark.asyncio
+async def test_i141_g1_facade_cc_list_still_passes_through_facade():
+    """改动面哨兵：门面 ccList 恒挂归属条件（`_operator_arg` 归一 → actor_id 入参），
+    G1 的收紧不该让这个出口少一行；缺键/空串档照旧回落 demo 缺省 user1（issues/129 第一层）。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    define_id = await _deploy(facade, "01-simple.json")
+    iid = await _start(facade, define_id, "zhangsan")
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": iid, "operator": "zhangsan", "actorIds": ["user1"]})
+    assert r["code"] == 0, r
+
+    for args in ({"operator": "user1"}, {"operator": ""}, {"operator": "   "}, {}):
+        r = await facade.flow("processInstance/ccList", args)
+        assert r["code"] == 0, (args, r)
+        assert len(r["data"]["rows"]) == 1, f"门面 ccList 应恒出 1 行（缺省回落 user1）: {args} {r['data']}"
+    r = await facade.flow("processInstance/ccList", {"operator": "nobody"})
+    assert r["code"] == 0 and len(r["data"]["rows"]) == 0, r
+
+
+# ── G2 夹具 ────────────────────────────────────────────────────────────────────
+
+def _cc141_tick():
+    """让"原行时间被刷新"与"没被刷新"在断言上分得开（datetime.now 逐次取值，留 10ms 余量）。"""
+    import time
+    time.sleep(0.01)
+
+
+def _cc141_harness(repo=None):
+    """引擎＋门面＋事件 sink：sink 只收 CC_CREATE(4)，"重复抄送没有新事件"就断在这里。"""
+    if repo is None:
+        repo = MemoryRepository()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen(), _TestExprEval())
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    cc_events: list = []
+    eng.set_extensions(EngineExtensions(event_listeners=[
+        lambda evt: cc_events.append(evt) if evt.type is EventType.CC_CREATE else None]))
+    return eng, repo, facade, cc_events
+
+
+async def _cc141_manual(facade, iid, *actors):
+    """门面手动腿 processInstance/createCCInstance（三条入口之一）。"""
+    r = await facade.flow("processInstance/createCCInstance",
+                          {"processInstanceId": iid, "operator": "zhangsan",
+                           "actorIds": list(actors)})
+    assert r["code"] == 0, r
+    return r
+
+
+async def _cc141_started(facade, **flow_args):
+    """01-simple 走 startAndExecute（申请节点自动办结 ⇒ 停在 task1），返回 (define_id, 实例 id)。"""
+    define_id = await _deploy(facade, "01-simple.json")
+    r = await facade.flow("processInstance/startAndExecute",
+                          {"processDefineId": define_id, "operator": "zhangsan", **flow_args})
+    assert r["code"] == 0, r
+    return define_id, int(r["data"]["processInstanceId"])
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_memory_first_cc_creates_rows_and_fires_per_actor():
+    """正向对照（首轮该发的还是要发）：全新的一次抄送照旧逐人建行、逐人 fire 码 4、新行未读。
+
+    摘掉 G2 的那一支（`create_cc_instance_if_absent` 换成旧的 `create_cc_instance`）本格不该红；
+    把子集 fire 写成"整支不发"也会在这里红——它钉的是"判重不许把首轮吃掉"。
+    """
+    _eng, repo, facade, cc_events = _cc141_harness()
+    _define_id, iid = await _cc141_started(facade)
+    cc_events.clear()
+    _cc141_tick()
+
+    await _cc141_manual(facade, iid, "6101", "6102")
+
+    assert await repo.find_cc_actor_ids(iid) == ["6101", "6102"], \
+        "全新抄送应逐人落行（顺序与入参一致）"
+    assert [e.ccActorId for e in cc_events] == ["6101", "6102"], \
+        f"全新抄送应逐人 fire 码 4: {[e.ccActorId for e in cc_events]}"
+    assert all(e.instanceId == iid for e in cc_events), [e.instanceId for e in cc_events]
+    rows = repo.cc_rows_for_test(iid)
+    assert [str(r) for r in rows] == ["6101", "6102"], rows
+    assert all(r.state == 0 for r in rows), f"新建行应一律未读: {[(str(r), r.state) for r in rows]}"
+    assert all(r.create_time is not None and r.update_time is not None for r in rows), rows
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_memory_repeat_cc_adds_no_row_and_fires_nothing():
+    """①不新增行 ＋ ④不 fire 码 4：手动腿连发两次同一个人。
+
+    改前红在④：引擎旧代码 `create_cc_instance(...)` 后**无条件**按原始入参全量 fire
+    （spec §11.2 原则 1「码=事实」被破——重复抄送根本没发生"创建"）。
+    """
+    _eng, repo, facade, cc_events = _cc141_harness()
+    _define_id, iid = await _cc141_started(facade)
+    await _cc141_manual(facade, iid, "6201")
+    assert await repo.find_cc_actor_ids(iid) == ["6201"], "首次抄送落 1 行"
+    assert len(cc_events) == 1, f"首次抄送 fire 1 次: {len(cc_events)}"
+
+    cc_events.clear()
+    _cc141_tick()
+    await _cc141_manual(facade, iid, "6201")
+
+    created = await repo.create_cc_instance_if_absent(iid, "zhangsan", ["6201"])
+    assert created == [], f"重复抄送的实际新建子集应为空: {created}"
+    assert await repo.find_cc_actor_ids(iid) == ["6201"], "①重复抄送不得新增行"
+    assert len(repo.cc_rows_for_test(iid)) == 1, "①重复抄送后行数仍是 1"
+    assert cc_events == [], "④没发生创建就不得发码 4（spec 11.2 原则 1「码=事实」）"
+
+    # 仓储侧自己也要顶住：绕过漏斗**裸调** create_cc_instance 同样不得新增行
+    await repo.create_cc_instance(iid, "zhangsan", "6201")
+    assert len(repo.cc_rows_for_test(iid)) == 1, \
+        f"①判重写在仓储写侧，裸调也不许多出一行: {repo.cc_rows_for_test(iid)}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_memory_repeat_cc_does_not_reset_unread():
+    """②不重置未读：置已读后重复抄送，state 必须仍是已读（owner 明确"不需要重置"）。
+
+    本档在 G2 之前**照不出来**：内存仓旧 `update_cc_status` 是 `pass`、cc 只存 actor id 串，
+    既没有 state 也没有时间——java 为同一理由把它的内存仓升级成行模型，本仓同理。
+    判据的"假修"对照面是把判重写成 upsert（重置 state），见本仓报告里的还原读数。
+    """
+    _eng, repo, facade, _events = _cc141_harness()
+    _define_id, iid = await _cc141_started(facade)
+    await _cc141_manual(facade, iid, "6301")
+    r = await facade.flow("processInstance/updateCCStatus",
+                          {"processInstanceId": iid, "operator": "6301"})
+    assert r["code"] == 0, r
+    assert repo.cc_rows_for_test(iid)[0].state == 1, "置读后 state 应为 1（内存仓与 SQL 仓同语义）"
+
+    _cc141_tick()
+    await _cc141_manual(facade, iid, "6301")
+
+    rows = repo.cc_rows_for_test(iid)
+    assert len(rows) == 1 and str(rows[0]) == "6301", f"①不新增行（也不该冒出第二行盖住已读行）: {rows}"
+    assert rows[0].state == 1, f"②重复抄送不得把已读抹回未读: {rows[0].state}"
+
+    # 绕过漏斗裸调仓储写入口：同一判据必须同样成立（判重写在仓储，不是只写在子集计算里）
+    _cc141_tick()
+    await repo.create_cc_instance(iid, "zhangsan", "6301")
+    rows = repo.cc_rows_for_test(iid)
+    assert len(rows) == 1, f"②裸调也不许多出行: {rows}"
+    assert rows[0].state == 1, f"②裸调不得把已读抹回未读: {rows[0].state}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_memory_repeat_cc_does_not_touch_row_times():
+    """③不更新原行时间：create_time/update_time 逐字不变（跳过式判重不走 UPDATE、也不删旧插新）。"""
+    _eng, repo, facade, _events = _cc141_harness()
+    _define_id, iid = await _cc141_started(facade)
+    await _cc141_manual(facade, iid, "6401")
+    before = repo.cc_rows_for_test(iid)[0]
+    create_time, update_time, row_id = before.create_time, before.update_time, id(before)
+    assert create_time is not None
+
+    _cc141_tick()
+    await _cc141_manual(facade, iid, "6401")
+
+    after = repo.cc_rows_for_test(iid)[0]
+    assert id(after) == row_id, "③原行必须还是那一行（没有删旧插新）"
+    assert after.create_time == create_time, f"③不得刷新原行 create_time: {after.create_time}"
+    assert after.update_time == update_time, f"③不得刷新原行 update_time: {after.update_time}"
+
+    # 绕过漏斗裸调仓储写入口：时间照旧逐字不变
+    _cc141_tick()
+    await repo.create_cc_instance(iid, "zhangsan", "6401")
+    bare = repo.cc_rows_for_test(iid)[0]
+    assert (bare.create_time, bare.update_time) == (create_time, update_time),         f"③裸调重复抄送不得刷时间: {(create_time, update_time)} → {(bare.create_time, bare.update_time)}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_memory_repeat_cc_fires_only_new_subset():
+    """④的子集档：第二次给「已知人＋新人」⇒ 只为新人建行、只为新人 fire（入参＝实际新建子集）。
+
+    改前红在这里：旧代码把**原始请求**（6501,6503）整个拿去 fire，
+    6501 一行都没新建却收到码 4——"一行一事件"的粒度被破（spec §11.3 码 4）。
+    """
+    _eng, repo, facade, cc_events = _cc141_harness()
+    _define_id, iid = await _cc141_started(facade)
+    await _cc141_manual(facade, iid, "6501", "6502")
+    assert await repo.find_cc_actor_ids(iid) == ["6501", "6502"], "首轮 2 行"
+    assert len(cc_events) == 2, f"首轮 fire 2 次: {len(cc_events)}"
+
+    cc_events.clear()
+    _cc141_tick()
+    await _cc141_manual(facade, iid, "6501", "6503")
+
+    assert [e.ccActorId for e in cc_events] == ["6503"], \
+        f"逐人 fire 的入参应是实际新建的子集: {[e.ccActorId for e in cc_events]}"
+    assert await repo.find_cc_actor_ids(iid) == ["6501", "6502", "6503"], "实际新建的 cc 行也只有那一行"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_memory_duplicate_within_one_call_collapses():
+    """同一次调用里重复给同一个人 ⇒ 也按幂等处理（一行一次提醒），判重在入参侧同样折叠。
+
+    走仓储直连（不经引擎的 `parse_cc_actors` 去重），这样"同一次调用折叠"这条义务
+    钉在**仓储**上——引擎侧的去重挡不住绕过引擎直调仓储的调用方。
+    """
+    eng, repo, _facade, cc_events = _cc141_harness()
+    iid = 9_420_001   # cc 写侧不 join 实例表，直连仓储用一个固定实例 id 即可
+    cc_events.clear()
+
+    # 裸写入口（一个调用里给两次同一个人）
+    await repo.create_cc_instance(iid, "zhangsan", "6601", "6601")
+    assert await repo.find_cc_actor_ids(iid) == ["6601"],         f"同一次调用内的重复不新增第二行: {await repo.find_cc_actor_ids(iid)}"
+
+    # 漏斗入口（同一批里既有已知人又有重复新人）：子集折叠后才拿去 fire
+    created = await repo.create_cc_instance_if_absent(iid, "zhangsan", ["6601", "6602", "6602"])
+    await eng._notify_cc_create(iid, created)
+
+    assert created == ["6602"], f"子集应折叠同一次调用内的重复、并剔掉已存在的 6601: {created}"
+    assert await repo.find_cc_actor_ids(iid) == ["6601", "6602"], "两形入口折叠到同一行集"
+    assert len(repo.cc_rows_for_test(iid)) == 2, repo.cc_rows_for_test(iid)
+    assert [e.ccActorId for e in cc_events] == ["6602"], f"每人一次提醒、重复项不再提醒: {cc_events}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_engine_cc_legs_share_the_same_dedup_rule():
+    """两条腿共用同一条判据：发起 `f_ccActors` 已建的人，办理 `tf_ccActors` 再给一次
+    ⇒ 不新增行、不 fire；同批里的新人照旧建行＋fire（spec §11.7「三条入口同一支」）。"""
+    eng, repo, facade, cc_events = _cc141_harness()
+    define_id = await _deploy(facade, "01-simple.json")
+    inst = await eng.start_process_instance_by_id(define_id, "zhangsan",
+                                                  {"f_ccActors": "7001"})
+    iid = inst.id
+    assert await repo.find_cc_actor_ids(iid) == ["7001"], "发起腿落 1 行"
+    assert [e.ccActorId for e in cc_events] == ["7001"], "发起腿 fire 1 次"
+
+    cc_events.clear()
+    _cc141_tick()
+    doing = await repo.find_doing_tasks(iid)
+    assert doing, "发起后应有待办"
+    await repo.add_task_actor(doing[0].id, ["zhangsan"])
+    await eng.execute_process_task(doing[0].id, "zhangsan", {"submitType": 0})
+    doing = await repo.find_doing_tasks(iid)
+    assert doing, "申请节点办结后应有 task1 待办"
+    await repo.add_task_actor(doing[0].id, ["leader"])
+    await eng.execute_process_task(doing[0].id, "leader",
+                                   {"submitType": 1, "tf_ccActors": "7001,7002"})
+
+    assert await repo.find_cc_actor_ids(iid) == ["7001", "7002"], \
+        f"办理腿只为新人 7002 建行（7001 已有行）: {await repo.find_cc_actor_ids(iid)}"
+    assert [e.ccActorId for e in cc_events] == ["7002"], \
+        f"办理腿只 fire 实际新建的子集: {[e.ccActorId for e in cc_events]}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_string_and_collection_forms_share_the_dedup_rule():
+    """两形态入参（`Collection` 逐元素 / 逗号串 `str`）共用同一条判重腿：
+    发起腿给集合、办理腿给逗号串，重叠的人仍只有一行、只 fire 一次。"""
+    eng, repo, facade, cc_events = _cc141_harness()
+    define_id = await _deploy(facade, "01-simple.json")
+    inst = await eng.start_process_instance_by_id(define_id, "zhangsan",
+                                                  {"f_ccActors": ["7101", "7102"]})
+    iid = inst.id
+    assert await repo.find_cc_actor_ids(iid) == ["7101", "7102"], "集合形态照旧逐人建行"
+    assert [e.ccActorId for e in cc_events] == ["7101", "7102"], "集合形态照旧逐人 fire"
+
+    cc_events.clear()
+    _cc141_tick()
+    doing = await repo.find_doing_tasks(iid)
+    await repo.add_task_actor(doing[0].id, ["zhangsan"])
+    await eng.execute_process_task(doing[0].id, "zhangsan", {"submitType": 0})
+    doing = await repo.find_doing_tasks(iid)
+    await repo.add_task_actor(doing[0].id, ["leader"])
+    await eng.execute_process_task(doing[0].id, "leader",
+                                   {"submitType": 1, "tf_ccActors": "7101, 7103 ,7101"})
+
+    assert await repo.find_cc_actor_ids(iid) == ["7101", "7102", "7103"], \
+        f"逗号串形态与集合形态判重同一条: {await repo.find_cc_actor_ids(iid)}"
+    assert [e.ccActorId for e in cc_events] == ["7103"], \
+        f"两形态混用也只为新人 fire: {[e.ccActorId for e in cc_events]}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_dedup_is_scoped_to_instance_not_global():
+    """反向哨兵：判重不许把"这个实例上没抄送过的人"也吃掉——不同实例上的同一个人各自建行、各 fire。
+
+    把判重的读侧写成全局集合（`SELECT actor_id FROM wf_process_cc_instance` 少带 WHERE）
+    就会在这一格红，而①②③④四档全是绿的。
+    """
+    _eng, repo, facade, cc_events = _cc141_harness()
+    define_id = await _deploy(facade, "01-simple.json")
+    first = await _start(facade, define_id, "zhangsan")
+    second = await _start(facade, define_id, "lisi")
+    assert first != second
+    cc_events.clear()
+
+    await _cc141_manual(facade, first, "6701")
+    _cc141_tick()
+    await _cc141_manual(facade, second, "6701")
+
+    assert await repo.find_cc_actor_ids(first) == ["6701"], "实例一有自己的 cc 行"
+    assert await repo.find_cc_actor_ids(second) == ["6701"], "实例二不受实例一影响，同一个人照样建行"
+    assert [e.instanceId for e in cc_events] == [first, second], \
+        f"两个实例各 fire 一次: {[(e.ccActorId, e.instanceId) for e in cc_events]}"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_sql_repo_write_side_is_idempotent():
+    """G2（SQL 仓一路，真 SQLite）：①不新增行（含原行 id 不变）②不重置未读 ③不刷原行时间
+    ＋同一次调用内重复折叠 ＋ `find_cc_actor_ids` 读侧反映真实行集 ＋ 返回实际新建子集。
+    断言一律直查 `wf_process_cc_instance` 的真实行——只看返回值或只看内存对象都不作数。
+
+    ⚠️ ①②③与"同调用折叠"四档都走**裸写入口 `create_cc_instance`**（不经漏斗）：漏斗那侧的
+    子集由 SPI default 先算好，`create_cc_instance` 收到的本来就是一批新人——把仓储里的判重
+    摘掉，走漏斗的断言照样绿（本轮实测：还原病灶后 `-k i141` 仍 19 passed，就是这个洞）。
+    判重义务写在仓储里，就必须由裸写入口把它照出来；漏斗侧的子集档另有两格盯着。
+    """
+    raw, repo = _cc141_sql_repo()
+    iid = 9_421_001
+
+    await repo.create_cc_instance(iid, "zhangsan", "8101", "8102")
+    assert [r[1] for r in _cc141_cc_rows(raw, iid)] == ["8101", "8102"], "首轮逐人建行"
+    first_row = _cc141_cc_rows(raw, iid, "8101")[0]
+    assert first_row[2] == 0, f"新行应未读: {first_row}"
+
+    _cc141_tick()
+    await repo.create_cc_instance(iid, "zhangsan", "8101")
+    rows = _cc141_cc_rows(raw, iid)
+    assert [r[1] for r in rows] == ["8101", "8102"], f"①重复抄送不得新增行: {rows}"
+    after = _cc141_cc_rows(raw, iid, "8101")[0]
+    assert after[0] == first_row[0], "①原行 id 不变（没有删旧插新）"
+    assert after[3:] == first_row[3:], f"③原行 create_time/update_time 逐字不变: {first_row[3:]} → {after[3:]}"
+
+    # 同一次调用内的重复也只落一行（判重在仓储写侧，不吃引擎 parse_cc_actors 的去重）
+    await repo.create_cc_instance(iid, "zhangsan", "8104", "8104")
+    assert [r[1] for r in _cc141_cc_rows(raw, iid)] == ["8101", "8102", "8104"], "同调用折叠成一行"
+
+    # ②不重置未读：真 SQL 置读（state=1）后重复抄送，state 必须仍是 1，也不许冒出第二行未读
+    await repo.update_cc_status(iid, "8102")
+    read_row = _cc141_cc_rows(raw, iid, "8102")[0]
+    assert read_row[2] == 1, "置读后 state 应为 1"
+    _cc141_tick()
+    await repo.create_cc_instance(iid, "zhangsan", "8102")
+    rows = _cc141_cc_rows(raw, iid, "8102")
+    assert len(rows) == 1 and rows[0][2] == 1, f"②不得把已读抹回未读、也不得多出一行未读: {rows}"
+    assert rows[0][4] == read_row[4], f"③已读行的 update_time 不得被重复抄送刷掉: {read_row[4]} → {rows[0][4]}"
+
+    # 读侧：find_cc_actor_ids 反映真实行集（判重依据不能是内存猜测）
+    assert await repo.find_cc_actor_ids(iid) == ["8101", "8102", "8104"], "读侧＝库里的真行"
+    assert await repo.find_cc_actor_ids(9_421_999) == [], "空实例没有 cc 行"
+
+    # 漏斗侧：子集＝实际新建的人（新人档），且只新建那一行
+    created = await repo.create_cc_instance_if_absent(iid, "zhangsan", ["8101", "8103"])
+    assert created == ["8103"], f"子集只含新人: {created}"
+    assert sorted(r[1] for r in _cc141_cc_rows(raw, iid)) == ["8101", "8102", "8103", "8104"], \
+        "①不新增重复行"
+    assert await repo.create_cc_instance_if_absent(iid, "zhangsan", ["8101", "8102"]) == [], \
+        "全重复 ⇒ 子集空（漏斗据此整支不发码 4）"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_sql_repo_funnel_fires_only_new_subset():
+    """G2（SQL 仓＋引擎漏斗）：子集为空整支不发码 4；有新人时只 fire 新人。
+
+    引擎腿在两条入口上是同一支 `handle_cc_actors`（本栈的 cc 腿已在引擎里），
+    这一格把"fire 用子集"这件事在 **SQL 仓**上也钉一遍——只对内存仓钉等于放过两仓分叉。
+    """
+    _raw, repo = _cc141_sql_repo()
+    eng, _repo, _facade, cc_events = _cc141_harness(repo=repo)
+    iid = 9_422_001
+
+    await eng.handle_cc_actors(iid, "zhangsan", "8501,8502")
+    assert [e.ccActorId for e in cc_events] == ["8501", "8502"], "首轮逐人 fire"
+
+    cc_events.clear()
+    _cc141_tick()
+    await eng.handle_cc_actors(iid, "zhangsan", ["8501", "8502"])       # 全重复
+    assert cc_events == [], f"子集为空 ⇒ 整支不 fire（不空转）: {[e.ccActorId for e in cc_events]}"
+
+    _cc141_tick()
+    await eng.handle_cc_actors(iid, "zhangsan", "8501,8503")            # 一半新人
+    assert [e.ccActorId for e in cc_events] == ["8503"], \
+        f"两仓同样只 fire 实际新建子集: {[e.ccActorId for e in cc_events]}"
+    assert await repo.find_cc_actor_ids(iid) == ["8501", "8502", "8503"]
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_sql_repo_query_side_still_has_no_distinct():
+    """owner 拍的边界：判重只在**写侧**，查询侧不加 DISTINCT、历史重复行也不清理。
+
+    这一格钉的是"没被顺手改宽"：手工插两行重复（模拟存量脏数据）后
+    `page_cc_instances` 仍按 SQL 现状出行数（各栈维持现状，内存仓天然一实例一行——
+    这条不对称 owner 已拍为接受既成事实，见 spec 06 §4 末段）。
+    """
+    raw, repo = _cc141_sql_repo()
+    iid = 9_423_001
+    now = datetime.now()
+    await repo.save_instance(ProcessInstance(
+        id=iid, defineId=0, state=InstanceState.DOING, operator="zhangsan",
+        businessNo="I141-DUP", variables={}, createTime=now, updateTime=now,
+        createUser="zhangsan", updateUser="zhangsan"))
+    for rid in (9_423_101, 9_423_102):
+        raw.execute("INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state,"
+                    " create_time, create_user, update_time, update_user)"
+                    " VALUES (?,?,'8601',0,?,'zhangsan',?,'zhangsan')", (rid, iid, now, now))
+    raw.commit()
+
+    rows, total = await repo.page_cc_instances(1, 10, "8601")
+    assert (len(rows), total) == (2, 2), f"查询侧不引入 DISTINCT：历史脏行仍按 2 行出: {len(rows)}/{total}"
+    # 但写侧今后不再新增第三行
+    assert await repo.create_cc_instance_if_absent(iid, "zhangsan", ["8601"]) == []
+    assert len(_cc141_cc_rows(raw, iid)) == 2, "写侧判重只保证今后不再新增重复行"
+
+
+@pytest.mark.asyncio
+async def test_i141_g2_spi_defaults_keep_third_party_repos_on_old_behaviour():
+    """SPI 形状（issues/141 G2）：`find_cc_actor_ids` 的 default＝空集（不判重），
+    未覆写它的第三方仓储走 default ⇒ 行为与旧 `create_cc_instance` 逐字一致（全量建行、全量返回），
+    源码兼容不破。同时钉住"自带两仓必须覆写"，否则两仓两个答案在写侧重演。"""
+    assert MemoryRepository.find_cc_actor_ids is not ProcessRepository.find_cc_actor_ids, \
+        "内存仓未覆写 find_cc_actor_ids（判重不生效）"
+    from jeeflow.repository.base import JdbcRepository
+    assert JdbcRepository.find_cc_actor_ids is not ProcessRepository.find_cc_actor_ids, \
+        "SQL 仓未覆写 find_cc_actor_ids（判重不生效）"
+
+    class _ThirdPartyRepo(MemoryRepository):
+        """模拟只实现 `create_cc_instance` 的第三方仓储：把 SPI default 显式装回来。"""
+        find_cc_actor_ids = ProcessRepository.find_cc_actor_ids
+
+        def __init__(self):
+            super().__init__()
+            self.create_calls: list[tuple] = []
+
+        async def create_cc_instance(self, instance_id, creator, *actor_ids):
+            self.create_calls.append(actor_ids)
+            await MemoryRepository.create_cc_instance(self, instance_id, creator, *actor_ids)
+
+    repo = _ThirdPartyRepo()
+    assert await repo.find_cc_actor_ids(1) == [], "default 返回空集＝不判重"
+    created = await repo.create_cc_instance_if_absent(7, "zhangsan", ["a", "b", "a"])
+    assert created == ["a", "b"], f"default 只折叠同一次调用内的重复、不做跨行判重: {created}"
+    assert repo.create_calls == [("a", "b")], f"default 把子集原样交给 create_cc_instance: {repo.create_calls}"
 

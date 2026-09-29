@@ -54,14 +54,68 @@ class ProcessRepository(ABC):
     @abstractmethod
     async def remove_task_actor(self, task_id: int, actors: list[str]) -> None: ...
     @abstractmethod
-    async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str) -> None: ...
+    async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str) -> None:
+        """落 cc 行（**写侧判重＝幂等空操作**，issues/141 G2 · spec 06-facade.md §4）。
+
+        同一 `(instance_id, actor_id)` **已存在 cc 行时直接跳过**：①不新增行 ②不重置未读状态
+        （`state` 保持原值）③不更新原行时间（`create_time`/`update_time` 逐字不变）。
+        判重放在**写侧**而不是查询侧——`page_cc_instances` 不引入 `DISTINCT`、历史重复行也不清理
+        （owner 2026-09-29 拍：接受既成事实，写侧判重只保证今后不再新增）。
+        建 cc 的三条入口（发起 `f_ccActors`／办理 `tf_ccActors`／手动 `createCCInstance`）都经由
+        引擎的 `handle_cc_actors` 漏斗，那里调的是 `create_cc_instance_if_absent`
+        ——需要"实际新建了谁"拿去 fire `CC_CREATE`（码 4）。"""
+        ...
     @abstractmethod
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None: ...
+
+    async def find_cc_actor_ids(self, instance_id: int) -> list[str]:
+        """某实例**已存在**的 cc 行 actor id（issues/141 G2 写侧判重的读侧）。
+
+        default 返回空集＝**不判重**：未覆写的第三方仓储维持旧行为（全量建行、全量 fire），
+        SPI 源码兼容不破。jeeflow 自带的两仓（SQL 仓 `JdbcRepository` / 内存仓
+        `MemoryRepository`）**必须**覆写——否则「同一栈 SQL 仓与内存仓两个答案」
+        （issues/117 场景 27 那把尺子）在写侧重演一遍。
+        """
+        return []
+
+    async def create_cc_instance_if_absent(self, instance_id: int, creator: str,
+                                           actor_ids: list[str]) -> list[str]:
+        """写侧幂等建 cc 行，返回**实际新建**的 actor 子集（issues/141 G2 · spec 06 §4）。
+
+        判据：`actor_ids` 里已在该实例有 cc 行的跳过、同一次调用内的重复也折叠（顺序与入参一致），
+        剩下的子集交给 `create_cc_instance` 落库。
+
+        为什么返回子集而不是 None：spec 11-events §11.2 原则 1「码值表达发生了什么事实」
+        ⇒ 没发生"创建"就**不得** fire `CC_CREATE`（码 4）。三条入口一律拿这个子集去 fire，
+        **子集为空整支不发**（不空转，也不照旧按原始请求全量 fire）。
+
+        未覆写 `find_cc_actor_ids` 的第三方仓储走本 default ⇒ 与旧
+        `create_cc_instance(全量)` 逐字一致（子集＝入参去重后全量），不静默改变既有集成方行为。
+        """
+        existing = set(await self.find_cc_actor_ids(instance_id) or [])
+        fresh: list[str] = []
+        for actor_id in actor_ids or []:
+            if actor_id is None or actor_id in existing or actor_id in fresh:
+                continue
+            fresh.append(actor_id)
+        if fresh:
+            await self.create_cc_instance(instance_id, creator, *fresh)
+        return fresh
+
     @abstractmethod
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
                                 actor_id: Optional[str] = None,
                                 conditions: Optional[list[QueryCondition]] = None) -> tuple[list[CcInstanceRow], int]:
-        """我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：按抄送人 actor_id 过滤实例列表"""
+        """我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：按抄送人 actor_id 过滤实例列表。
+
+        **归属条件必填**（issues/141 G1 · spec 06-facade.md §2.5「抄送分页同一条尺子」）：
+        查询必须带归属列 `cc.actor_id` 的**有效**条件——`actor_id` 入参，或 `conditions` 里
+        某一条件 `column == "cc.actor_id"`；有效＝值非 `None`、`str` 型 strip 后非空、集合非空。
+        **没有有效归属条件时返回空页**（`[], 0`），严禁退化成"这条条件不加"而放出全部实例。
+        这条义务同时钉在 SQL 仓与内存仓上：**同一份数据两仓必须给同一个答案**（issues/117 场景 27）。
+        门面 `processInstance/ccList` 恒挂 `cc.actor_id EQ operator`，这里防的是绕过门面
+        直连仓储的调用方（与下一版门面的漏挂）。
+        """
         ...
 
     # ── 统计查询（v1.8.25，issues/103） ──

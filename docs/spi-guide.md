@@ -23,7 +23,22 @@ class MyRepository(ProcessRepository):
     async def remove_task_actor(self, task_id: int, actors: list[str]) -> None: ...
     async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str) -> None: ...
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None: ...
+
+    # 抄送写侧判重（issues/141 G2，带 default：不覆写＝维持旧行为，第三方仓储源码兼容不破）
+    async def find_cc_actor_ids(self, instance_id: int) -> list[str]: ...
+    async def create_cc_instance_if_absent(self, instance_id: int, creator: str,
+                                          actor_ids: list[str]) -> list[str]: ...
 ```
+
+> **抄送写侧判重＝幂等空操作**（issues/141 G2 · [规范 06 · 门面](../../spec/06-facade) §4）：同一
+> `(instance_id, actor_id)` 已有 cc 行时跳过——**不新增行、不重置未读状态、不更新原行时间**，
+> 并且**不 fire `CC_CREATE`（码 4）**（规范 11 §11.2 原则 1「码值表达发生了什么事实」）。
+> 建 cc 的三条入口（发起 `f_ccActors`／办理 `tf_ccActors`／门面手动 `createCCInstance`）在本栈
+> 全部收敛到 `engine.handle_cc_actors` 这一个漏斗，那里统一调 `create_cc_instance_if_absent`，
+> 逐人 fire 的入参＝它返回的**实际新建子集**（子集为空整支不发）。查询侧不引入 `DISTINCT`、
+> 历史重复行不清理（owner 2026-09-29 拍为接受既成事实）。
+> 自带两仓（`JdbcRepository` / `MemoryRepository`）都覆写 `find_cc_actor_ids`；**集成方自实现
+> 仓储时也应覆写**，否则 default 返回空集＝不判重，重复抄送会照旧逐条 INSERT。
 
 > 开箱即用：
 > - `MemoryRepository`（`jeeflow/memory.py`）供演示/测试；
@@ -65,6 +80,16 @@ await repo.with_tx(do_biz)
 ```
 
 > 约定：**业务层是事务 owner**——先 `with_tx` 再调引擎方法，引擎核心不感知事务。
+
+> **`page_cc_instances` 的归属条件必填**（issues/141 G1 · [规范 06](../../spec/06-facade) §2.5）：
+> "抄送我"这类取数入口必须带归属列 `cc.actor_id` 的**有效**条件——本栈有两形（Java 只有一形）：
+> 专用入参 `actor_id`，或 `conditions` 里 `column="cc.actor_id"` 的那条；有效＝值非 `None`、
+> 字符串 `strip()` 后非空、集合非空。**两形都没给有效值 ⇒ 返回空页**（`[], 0`），
+> 严禁退化成"这条条件不加"而放出全部实例。SQL 仓与内存仓在同一条判据上**必须给同一个答案**
+> （判据见 `memory.py::_has_cc_ownership` 与 `repository/base.py::_has_cc_ownership`，同名同实现）。
+> 门面 `processInstance/ccList` 恒挂这条条件（`operator` 经归一化后走 `actor_id` 入参），
+> 这条义务防的是绕过门面直连仓储的调用方与下一版门面的漏挂。
+> ⚠️ 只收**归属谓词**：`m_LIKE_*` 这类可选过滤传空串仍按"没填"忽略，不跟着收紧。
 
 ## UserProvider（可选）
 

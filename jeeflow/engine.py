@@ -93,7 +93,10 @@ class Engine:
     async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
     async def handle_cc_actors(self, instance_id: int, operator: str, cc_actors: Any) -> list[str]:
         """抄送唯一漏斗（spec §11.7）：门面手动 ``createCCInstance`` 与引擎发起/办理两条腿共用；
-        自定义引擎实现若不提供，手动抄送腿就只剩"写行不 fire"，属 §11.2 原则 1 的缺支。"""
+        自定义引擎实现若不提供，手动抄送腿就只剩"写行不 fire"，属 §11.2 原则 1 的缺支。
+
+        自定义实现同样要守 issues/141 G2（spec 06 §4）：落库走
+        ``repo.create_cc_instance_if_absent``，fire 只用它返回的**实际新建子集**，子集为空不发码 4。"""
         ...
 
 class EngineImpl(Engine):
@@ -183,8 +186,8 @@ class EngineImpl(Engine):
     # ─── 抄送腿（spec 11-events §11.7／issues/127）─────────────────────────────────
 
     async def handle_cc_actors(self, instance_id: int, operator: str, cc_actors: Any) -> list[str]:
-        """抄送的**唯一漏斗**：归一化抄送人 → **先** ``create_cc_instance`` 落 cc 行 →
-        落库**后**逐抄送人 fire ``CC_CREATE``(码 4)。
+        """抄送的**唯一漏斗**：归一化抄送人 → **先** ``create_cc_instance_if_absent`` 落 cc 行 →
+        落库**后**逐**实际新建**的抄送人 fire ``CC_CREATE``(码 4)。
 
         形状基准＝jeeflow-java ``JeeflowEngineImpl.handleCcActors`` → ``ProcessPublisher.notifyCcCreate``
         （发起 ``f_ccActors`` 与办理 ``tf_ccActors`` 共用同一条腿），go ``EngineImpl.HandleCcActors``、
@@ -209,21 +212,37 @@ class EngineImpl(Engine):
         传 ``f_ccActors``/``tf_ccActors`` 根本不建 cc 行**——这正是本轮要搬掉的病灶。
 
         ``cc_actors`` 为 ``None``/空 ⇒ 零写入、零 fire、返回 ``[]``（纯增量：不带抄送的发起/办理
-        行为与上一版逐字一致）。返回归一化后的抄送人列表。
+        行为与上一版逐字一致）。返回归一化后的**请求**抄送人列表（不是新建子集——调用方按
+        "我请求抄给了谁"读，事件按"实际新建了谁"发，两件事各有各的形状）。
+
+        重复抄送同一个人（issues/141 G2 · spec 06 §4）＝数据面 no-op：不新增行、不重置未读、
+        不刷原行时间，且**不发**码 4。判重落在仓储写侧（两仓同判据），事件收口落在这一个漏斗里，
+        三条入口（``f_ccActors``／``tf_ccActors``／手动 ``createCCInstance``）共用同一条腿。
         """
         cc_list = parse_cc_actors(cc_actors)
         if not cc_list or not instance_id:
             return cc_list
-        await self.repo.create_cc_instance(instance_id, operator, *cc_list)
-        await self._notify_cc_create(instance_id, cc_list)
+        # issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：同一 (实例, 被抄送人) 已有 cc 行时跳过，
+        # 拿回来的 created 是**实际新建的子集**（可能比 cc_list 短，甚至为空）。
+        created = await self.repo.create_cc_instance_if_absent(instance_id, operator, cc_list)
+        # 逐人 fire 的入参＝实际新建的子集，不是原始 cc_list（issues/141 G2 · spec §11.2 原则 1
+        # 「码值表达发生了什么事实」）：重复抄送没发生"创建"⇒ 不发码 4；子集为空**整支不 fire**
+        # （不空转，也不照旧全量 fire）。
+        if created:
+            await self._notify_cc_create(instance_id, created)
         return cc_list
 
     async def _notify_cc_create(self, instance_id: int, cc_list: list[str]) -> None:
-        """CC_CREATE（码 4，issues/102）逐抄送人 fire，与 ``create_cc_instance`` 的逐行写一一对应
+        """CC_CREATE（码 4，issues/102）逐抄送人 fire，与 cc 行的逐行写一一对应
         （对齐 Java ``ProcessPublisher.notifyCcCreate``）。``ccActorId`` 直传事件体，监听器免反查 cc 表。
         接收人过滤（合法性/存在性）属集成层监听器职责，引擎只按 cc 行粒度 fire。
         ⚠️ 只在 cc 行落库**之后**调用（spec §11.2 原则 3）——本方法是 ``handle_cc_actors`` 的下游，
-        不得脱离 cc 行落库单独调用。"""
+        不得脱离 cc 行落库单独调用。
+
+        ⚠️ ``cc_list`` **入参一律是"实际新建的 actor 子集"**（issues/141 G2 · spec 06 §4）：
+        调用点先走 ``repo.create_cc_instance_if_absent`` 拿子集，**子集为空整支不 fire**——
+        §11.2 原则 1「码=事实」，重复抄送没发生"创建"就不该发码 4，严禁照旧按原始请求全量 fire。
+        """
         for actor in cc_list:
             await self._fire_event(ProcessEvent(type=EventType.CC_CREATE, instanceId=instance_id,
                                                 ccActorId=actor))

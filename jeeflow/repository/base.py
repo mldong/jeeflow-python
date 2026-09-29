@@ -114,6 +114,40 @@ _CC_WHITELIST = {
 _OWNERSHIP_COLUMNS = {"t.operator", "pi.operator", "pta.actor_id", "cc.actor_id"}
 
 
+def _effective_ownership(val) -> bool:
+    """归属条件的**有效值**判据（issues/141 G1）：值非 None、`str` 型 strip 后非空、集合非空。
+
+    与 `jeeflow/memory.py::_effective_ownership` 同名同判据——两条尺子必须逐字一致，
+    判据分叉＝"同一栈 SQL 仓与内存仓两个答案"（issues/117 场景 27 立过法）。
+    与 `JdbcRepository._build_where` 的 `OWNERSHIP_COLUMNS` 空值档（issues/129）同一口径，
+    本函数多收的是"条件整条没给"与"空集合"两档。
+    """
+    if val is None:
+        return False
+    if isinstance(val, str) and not val.strip():
+        return False
+    if isinstance(val, (list, tuple, set, dict)) and len(val) == 0:
+        return False
+    return True
+
+
+def _has_cc_ownership(actor_id, conditions) -> bool:
+    """抄送分页有没有**有效**归属条件（issues/141 G1 · spec 06-facade.md §2.5）。
+
+    本栈的归属落点有两形（Java 只有 conditions 一形）：`page_cc_instances` 的专用入参 `actor_id`，
+    以及 `conditions` 里 `column == "cc.actor_id"` 的那条。任一形给了有效值即"条件齐了"；
+    两形都没给 ⇒ 契约答案是**空页**，严禁退化成"这条条件不加"而放出全部实例。
+    与 `memory.py::_has_cc_ownership` 同名同判据（内存仓一路的判据表见 tests/spec_test.py
+    的 Test 141 G1，两仓各钉一遍）。
+    """
+    if _effective_ownership(actor_id):
+        return True
+    for cond in conditions or []:
+        if getattr(cond, "column", None) == "cc.actor_id" and _effective_ownership(cond.value):
+            return True
+    return False
+
+
 _DEFINE_WHITELIST = {
     "t.id", "t.name", "t.display_name", "t.type", "t.state", "t.version",
     "t.create_time", "t.update_time",
@@ -471,13 +505,32 @@ class JdbcRepository(ProcessRepository):
     async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str) -> None:
         import datetime
         now = datetime.datetime.now()
+        # issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：同一 (实例, 被抄送人) 已有 cc 行时
+        # 直接跳过——不新增行、不重置未读（state 保持原值）、不更新原行时间（不碰 UPDATE，
+        # create_time/update_time 逐字不变）。判重放在写侧而不是查询侧：查询保持现状不引入
+        # DISTINCT（owner 2026-09-29 拍），历史重复行也不清理。
+        # 与 MemoryRepository.create_cc_instance 同一条判据——两仓判据分叉＝issues/117 场景 27。
+        existing = await self.find_cc_actor_ids(instance_id)
         async with self._conn() as conn:
             for actor_id in actor_ids:
+                if actor_id is None or actor_id in existing:
+                    continue
                 await conn.execute(self._sql(
                     "INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state,"
                     " create_time, create_user, update_time, update_user)"
                     " VALUES (?,?,?,0,?,?,?,?)"),
                     (self._id_gen.next_id(), instance_id, actor_id, now, creator, now, creator))
+                # 同一次调用内的重复也算"已存在"，只落一行
+                existing.append(actor_id)
+
+    async def find_cc_actor_ids(self, instance_id: int) -> list[str]:
+        """issues/141 G2：某实例已有的 cc 行 actor id（写侧判重的读侧，覆写 SPI default）。
+        返回**可修改**的 list——`create_cc_instance` 要在插入过程中往里追加。"""
+        async with self._conn() as conn:
+            rows = await conn.fetchall(self._sql(
+                "SELECT actor_id FROM wf_process_cc_instance WHERE process_instance_id = ?"),
+                (instance_id,))
+        return [r[0] for r in rows]
 
     async def update_cc_status(self, instance_id: int, actor_id: str) -> None:
         import datetime
@@ -490,21 +543,41 @@ class JdbcRepository(ProcessRepository):
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10,
                                 actor_id: Optional[str] = None,
                                 conditions: Optional[list[QueryCondition]] = None) -> tuple[list[CcInstanceRow], int]:
-        """我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）"""
-        cond_sql, cond_args = self._build_where(conditions or [], _CC_WHITELIST)
+        """我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）。
+
+        **归属条件必填**（issues/141 G1 · spec 06 §2.5）：`cc.actor_id` 没有有效条件 ⇒ **空页**。
+        本仓的旧形状是那句恒绑的 `WHERE cc.actor_id = ?`：不给入参时绑 `None` ⇒ `= NULL` 恒不命中，
+        "缺条件"档碰巧是空页，但**只给条件形**（`actor_id=None` + `cc.actor_id EQ 'user1'`）也被这句
+        折成 0 行，而内存仓同一档返 1 行——两仓两个答案，正是 issues/117 场景 27 立过法的那一类
+        （spec 06 §2.5 点名的反面教材是 php PDO 仓"LEFT JOIN 不带条件放全部实例"，本栈两仓各错一头）。
+        改成显式短路后不再依赖 NULL 巧合；空值档另有 `_build_where` 的 `_OWNERSHIP_COLUMNS`
+        （issues/129）兜底，本格补的是"条件整条没给"与"空集合"两档。
+        """
+        conds = conditions or []
+        if not _has_cc_ownership(actor_id, conds):
+            return [], 0
+        cond_sql, cond_args = self._build_where(conds, _CC_WHITELIST)
+        # 归属谓词的两形（本栈专用入参 + m_ 条件；Java 只有条件一形）：入参给了有效值时照旧
+        # `cc.actor_id = ?`；只有条件给了归属值时**不能再补这句**——`actor_id=None` 会拼成
+        # `cc.actor_id = NULL` 恒不命中，把合法的条件查询折成空页，与内存仓再次分叉。
+        if _effective_ownership(actor_id):
+            predicate, bind = " WHERE cc.actor_id = ?", (actor_id,)
+        else:
+            predicate, bind = " WHERE 1=1", ()
         where = (" FROM wf_process_instance t"
                  " LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id"
                  " LEFT JOIN wf_process_cc_instance cc ON t.id = cc.process_instance_id"
-                 " WHERE cc.actor_id = ?" + cond_sql)
+                 + predicate + cond_sql)
+        bind = (*bind, *cond_args)
         cols = ("t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,"
                 " t.operator, t.expire_time, t.variable, t.create_time, t.create_user,"
                 " t.update_time, t.update_user, pd.name, pd.display_name, pd.version")
         async with self._conn() as conn:
-            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), (actor_id, *cond_args))
+            row = await conn.fetchone(self._sql("SELECT COUNT(*)" + where), bind)
             total = int(row[0]) if row else 0
             rows = await conn.fetchall(self._sql(
                 f"SELECT {cols}{where} ORDER BY t.id ASC LIMIT ? OFFSET ?"),
-                (actor_id, *cond_args, page_size, (page_num - 1) * page_size))
+                (*bind, page_size, (page_num - 1) * page_size))
         return [self._map_cc_row(r) for r in rows], total
 
     def _map_cc_row(self, r: Sequence[Any]) -> CcInstanceRow:

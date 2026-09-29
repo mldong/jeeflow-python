@@ -9,13 +9,38 @@ from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, Inst
 from .spi import ProcessRepository, ProcessExtRepository
 from .surrogate import hydrate_enabled, to_datetime   # 判据本身已收口到 ProcessSurrogate.is_effective（issues/123）
 
+class CcRow(str):
+    """内存仓的 cc 行（issues/141 G2）——形状对齐 `wf_process_cc_instance`：actor id ＋ 未读状态
+    （0 未读 / 1 已读）＋ 建行时间与更新时间。
+
+    ⚠️ 为什么是 `str` **子类**而不是 dataclass：判重的②③档（不重置未读、不刷原行时间）要求
+    内存仓也带 state/时间，而本仓既有测试直读 `repo._cc[iid]` 并与 `["alice","bob"]` 比较
+    （如 `test_cc_leg_untouched_start_and_manual_paths`）——行模型不许改既有断言。
+    `str` 子类两头都满足：值本身就是 actor id（`==`/`in`/`in rows` 一律按字符串判），
+    另挂三个可变字段给②③档取证。对齐 Java 内存仓的同名 `CcRow`（那边的既有读法走
+    `ccActorsForTest`，所以它可以直接做成普通类）。
+    """
+
+    __slots__ = ("state", "create_time", "update_time")
+
+    def __new__(cls, actor_id: str, *, state: int = 0, create_time=None, update_time=None):
+        row = super().__new__(cls, actor_id)
+        row.state = state
+        row.create_time = create_time
+        row.update_time = update_time
+        return row
+
+    def __repr__(self):
+        return f"CcRow({str(self)!r}, state={self.state})"
+
+
 class MemoryRepository(ProcessRepository):
     def __init__(self):
         self._defines: dict[int, ProcessDefine] = {}
         self._instances: dict[int, ProcessInstance] = {}
         self._tasks: dict[int, ProcessTask] = {}
         self._actors: dict[int, list[str]] = {}
-        self._cc: dict[int, list[str]] = {}
+        self._cc: dict[int, list[CcRow]] = {}
         self._seq = 1
 
     def add_define(self, d: ProcessDefine):
@@ -96,13 +121,47 @@ class MemoryRepository(ProcessRepository):
         remove = set(actors)
         self._actors[task_id] = [a for a in self._actors.get(task_id, []) if a not in remove]
     async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str):
-        self._cc[instance_id] = list(dict.fromkeys([*self._cc.get(instance_id, []), *actor_ids]))
-    async def update_cc_status(self, instance_id: int, actor_id: str): pass
+        # issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与 JdbcRepository.create_cc_instance
+        # 同一条判据：同一 (实例, 被抄送人) 已有 cc 行 ⇒ 跳过——①不新增行 ②不重置未读（state 保持
+        # 原值）③不更新原行时间（create_time/update_time 逐字不变）。判重在写侧，查询侧不引入去重。
+        rows = self._cc.setdefault(instance_id, [])
+        for actor_id in actor_ids:
+            if actor_id is None or actor_id in rows:
+                continue
+            now = datetime.now()
+            rows.append(CcRow(actor_id, create_time=now, update_time=now))
+
+    async def find_cc_actor_ids(self, instance_id: int) -> list[str]:
+        """某实例已有的 cc 行 actor id（issues/141 G2 写侧判重的读侧，覆写 SPI default）。"""
+        return [str(row) for row in self._cc.get(instance_id, [])]
+
+    async def update_cc_status(self, instance_id: int, actor_id: str):
+        # 已读：state 0→1 ＋ 刷 update_time（对齐 wf_process_cc_instance.state 语义与 SQL 仓那句
+        # UPDATE）。issues/141 G2 之前这里是 `pass`——内存仓的 cc 行不带 state/时间，
+        # "重复抄送不重置未读 / 不刷原行时间"两档根本照不出来，只能空转断言。
+        for row in self._cc.get(instance_id, []):
+            if row == actor_id:
+                row.state = 1
+                row.update_time = datetime.now()
+
+    def cc_rows_for_test(self, instance_id: int) -> list["CcRow"]:
+        """测试访问器：读回某实例的 cc **行**（issues/141 G2 的②③档要看未读状态与原行时间，
+        只看 actor id 集合照不出"重复抄送把 state 抹回未读 / 把时间刷成 now"这两种假修）。"""
+        return list(self._cc.get(instance_id, []))
+
     async def page_cc_instances(self, page_num: int = 1, page_size: int = 10, actor_id: Optional[str] = None,
                                 conditions=None):
-        """我的抄送分页（v1.3.0）：按抄送人 actor_id 过滤，join 实例 + 定义"""
-        if _ownership_blank(actor_id):
-            return [], 0  # issues/129：cc.actor_id 空串 ⇒ 空页，不得退化成"不过滤=读全库"
+        """我的抄送分页（v1.3.0）：按抄送人 actor_id 过滤，join 实例 + 定义。
+
+        **归属条件必填**（issues/141 G1 · spec 06 §2.5）：`cc.actor_id` 没有有效条件（`actor_id`
+        入参与 `cc.actor_id` 条件两形都算）⇒ 返回**空页**，判据与 `JdbcRepository.page_cc_instances`
+        逐字同一条。本仓的旧形状是 `_ownership_blank` 只收空串，`actor_id=None` 被当成"本次不带
+        归属过滤"⇒ 放出全部"有 cc 行的实例"；SQL 仓同一档却因恒绑 `cc.actor_id = ?`（None ⇒ `= NULL`
+        恒不命中）返 0 行——同一份数据两仓两个答案（issues/117 场景 27 那把尺子；spec 06 §2.5 点名的
+        反面教材是 php PDO 仓"不带条件放全部实例"，本栈两仓各错一头）。
+        """
+        if not _has_cc_ownership(actor_id, conditions):
+            return [], 0  # issues/141 G1：缺有效归属条件 ⇒ 空页（G1 前这里是"不过滤＝读全部有 cc 行的实例"）
         rows = []
         for inst_id, actors in self._cc.items():
             if actor_id and actor_id not in actors:
@@ -474,8 +533,44 @@ def _ownership_blank(v) -> bool:
     None 不算空：内存仓储这些分页方法的 `operator/actor_id` 是**专用入参**，
     None 是既有 SPI 语义"本次不带归属过滤"，把 None 也判成空会让不带该参的既有调用整体变空页。
     只有"显式传了个空串"才是本 issue 的病灶（门面第一层已归一化，这一层防绕过门面的调用方）。
+
+    ⚠️ 本判据只管 `page_instances`/`page_todo_tasks`/`page_done_tasks` 三张列表；
+    **抄送分页不吃这条**——issues/141 G1（spec 06 §2.5）把 `page_cc_instances` 的尺子延长成
+    "归属条件必填、None 也算没填"，见 `_has_cc_ownership`（G9 那条"要不要把必填推广到
+    其余三张"正等 owner 拍，本轮不推广）。
     """
     return v is not None and isinstance(v, str) and not v.strip()
+
+
+def _effective_ownership(val) -> bool:
+    """归属条件的**有效值**判据（issues/141 G1）：值非 None、`str` 型 strip 后非空、集合非空。
+
+    与 `repository/base.py::_effective_ownership` 同名同判据（两仓逐字一条，判据分叉＝
+    issues/117 场景 27 立过法的"同一栈两个仓储两个答案"）。空串档与 issues/129 的
+    `OWNERSHIP_COLUMNS`/`_ownership_blank` 同一口径，这一格多收的是"整条条件没给"与"空集合"。
+    """
+    if val is None:
+        return False
+    if isinstance(val, str) and not val.strip():
+        return False
+    if isinstance(val, (list, tuple, set, dict)) and len(val) == 0:
+        return False
+    return True
+
+
+def _has_cc_ownership(actor_id, conditions) -> bool:
+    """抄送分页有没有**有效**归属条件（issues/141 G1 · spec 06 §2.5）。
+
+    本栈的归属落点有两形（Java 只有 conditions 一形）：专用入参 `actor_id`，以及
+    `conditions` 里 `column == "cc.actor_id"` 的那条。任一形给了有效值就算"条件齐了"；
+    两形都没给 ⇒ 调用方要求的就是空页。
+    """
+    if _effective_ownership(actor_id):
+        return True
+    for cond in conditions or []:
+        if getattr(cond, "column", None) == "cc.actor_id" and _effective_ownership(cond.value):
+            return True
+    return False
 
 
 def _match_conditions(conditions, fields: dict) -> bool:

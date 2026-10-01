@@ -4850,6 +4850,63 @@ async def test_i126_unparsable_expression_stays_null():
         assert row.expireTime is None, f"表达式 {expr!r} 解析不出必须 NULL，实得 {row.expireTime!r}"
 
 
+# ─── issues/137 D · 相对档前缀须**非负**整数（owner 2026-10-01 拍"判非负"）───────────
+
+@pytest.mark.asyncio
+async def test_i137d_negative_relative_expression_stays_null():
+    """建单路径判点，形状照 Java 基准 ``ExpireTimeOnCreateTest.negativeRelativeExpressionStaysNull``
+    （jeeflow-java ``1649955``）：四档（``s``/``m``/``h``/``d``）各喂一个负数前缀 ⇒ 行照常建，
+    但 ``expire_time`` 必须留 NULL —— 判负后走的是**既有落穿分支**（档 2 不匹配 → 档 3 解析不出
+    → None），不是新造的第三条出口，更不是退化成 now()（issues/126 红线）。
+    放行 ``-5h`` 得到的是一个**过去**的时刻 ⇒ 新建的行当场即逾期，比"没配到期时间"更难发现。
+    ``d`` 档单独一格是必需的：本栈它是 naive 墙上钟加天数（对齐 Java ``Calendar.add(DAY_OF_MONTH)``），
+    负数＝历日倒退，与 s/m/h 的秒级加法不同形，按档分开才拦得住"只改一档"的实现。
+    末格 ``+2h`` 是**正向对照**（≈now+7200s）：没有它，上面四格会被"相对档整档返回 None"
+    这种错误实现也判绿（恒真），也证明判负没顺手把加号一起裁掉。"""
+    for i, expr in enumerate(("-5h", "-5d", "-30s", "-45m")):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]),
+                                            f"expire137d_neg{i}")
+        inst = await eng.start_process_instance_by_id(def_id, "applicant")
+        row = await _row(repo, inst.id, "approve")
+        assert row.expireTime is None, \
+            f"负数相对档 {expr!r} 应落穿成 NULL，实得 {row.expireTime!r}（放行＝建单即逾期）"
+
+    eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", "+2h")]), "expire137d_plus")
+    inst = await eng.start_process_instance_by_id(def_id, "applicant")
+    _assert_expire_after_create(await _row(repo, inst.id, "approve"), 2 * 3600, '正向对照配 "+2h"')
+
+
+def test_i137d_process_time_tier_matrix_around_negative_prefix():
+    """求值器档位矩阵（直调 ``process_time``，不借建单路径），把"判负只发生在档 2 前缀解析**之后**"
+    的覆盖面钉全：
+    ① 四档负数前缀 ⇒ ``None``（判的是 `is None`，因此既不可能是异常、也不可能是 now 或回拨后的时刻）；
+    ② 正向对照 ``+2h``/``+1d``/``2h``/``2d`` 照旧算得出 ≈now+N —— 这一组保证 ① 不是恒真，
+       并钉住"只裁负**不裁加号**"：本栈 ``_INT_PREFIX`` 的 ``[+-]?`` 原样保留（各栈整数解析
+       python ``[+-]?``、node ``[-+]?\\d+``、php ``[+-]?\\d{1,18}``、go ``Atoi`` 都收 '+'，
+       把加号裁掉等于新造一处跨栈分叉）；
+    ③ 变量档与绝对档不受影响：键名就叫 ``-5h`` 的变量照旧取变量值（档 1 优先于档 2，顺序没动），
+       ``"2026-12-31 10:00:00"`` 照旧解析成该时刻；
+    ④ 坏前缀行为不变（本来就是落穿）：``"xh"`` 前缀非整数、``"2.5h"`` 是小数 ⇒ 仍是 ``None``。"""
+    from jeeflow.engine import process_time
+
+    for expr in ("-5h", "-5d", "-30s", "-45m", "-1s", "-99999d"):
+        assert process_time(expr, None) is None, f"负数相对档 {expr!r} 应落穿成 None"
+
+    for expr, want in (("+2h", 2 * 3600), ("+1d", 86400), ("2h", 2 * 3600),
+                       ("2d", 2 * 86400), ("+30s", 30), ("+45m", 2700)):
+        got = process_time(expr, None)
+        assert got is not None, f"正向对照 {expr!r} 不该被判负误伤"
+        delta = (got - datetime.now()).total_seconds()
+        assert want - 5 <= delta <= want + 5, f"{expr!r} 偏移 = {delta}s，want ≈{want}s"
+
+    assert process_time("-5h", {"-5h": "2028-08-08 08:08:08"}) == datetime(2028, 8, 8, 8, 8, 8), \
+        "变量档优先于相对档：命中同名变量时取变量值，不受判负影响"
+    assert process_time("2026-12-31 10:00:00", None) == datetime(2026, 12, 31, 10, 0, 0), \
+        "绝对档照旧解析成功"
+    for expr in ("xh", "2.5h"):
+        assert process_time(expr, None) is None, f"坏前缀 {expr!r} 的既有落穿行为被改动了"
+
+
 @pytest.mark.asyncio
 async def test_i126_parallel_countersign_applies_to_every_member():
     """写点③「并行会签全员」：Java 的并行循环是**每位成员**都算，不是只算首位。

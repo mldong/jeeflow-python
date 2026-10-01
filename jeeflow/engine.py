@@ -1149,7 +1149,9 @@ def _filter_field_by_perm(args: dict, node: Optional[FlowNode]) -> dict:
 
 #: 绝对时刻格式（Java ``SimpleDateFormat("yyyy-MM-dd HH:mm:ss")``，只此一种）
 _EXPIRE_LAYOUT = "%Y-%m-%d %H:%M:%S"
-#: 相对档前缀必须是整数（Java ``Integer.parseInt`` 的接受面；``int(" 2")``/``"1_0"`` 不算）
+#: 相对档前缀必须是整数（Java ``Integer.parseInt`` 的接受面；``int(" 2")``/``"1_0"`` 不算）。
+#: ``[+-]?`` 是**故意**留符号位的（issues/137 D 只裁负不裁加号）：负数在 :func:`process_time`
+#: 里 ``int()`` **之后**判掉 ⇒ 落穿档 3，正则本身不收窄，免得把 '+' 裁成新的一处跨栈分叉
 _INT_PREFIX = re.compile(r"[+-]?[0-9]+")
 _UNIT_BY_SUFFIX = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 
@@ -1163,10 +1165,13 @@ def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime
        ``str`` → 按 ``"yyyy-MM-dd HH:mm:ss"`` 解析，解析失败 → ``None``。
        值类型不认识（``list`` / ``dict`` / ``float`` / ``bool`` …）⇒ **落穿**到档 2/3，
        不是提前返回 ``None``（Java/C# 都是落穿，改成 return None 就是跨栈分叉）。
-    2. **相对档**：``expr`` 以 ``s|m|h|d`` 结尾且前缀是整数 ⇒ 当前时间 + N 秒/分/时/天。
+    2. **相对档**：``expr`` 以 ``s|m|h|d`` 结尾且前缀是**非负**整数 ⇒ 当前时间 + N 秒/分/时/天。
        ``d`` 走**日历加天**（Java ``Calendar.add(DAY_OF_MONTH)``），不乘 86400 秒
        ——本栈写 ``createTime`` 用的是 naive 本地钟，naive ``datetime + timedelta(days=n)``
        即名义（墙上时钟）加天，与 ``Calendar`` 同档。
+       前缀为负（``-5h`` / ``-5d``）按**不合法**处理，与坏前缀一样落穿档 3 ⇒ ``None``
+       （issues/137 D · owner 2026-10-01 拍"判非负"：放行负偏移＝建单即逾期）；带 ``'+'`` 的前缀
+       照旧合法（只裁负不裁加号）。
     3. **绝对档**：把 ``expr`` 本身按 ``"yyyy-MM-dd HH:mm:ss"`` 解析 → 时刻；失败 → ``None``。
 
     **任何一档都不得返回 now()**：没配 / 解析不出 ⇒ ``None``（这一列留 NULL）。
@@ -1200,9 +1205,23 @@ def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime
         return None
     suffix = expr[-1]
     if suffix in _UNIT_BY_SUFFIX and _INT_PREFIX.fullmatch(expr[:-1]):
-        # 本栈写 createTime 用 naive 本地钟 ⇒ naive datetime + timedelta 是**名义（墙上时钟）加量**：
-        # "d" 这一档即日历加天，与 Java Calendar.add(DAY_OF_MONTH) 同形，不是乘 86400 秒的瞬时加法
-        return datetime.now() + timedelta(**{_UNIT_BY_SUFFIX[suffix]: int(expr[:-1])})
+        offset = int(expr[:-1])
+        # issues/137 D（owner 2026-10-01 拍"判非负"）：**负数前缀同样算不合法** —— 不进档 2，
+        # 沿本函数既有的落穿路径继续走档 3 ⇒ 仍解析不出即 ``None``（这一列留 NULL）。
+        # 两条理由逐字对齐 java ``FlowUtil.parseIntOrNull``：
+        #   1. **任何一档都不许退化成"取当前时间"**：放行 ``-5h`` 算出的是一个**过去**的时刻 ⇒
+        #      新建的行当场就逾期，比"没配到期时间"更难发现，正是 issues/126 占位 ``now()``
+        #      病灶的同型形状。
+        #   2. **只裁负、不裁加号**：判负发生在 ``int()`` **之后**，``_INT_PREFIX`` 的 ``[+-]?``
+        #      原样保留。各栈整数解析（python ``[+-]?``、node ``[-+]?\d+``、php ``[+-]?\d{1,18}``、
+        #      go 的 ``Atoi``）都收 ``'+'``，把加号一并裁掉反而新造一处跨栈分叉——``+2h`` 照旧是
+        #      合法的 now+7200s。
+        # 判点覆盖面：四档 s/m/h/d 共用这一处前缀解析（单位靠 ``_UNIT_BY_SUFFIX`` 查同一张表、
+        # 复用同一个 ``offset``，``d`` 档没有另开加天数分支）⇒ 这一判同时拦住四档。
+        if offset >= 0:
+            # 本栈写 createTime 用 naive 本地钟 ⇒ naive datetime + timedelta 是**名义（墙上时钟）加量**：
+            # "d" 这一档即日历加天，与 Java Calendar.add(DAY_OF_MONTH) 同形，不是乘 86400 秒的瞬时加法
+            return datetime.now() + timedelta(**{_UNIT_BY_SUFFIX[suffix]: offset})
     try:
         return datetime.strptime(expr, _EXPIRE_LAYOUT)
     except ValueError:

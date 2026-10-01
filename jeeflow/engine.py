@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 from .model import (
     FlowModel, FlowNode, FlowEdge,
     TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK, TYPE_JOIN, TYPE_CUSTOM,
+    KNOWN_NODE_TYPES,
     ProcessInstance, ProcessTask, ProcessDefine,
     InstanceState, TaskState, SubmitType, PerformType,
     parse_flow_model,
@@ -673,6 +674,30 @@ class EngineImpl(Engine):
                 # （办结 20 / 拒绝 45 共用一号，spec §11.6 收口旧的 Finish/Reject 拆分）
                 await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
                                                     operator=operator, state=int(inst.state)))
+            else:
+                # issues/141 G4 义务 2（spec/02「类型键的三条义务」第 2 条）：**未知档不得静默丢节点**
+                # ——类型不在表里时先记一条可诊断日志，再决定跳过。
+                #
+                # 落点为什么在执行腿而不是解析期：本栈 `parse_flow_model` **不按类型过滤节点**
+                # （model.py 里那张表只是常量族，没有 java `ModelParser` 那种"查不到解析器就
+                # continue"的解析期丢弃臂），节点一路留在模型里，真正"这个节点什么都不做、
+                # 出边也没人走"的决定点就是这里的 if/elif 走完没人认领。⇒ 每次令牌落到该节点
+                # 打一条；令牌停在原地不再有后续推进，所以不存在按请求刷屏
+                # （反例：挂到 parse_flow_model 上，会跟着每一次发起与每一次办理各打一遍）
+                #
+                # **为什么必须带实得类型串原文**：spec/02 义务 3 段 owner 二拍「子流程暂不进契约
+                # 面」，六栈不补 `snaker:subProcess` 档 ⇒ 设计器画出的子流程节点在本栈唯一的
+                # 痕迹就是这条日志。少了 type= 那一半，"snaker:subProcess 被吞了"和"某个手写
+                # 的 snaker:Task 拼错大小写被吞了"长得一模一样，那条裁定就没有可诊断面，
+                # 等于没立法依据。nodeId 同理：没有它连是哪个节点都找不到。
+                #
+                # ⚠️ 只记日志，不改行为：跳过形状（不建行、不沿出边推进、令牌停住）已由 issues/143
+                # 在 java/php/c# 收口，本栈本来就是"按 id 现查目标、查不到就停"那一派，行为已对。
+                if node.type not in KNOWN_NODE_TYPES:
+                    logging.warning(
+                        "[jeeflow] 流程定义里的节点类型不在类型表里，该节点及其出边将被跳过"
+                        "（不建行、不推进，令牌停在此处）: nodeId=%s, type=%s",
+                        node.id, node.type)
         finally:
             await self._fire_post(node, inst)
 

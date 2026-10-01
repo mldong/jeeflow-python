@@ -7484,3 +7484,90 @@ async def test_i142_b1_update_cc_status_operator_normalized_and_blank_is_noop():
     await sql.update_cc_status(iid2, " lisi ")
     assert _i142b_cc_states(raw, iid2) == [("lisi", 1), ("", 0)], "SQL 仓写侧同样 trim 后再比"
 
+
+
+# ═══ issues/141 G4 义务 2 · 未知节点档的可诊断日志（python 腿 · 批二 §3-5）═══════════════════
+#
+# 契约逐字（jeeflow-doc/docs/spec/02-flow-definition.md:113-124「类型键的三条义务」第 2 条）：
+#   「未知档不得静默丢节点：类型不在表里时，必须**记一条可诊断日志（带节点 id 与实得类型串）**
+#    再决定跳过，不允许"静默丢节点＋连带丢它的出边"。」
+# 同文件 :107-111（owner 2026-10-01 二拍「子流程暂不进契约面」）：六栈**不补** snaker:subProcess 档，
+# 设计器画出的子流程节点就靠这条未知档日志被显式暴露 ⇒ 日志不是装饰，是那条裁定唯一的可诊断面。
+#
+# 落点是**执行期**（`engine._execute_node` 那条 if/elif 走完没人认领的 else 支），不是解析期：
+# 本栈 `parse_flow_model` 压根不按类型过滤节点（model.py 那张"表"只是常量族，没有 java
+# `ModelParser` 的"查不到解析器就 continue"臂），节点一路留在模型里 ⇒ 未知类型只有执行令牌
+# 撞上它时才可观测。挂在解析期反而会跟着每一次 start/execute 各打一遍（那才是刷屏）。
+#
+# 本轮**只加日志**：后半"指向被丢弃节点的边落穿停住、不许打崩办理"已由 issues/143 在 java/php/c#
+# 落过，本栈本来就是"按 id 现查目标、查不到就停"那一派，行为已对 ⇒ 下面顺带钉住行为没漂。
+
+_UNKNOWN_TYPE_MARKER = "不在类型表里"
+
+
+def _unknown_type_warnings(records):
+    """从 caplog.records 里只挑本条判据那句（其余 WARNING 是别处的诊断，比如 custom clazz 未注册）。"""
+    return [r.getMessage() for r in records if _UNKNOWN_TYPE_MARKER in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_i141_g4_unknown_node_type_logs_one_diagnosable_warning(caplog):
+    """未知档矩阵：每个实得类型串都**必须**留下一条同时带 nodeId 与 type 原串的日志。
+    两要素各钉一半——只打 nodeId 查不出为什么被吞，只打 type 不知道是哪个节点。
+    行为侧同钉：不建行、不推进、不打崩办理（spec/02 义务 2 后半＋issues/143 口径）。"""
+    import logging
+
+    vectors = [
+        # (实得类型串, 为什么这一档必须被暴露)
+        ("snaker:subProcess", "设计器实际输出的驼峰子流程串——owner 二拍暂不进契约面，全靠这条日志显影"),
+        ("snaker:subprocess", "契约里那条小写档同样不在表里（查表大小写敏感，不许偷偷认）"),
+        ("snaker:Task", "拼错大小写：不许再塌成 Custom/Task 任一档"),
+        ("task", "裸名（没带 snaker: 前缀）不在本栈表里"),
+        ("snaker:not-a-node", "纯杜撰"),
+        ("", "type 缺失／空串"),
+    ]
+    for raw_type, why in vectors:
+        _eng, repo, facade, _events, _reg = _i141g9_harness()
+        nodes, edges = _i142_chain([{"id": "ghost", "type": raw_type,
+                                     "text": {"value": "没人认领的节点"}, "properties": {}}])
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            iid = await _i142_start(facade, f"i141-g4-unknown-{raw_type or 'empty'}", nodes, edges)
+        msgs = _unknown_type_warnings(caplog.records)
+
+        assert len(msgs) == 1, \
+            f"[{raw_type or '<空串>'}] 未知档应恰好留一条可诊断日志（{why}），实得 {len(msgs)} 条: {msgs}"
+        m = msgs[0]
+        assert "nodeId=ghost" in m, f"[{raw_type}] 日志必须带节点 id，否则不知道哪个节点被吞: {m}"
+        assert f"type={raw_type}" in m, \
+            f"[{raw_type}] 日志必须带**实得类型串原文**（子流程裁定靠它暴露）: {m}"
+        assert "[jeeflow]" in m, f"日志得走本栈既有的 [jeeflow] 前缀惯例，方便横扫: {m}"
+
+        # 行为零改动（本轮只加日志）：节点不建行、令牌停住、办理没被打崩
+        inst = await repo.find_instance_by_id(iid)
+        assert int(inst.state) == 10, f"[{raw_type}] 实例停在进行中（不许炸、也不许假办结）: {inst.state}"
+        assert not await repo.find_doing_tasks(iid), f"[{raw_type}] 未知节点不产生待办行"
+        assert [t for t in inst.tasks if t.taskName == "ghost"] == [], \
+            f"[{raw_type}] 未知节点连历史行都不该有（没被解析成任何模型）"
+
+
+@pytest.mark.asyncio
+async def test_i141_g4_known_node_types_emit_no_unknown_warning(caplog):
+    """反向哨兵：表里那 7 档**一律不许**被报成"不在类型表里"。
+    这一格咬的是两种混过判据的写法——① 把日志无条件打出去（只在未知分支里才该响）；
+    ② 用"if/elif 走完没人认领"当未知判据（`snaker:start` 也在表里，却恰好没有执行分支，
+    令牌真走到它头上时会被误报成未知档——两个病得分开诊断，判据是 model.KNOWN_NODE_TYPES）。"""
+    import logging
+
+    for known in ("snaker:task", "snaker:decision", "snaker:fork", "snaker:join",
+                  "snaker:end", "snaker:custom", "snaker:start"):
+        _eng, repo, facade, _events, _reg = _i141g9_harness()
+        props = {"assignee": "boss"} if known == "snaker:task" else {}
+        nodes, edges = _i142_chain([{"id": "known1", "type": known,
+                                     "text": {"value": "表里的档"}, "properties": props}])
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            iid = await _i142_start(facade, f"i141-g4-known-{known}", nodes, edges)
+        msgs = _unknown_type_warnings(caplog.records)
+        assert msgs == [], f"[{known}] 是类型表里的档，不该出现未知档日志（无条件打日志／else 兜底都在这红）: {msgs}"
+        assert await repo.find_instance_by_id(iid) is not None, f"[{known}] 办理没被打崩"

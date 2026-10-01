@@ -42,6 +42,19 @@ TYPE_FORK     = "snaker:fork"
 TYPE_JOIN     = "snaker:join"
 TYPE_CUSTOM   = "snaker:custom"
 
+# 类型表全集（spec/02「类型键的三条义务」第 2 条 · issues/141 G4 立的判据本体）。
+#
+# 为什么要**具名成一个集合**，而不是让执行腿 `if/elif` 的 `else` 直接兜住：
+# `snaker:start` 也是表里的一档，但它在执行链上是**入口**（引擎从 start 的出边起步，start 自身
+# 正常不会被 `_execute_node` 走到）。用"没人认领"当未知判据，会把"令牌真走到 start 上"这种
+# 拓扑病误报成"类型不在表里"——两个病得分别可诊断。义务 2 要的是**串 ∉ 表** 那一判。
+#
+# ⚠️ 表里**没有** `snaker:subProcess`／`snaker:subprocess`：owner 2026-10-01 二拍「子流程暂不进
+# 契约面」（spec/02 义务 3 段），六栈不补这一档。设计器画出子流程节点时，本栈就靠下面那条
+# 未知档日志把它**显式暴露**出来——那条裁定唯一的可诊断面就是这条日志（见 engine._execute_node）。
+KNOWN_NODE_TYPES = frozenset({TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK,
+                              TYPE_JOIN, TYPE_CUSTOM})
+
 # ─── Domain Types ──────────────────────────────────────────────────────────────
 
 class InstanceState(IntEnum):

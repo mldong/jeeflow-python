@@ -1197,6 +1197,84 @@ class JeeflowFacade:
                                                    operator, fromActor=from_actor, toActor=to_actor))
         return None
 
+    async def _processTask_removeTaskActor(self, args: dict) -> dict:
+        """摘除参与人（issues/115 残留 · 门面第 **47** 个 action，spec 06-facade.md
+        §processTask/removeTaskActor）。SPI 侧 ``remove_task_actor`` 早就是必选方法、两仓都实现，
+        本 action 补的只是"上门面"那一段（Java 基准 ``taskRemoveActor`` 同批）。
+
+        三个兄弟 action 的分工先钉死，免得后来人把三条混用：
+        ``_taskAddActor``（surrogate/addCandidate 同体）＝**只加**；``_processTask_transfer``＝
+        **换人**（摘 A 并加 B，写 submitType=7 + tf_transferHistory 留痕 + fire 码 7）；
+        本 action＝**只摘不加、零留痕**：删掉 ``actorIds`` 在本任务的参与者行，不新建任务、
+        不写任何任务变量、不覆写任务 ``actorId``/``updateUser``/``updateTime``，也**不 fire 事件**——
+        issues/132 §11.3 定稿的事件集里没有"摘人"这一码，码 7 ``TASK_TRANSFER`` 的语义是
+        "参与者被替换"，只摘不加却发码 7 等于把没发生的转办写进事件流（要立法先开 issue）。
+
+        守卫次序（spec 同节末尾钉死，逐栈一致，门禁按 msg 断言，不接受本栈自行重排）：
+        ``operator 必填`` → ``processTaskId/actorIds 缺失`` → ``任务不存在`` → ``无权限摘除该任务参与人``
+        → ``任务非进行中，不可摘除参与人`` → ``至少需保留一名参与人`` → 落库。
+        ``operator`` 排在最前：参数全缺时若先报缺参数，鉴权缺口会被参数报错藏起来（严禁回落 user1）。
+
+        ⚠️ ``任务不存在`` 用的是 spec 钉的逐字中文文案，**不沿用** ``_processTask_transfer`` 里那句
+        历史形状 ``f"task not found: {task_id}"``——spec 同节已注明那是既有分叉、本轮不回改 transfer。
+        """
+        operator = normalize_actor_value(args.get("operator"))
+        if operator == "":
+            raise ValueError("operator 必填")
+        # 缺参数档与兄弟 action ``_taskAddActor`` 复用同一枚判据、同一条逐字文案（spec 语义 8
+        # 「同族同文案，不另造」）：``processTaskId`` 属主键档（缺失/空串/0 一律响亮报错，§2.11 末段），
+        # ``actorIds`` 两形（数组/逗号串）过同一枚归一单点，归一后丢完为空 ⇒ 同一条文案。
+        # 两条都不落库，空串元素也绝不会被喂进 DELETE ⇒ 历史 ``actor_id=''`` 脏行天然安全。
+        task_id = self._to_int(args.get("processTaskId"))
+        actor_ids = self._to_actor_ids(args.get("actorIds"))
+        # 缺参数档收齐五种形状（spec 语义 8）：缺键 / 空串 / 纯空白 / 0 / 负数。
+        # `not task_id` 管前者三者与 0，负数另判——`None < 0` 会 TypeError，靠 or 短路挡住，
+        # 所以两个条件的顺序不能颠倒。拿 0 或负数当 id 去查/去落库，与没传 id 是同一种
+        # 调用方错误，不得改口成「任务不存在」。
+        if not task_id or task_id < 0 or not actor_ids:
+            raise ValueError("processTaskId/actorIds 缺失")
+        task = await self._repo.find_task_by_id(task_id)
+        if not task:
+            raise ValueError("任务不存在")
+        # 归属判据同 transfer：被摘集合必须含操作人本人（入参已归一，比较才咬得上），或 operator 是
+        # ``flow.auto``/``flow.admin`` 哨兵（大小写不敏感沿用本栈既有 ``operator.lower() == KEY_*`` 写法）。
+        # transfer 能"摘 A 加 B"是因为 A 就是操作人本人；本 action 不得成为借道摘他人的口子。
+        targets = set(actor_ids)
+        op = operator.lower()
+        if operator not in targets and op != KEY_AUTO_ID and op != KEY_ADMIN_ID:
+            raise ValueError("无权限摘除该任务参与人")
+        # 前置态：仅进行中（DOING=10）任务可摘人。已办结/废弃/撤回的历史参与人行是 approvalRecord 的
+        # 取证依据（它读全状态任务行），摘它等于改写审批历史。
+        if task.taskState != TaskState.DOING:
+            raise ValueError("任务非进行中，不可摘除参与人")
+        actors = await self._repo.find_task_actors(task_id) or list(task.actorIds or [])
+        # 语义 6「匹配取归一值、DELETE 取行上的原值」（§2.11 硬要求②的**删除腿**）：库里的行可能是
+        # 修复前落下的未 trim 原值 ``" leader "``，入参 ``"leader"`` 必须判成同一个人**并真删掉它**——
+        # 所以匹配用归一形、喂给仓储的是那一行的**原值**。只拿归一值去 DELETE 会"判成同一人却一条没删"，
+        # 门面报成功而被摘的人待办还在，是**假成功**。
+        #
+        # 语义 5「不得摘空」的下限按**能办单的人数**算（``remaining`` 只数归一后非空的行）：历史
+        # ``actor_id=''``/纯空白脏行谁也办不了单，拿它撑住下限等于让"摘空"伪装成成功。
+        # 判据是**集合差**（当前参与者 − 归一后入参），不是"入参条数"——否则 ``actorIds`` 里混进
+        # 非参与者的 id 就能绕过这条下限。
+        to_delete: list[str] = []
+        remaining = 0
+        for row in actors:
+            normalized = normalize_actor_value(row)
+            if normalized == "":
+                continue  # 归一后为空的历史脏行：既不匹配任何入参，也不计入"一个人"
+            if normalized in targets:
+                to_delete.append(row)
+            else:
+                remaining += 1
+        if to_delete and remaining == 0:
+            raise ValueError("至少需保留一名参与人")
+        # 语义 7「幂等」：一个都没命中 ⇒ 空操作、成功信封（前端双点/集成层重放第二次不再报错）。
+        # 需要"人不在任务里就报错"请用 transfer（它有「原办理人不是该任务参与人」那档判据）。
+        if to_delete:
+            await self._repo.remove_task_actor(task_id, to_delete)
+        return None
+
     async def _processTask_latest(self, args: dict) -> dict:
         instance_id = self._to_int(args.get("processInstanceId"))
         if not instance_id:

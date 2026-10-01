@@ -1222,10 +1222,11 @@ def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime
     这条是本卡的红线——占位写法 ``expire = now`` 让"配了到期表达式的节点"建单即逾期，
     逾期统计因此全失真（issues/126 病灶形状）。
 
-    ⚠️ 与 Java 的一处有意差异：Java 在档 2「以 s/m/h/d 结尾但前缀不是整数」（表达式如 ``xh``）
-    由 ``Integer.parseInt`` 抛 NumberFormatException **打断建单**；此处按卡面 §1.5 的读法
-    （「以 s/m/h/d 结尾**且前缀是整数**」）判为不匹配档 2，继续走档 3，最终 ``None``。
+    ⚠️ 档 2「以 s/m/h/d 结尾但前缀不是整数」（``xh``／``2.5h``／``3hh``）**落穿到档 3、最终 None**，
+    这是**八栈一致**口径（issues/137 C · 卡面 §1.5 的读法「以 s/m/h/d 结尾**且前缀是整数**」）：
     错配一个到期表达式不该让流程起不来，且 ``None`` 正是「解析失败」的既定方向。
+    旧文那句「Java 在档 2 由 ``Integer.parseInt`` 抛 NumberFormatException **打断建单**、本栈是有意差异」
+    **已过期**——java 参考实现已改成同款落穿（jeeflow-java commit ``6bdf41b``，随 1.8.36 发出）。
     """
     if expr is None:
         return None

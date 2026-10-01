@@ -4907,6 +4907,122 @@ def test_i137d_process_time_tier_matrix_around_negative_prefix():
         assert process_time(expr, None) is None, f"坏前缀 {expr!r} 的既有落穿行为被改动了"
 
 
+# ─── issues/137 E · 相对档前缀**允许两端空白**（owner 2026-10-01 拍"统一 trim"）───────────
+# 契约（jeeflow-doc spec/04 §「相对档前缀允许两端空白」）：各栈在**判整数之前**裁掉前缀的两端空白，
+# 之后才走 137 D 的"非负"那一档。基准＝jeeflow-java `bf1f401`（`FlowUtil.parseIntOrNull` 里
+# `Integer.parseInt(text.trim())`）。动机是各栈整数解析对空白的容忍度天然不同（go `Atoi` 前显式
+# `TrimSpace`、rust `.trim()`、.NET `TryParse` 与本栈 `int()` 默认就收，java `parseInt` 偏偏不收）
+# ⇒ 不裁就是"同一份流程定义在别家有到期时间、这一家没有"。
+# 裁的边界只到**前缀**，三条分界逐栈一致：① `" 2h"`/`"2 h"`（空格在前缀区内、末位仍是单位符）照样算得出；
+# ② `"2h "`（单位符后带空白）末位不是 s/m/h/d、认不出单位 ⇒ 按误配落穿 ⇒ None；③ `" 2.5h"` trim 后
+# 仍是小数误配 ⇒ 仍落穿（trim ≠ 把"裁空白"做成"裁容错"）。变量档与绝对档的串本身**不 trim**。
+
+@pytest.mark.asyncio
+async def test_i137e_padded_relative_prefix_still_applies():
+    """建单路径判点，形状照 Java 基准 ``ExpireTimeOnCreateTest.paddedRelativePrefixStillApplies``
+    （jeeflow-java ``bf1f401``）：① 前带空格 / 数字与单位符之间带空格两形都**照样算得出**
+    （同行差值≈2h，判据仍是差值不是"非空"，故 now() 占位照样拦得住）；② 单位符后面带空白 ⇒ 认不出
+    单位 ⇒ 仍 NULL —— 这一格专门挡"把 trim 做成整串去空白"（``expr.strip()`` 后再判末位）那种顺手放宽；
+    ③ ``" 2.5h"`` 裁完仍是小数、④ ``" -5h"`` 裁完判负照旧生效 ⇒ 两档都仍落穿；
+    末段**正向对照**（不带空格的 ``2h`` / ``+2h``）保证①那两格不是恒真。"""
+    # ① 空格落在前缀区内、末位仍是单位符 ⇒ 两形都算得出 now+2h
+    for i, expr in enumerate((" 2h", "2 h")):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]),
+                                            f"expire137e_pad{i}")
+        inst = await eng.start_process_instance_by_id(def_id, "applicant")
+        _assert_expire_after_create(await _row(repo, inst.id, "approve"), 2 * 3600,
+                                    f'前缀带空白的相对档 "{expr}"')
+
+    # ② 单位符后面还带空白 ⇒ 末位不是 s/m/h/d ⇒ 落穿绝对档 ⇒ None（整串去空白是另一件没立过法的事）
+    for i, expr in enumerate(("2h ", "\t+2h ", "2h\t", " 2h  ")):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]),
+                                            f"expire137e_tail{i}")
+        inst = await eng.start_process_instance_by_id(def_id, "applicant")
+        row = await _row(repo, inst.id, "approve")
+        assert row.expireTime is None, \
+            f"{expr!r} 末位是空白、认不出单位 ⇒ 应落穿成 NULL，实得 {row.expireTime!r}"
+
+    # ③ 裁空白 ≠ 裁容错（小数/非整数前缀裁完还是误配）；④ 判负（137 D）在 trim 之后照旧生效
+    for i, expr in enumerate((" 2.5h", " xh", " -5h", " -5d")):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]),
+                                            f"expire137e_bad{i}")
+        inst = await eng.start_process_instance_by_id(def_id, "applicant")
+        row = await _row(repo, inst.id, "approve")
+        assert row.expireTime is None, \
+            f"{expr!r} 裁完仍是误配/负数 ⇒ 应落穿成 NULL，实得 {row.expireTime!r}"
+
+    # 正向对照：不带空格的 2h / +2h 照旧算得出（上面①不是恒真，也证明裁空白没误伤加号档）
+    for i, expr in enumerate(("2h", "+2h")):
+        eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", expr)]),
+                                            f"expire137e_plain{i}")
+        inst = await eng.start_process_instance_by_id(def_id, "applicant")
+        _assert_expire_after_create(await _row(repo, inst.id, "approve"), 2 * 3600,
+                                    f'正向对照（无空白）"{expr}"')
+
+    # 变量档不 trim：带空白的表达式名去 args 里取键 ⇒ 取不到 ⇒ 按既有落穿路径 ⇒ None
+    # （若实现顺手把整串 trim 成键名，这里就会"突然取到值"，本格当场红）
+    eng, repo, def_id = _expire_harness(_expire_flow([("approve", "leader", " dueAt ")]),
+                                        "expire137e_varkey")
+    inst = await eng.start_process_instance_by_id(def_id, "applicant",
+                                                  {"dueAt": "2026-12-31 10:00:00"})
+    row = await _row(repo, inst.id, "approve")
+    assert row.expireTime is None, \
+        f"变量档的键名不 trim：\" dueAt \" 取不到 dueAt ⇒ 落穿 ⇒ NULL，实得 {row.expireTime!r}"
+
+
+def test_i137e_process_time_tier_matrix_around_padded_prefix():
+    """求值器档位矩阵（直调 ``process_time``，不借建单路径），把"trim 只发生在档 2 的前缀切片上"
+    钉到每个档位：① 四档 s/m/h/d 的带空前缀都算得出（含制表符，``strip()`` 与 java ``trim()`` 同覆盖）；
+    ② 单位符后带空白一律 None；③ 裁完仍是误配的一律 None；④ 负数裁完照旧被判负拦下。
+    另钉两档**不 trim** 的边界：键名带空白 ⇒ 变量档取不到（对照：不带空白时取得到，保证不是恒真）；
+    绝对档串带空白 ⇒ 仍 None（对照：不带空白时解析成功）。"""
+    from jeeflow.engine import process_time
+
+    # ① 前缀区内带空白（h/m/s 三档）：秒级带宽 ±5s
+    for expr, want in ((" 2h", 2 * 3600), ("2 h", 2 * 3600), ("\t+3h", 3 * 3600),
+                       (" 30s", 30), (" 45m", 2700)):
+        got = process_time(expr, None)
+        assert got is not None, f"前缀带空白的 {expr!r} 必须照样算得出"
+        delta = (got - datetime.now()).total_seconds()
+        assert want - 5 <= delta <= want + 5, f"{expr!r} 偏移 = {delta}s，want ≈{want}s"
+
+    # ① 天档同款（走日历加天，跨夏令时是 23/25 小时 ⇒ 带宽 ±3600s，与本栈 126 组天档判据一致）
+    for expr, want in ((" 1d", 86400), ("1 d", 86400)):
+        got = process_time(expr, None)
+        assert got is not None, f"天档带空白的 {expr!r} 必须照样算得出"
+        delta = (got - datetime.now()).total_seconds()
+        assert want - 3600 <= delta <= want + 3600, f"{expr!r} 偏移 = {delta}s，want ≈{want}s（日历加天）"
+
+    # ② 单位符后面带空白 ⇒ 末位不是 s/m/h/d ⇒ 认不出单位 ⇒ 落穿（整串去空白是另一件事）
+    for expr in ("2h ", "2h\t", "\t+2h ", " 2h  ", "30s ", "1d "):
+        assert process_time(expr, None) is None, f"单位符后带空白的 {expr!r} 应落穿成 None"
+
+    # ③ trim 之后仍是误配 ⇒ 仍落穿（trim 不是裁容错）
+    for expr in (" 2.5h", " xh", " 3hh", "+ 2h"):
+        assert process_time(expr, None) is None, f"裁完仍是误配的 {expr!r} 应落穿成 None"
+
+    # ④ 判负（137 D）在 trim **之后**照常生效：加了裁空白不能把负号一并绕过去
+    for expr in (" -5h", " -5d", "\t-30s", "- 5h"):
+        assert process_time(expr, None) is None, f"负数带空白的 {expr!r} 应判负落穿成 None"
+
+    # 正向对照（不带空白，保证上面四组不是恒真）
+    for expr in ("2h", "+2h", "30s", "1d"):
+        assert process_time(expr, None) is not None, f"无空白的 {expr!r} 照旧该算得出"
+
+    # 变量档：串本身不 trim ⇒ 带空白的键名取不到值（对照：不带空白取得到）
+    want_at = datetime(2028, 8, 8, 8, 8, 8)
+    assert process_time(" dueAt ", {"dueAt": want_at}) is None, \
+        "变量档不 trim：\" dueAt \" 不等于键 \"dueAt\" ⇒ 取不到值 ⇒ 按既有路径落穿"
+    assert process_time("dueAt", {"dueAt": want_at}) == want_at, \
+        "对照：不带空白的键名照旧取值（上一格不是恒真）"
+
+    # 绝对档：串本身同样不 trim ⇒ 带空白的合法时间串仍解析不出（对照：不带空白解析成功）
+    assert process_time(" 2026-12-31 10:00:00", None) is None, \
+        "绝对档不 trim：前导空白的串仍按解析不出处理 ⇒ None"
+    assert process_time("2026-12-31 10:00:00", None) == datetime(2026, 12, 31, 10, 0, 0), \
+        "对照：绝对档不带空白照旧成功 ⇒ 第 3 档没被这次裁空白牵连"
+
+
 @pytest.mark.asyncio
 async def test_i126_parallel_countersign_applies_to_every_member():
     """写点③「并行会签全员」：Java 的并行循环是**每位成员**都算，不是只算首位。

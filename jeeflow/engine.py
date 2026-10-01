@@ -1149,9 +1149,12 @@ def _filter_field_by_perm(args: dict, node: Optional[FlowNode]) -> dict:
 
 #: 绝对时刻格式（Java ``SimpleDateFormat("yyyy-MM-dd HH:mm:ss")``，只此一种）
 _EXPIRE_LAYOUT = "%Y-%m-%d %H:%M:%S"
-#: 相对档前缀必须是整数（Java ``Integer.parseInt`` 的接受面；``int(" 2")``/``"1_0"`` 不算）。
+#: 相对档前缀必须是整数（Java ``Integer.parseInt`` 的接受面；按 issues/137 E 裁掉**两端空白**之后，
+#: ``"1_0"`` 这类带下划线/小数的串仍不算）。
 #: ``[+-]?`` 是**故意**留符号位的（issues/137 D 只裁负不裁加号）：负数在 :func:`process_time`
-#: 里 ``int()`` **之后**判掉 ⇒ 落穿档 3，正则本身不收窄，免得把 '+' 裁成新的一处跨栈分叉
+#: 里 ``int()`` **之后**判掉 ⇒ 落穿档 3，正则本身不收窄，免得把 '+' 裁成新的一处跨栈分叉。
+#: ⚠️ 正则里**不塞** ``\s*``：空白由 :func:`process_time` 在切片上做 ``.strip()`` 处理，
+#: 位置只在「判整数之前」，这样 137 D 的判负点（``offset >= 0``）不必跟着挪。
 _INT_PREFIX = re.compile(r"[+-]?[0-9]+")
 _UNIT_BY_SUFFIX = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 
@@ -1172,6 +1175,10 @@ def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime
        前缀为负（``-5h`` / ``-5d``）按**不合法**处理，与坏前缀一样落穿档 3 ⇒ ``None``
        （issues/137 D · owner 2026-10-01 拍"判非负"：放行负偏移＝建单即逾期）；带 ``'+'`` 的前缀
        照旧合法（只裁负不裁加号）。
+       前缀**允许两端空白**（issues/137 E · owner 2026-10-01 拍"统一 trim"）：判整数**之前**裁掉
+       ``expr[:-1]`` 的两端空白，裁完再走上那条非负判定 —— ``" 2h"`` / ``"2 h"``（空格落在前缀区内、
+       末位仍是单位符）照样算得出。裁的边界**只到前缀**：``"2h "`` 的末位是空格、认不出单位 ⇒ 仍按误配
+       落穿；``" 2.5h"`` 裁完仍是小数 ⇒ 仍落穿。变量档与绝对档的串本身**不 trim**。
     3. **绝对档**：把 ``expr`` 本身按 ``"yyyy-MM-dd HH:mm:ss"`` 解析 → 时刻；失败 → ``None``。
 
     **任何一档都不得返回 now()**：没配 / 解析不出 ⇒ ``None``（这一列留 NULL）。
@@ -1204,8 +1211,25 @@ def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime
     if not expr:
         return None
     suffix = expr[-1]
-    if suffix in _UNIT_BY_SUFFIX and _INT_PREFIX.fullmatch(expr[:-1]):
-        offset = int(expr[:-1])
+    # issues/137 E（owner 2026-10-01 拍"统一 trim" · spec 04 §「相对档前缀允许两端空白」）：
+    # **判整数之前**先裁掉前缀的两端空白，裁完才走 137 D 那条"非负"判定（基准＝jeeflow-java ``bf1f401``）。
+    # 为什么要显式裁：各栈整数解析对空白的容忍度天然不同 —— go 在 ``Atoi`` 前 ``TrimSpace``、rust
+    # ``.trim()``、.NET ``TryParse`` 与 python ``int()`` 默认就收前后空白，而 java ``Integer.parseInt(" 2")``
+    # 偏偏抛 ⇒ 不裁就是"同一份流程定义在别家有到期时间、这一家没有"（到期表达式是设计器手填 / JSON
+    # 搬运的字符串，夹一个空格是常态）。
+    # 三条分界（本栈靠"只裁 ``expr[:-1]``、``suffix`` 原样"这一处形状天然成立）：
+    #   ① ``" 2h"`` / ``"2 h"``：空格落在**前缀区内**、末位仍是单位符 ⇒ 裁完照样算出 now+2h；
+    #   ② ``"2h "``：单位符后面还带空白 ⇒ ``suffix`` 是空格、认不出单位 ⇒ 按误配**落穿**到档 3 ⇒ None。
+    #      裁的边界只到前缀：把整串去空白（``expr.strip()`` 再判末位）是另一件没立过法的事，不许顺手做；
+    #   ③ ``" 2.5h"``：trim 之后仍是小数误配 ⇒ ``fullmatch`` 照样不收 ⇒ 仍落穿 —— trim ≠ "裁容错"。
+    # 判负（137 D）位置不动、加了 trim 也照旧生效：``" -5h"`` 裁完是 ``-5`` ⇒ 下面 ``offset >= 0`` 拦下 ⇒ None。
+    # ⚠️ 变量档（上面 ``expr in args``）与绝对档（下面 ``strptime(expr, ...)``）**都不 trim 串本身**：
+    #    那是键名 / 时间串本身，裁它改的是另一件事（键名带空格就该取不到值、按既有落穿路径走）。
+    # 正则 ``_INT_PREFIX`` 一个字不动（不往 pattern 里塞 ``\s*``）：fullmatch 与 ``int()`` 必须吃
+    # **同一个**裁过的切片，否则"认得出但转不了"或反之，两处判据就分叉了。
+    prefix = expr[:-1].strip()
+    if suffix in _UNIT_BY_SUFFIX and _INT_PREFIX.fullmatch(prefix):
+        offset = int(prefix)
         # issues/137 D（owner 2026-10-01 拍"判非负"）：**负数前缀同样算不合法** —— 不进档 2，
         # 沿本函数既有的落穿路径继续走档 3 ⇒ 仍解析不出即 ``None``（这一列留 NULL）。
         # 两条理由逐字对齐 java ``FlowUtil.parseIntOrNull``：

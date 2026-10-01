@@ -7571,3 +7571,267 @@ async def test_i141_g4_known_node_types_emit_no_unknown_warning(caplog):
         msgs = _unknown_type_warnings(caplog.records)
         assert msgs == [], f"[{known}] 是类型表里的档，不该出现未知档日志（无条件打日志／else 兜底都在这红）: {msgs}"
         assert await repo.find_instance_by_id(iid) is not None, f"[{known}] 办理没被打崩"
+
+
+# ═══ issues/137 A · 裁定 A（批二 §3-4）· 实例行 expire_time ＝ 定义**顶层**表达式的求值结果 ═══════
+#
+# 立法依据：jeeflow-hub/docs/goal-批二-引擎收尾发版轮-启动词.md §3-4 ＋ issues/137 A（owner 拍 A 案：
+# 实例级 expire_time 是**定义级表达式的求值结果**，不是表达式原串、也不是 now()）。
+# 基准＝java：JeeflowEngineImpl.java:93-96（发起时取流程定义**顶层** ``model.getExpireTime()``，
+# 非空才 ``instance.setExpireTime(FlowUtil.processTime(expireTime, args))``）
+#      ＋ boot2 内置版 ProcessInstanceServiceImpl.java:157-160（先判非空再写，同一形状）。
+# spec 02:21/55「流程期望完成时间」＝流程 JSON **根上**那个 expireTime 键（与节点 properties 里那份
+# 是两个位置，任务行读 properties、实例行读根，两列各判各的）。
+#
+# 本栈原形状＝**这一处写点压根没有**：``FlowModel`` 连根上的 expireTime 都不读（没有那个字段），
+# 引擎发起腿也一句没赋 ⇒ ``wf_process_instance.expire_time`` 从来没被写过（恒 NULL）。
+# 本轮补两半：① ``FlowModel.expireTime`` ＋ ``parse_flow_model`` 读根键；② 发起腿在 ``save_instance``
+# **之前**用**既有那把尺子**（``process_time``，套在 ``_apply_expire_time`` 的"非空才写"守卫里）
+# 求值后落到实例行——不新造第二把尺子，档位顺序与语义一字不动。
+#
+# ⚠️ 判据全部打在**仓储读回的持久行**上（``repo.find_instance_by_id``／SQLite 直查列），
+#    不看引擎返回的那个聚合对象——issues/113 的形状：只有读回值能证明这一列真进了库。
+# ⚠️ 判据打在**值**上（具体时刻 / 同行 expire−create 带宽 / NULL），**不是"非空"空判**：
+#    "非空"既放过 now() 占位（差值≈0＝新建即逾期，issues/126 病灶），也放过搬原串。
+#
+# 五条判据 → 格子对照：
+#  ① 进列的是**求值结果（时刻）**不是原串 → ``..._is_a_moment_not_the_raw_expression``（相对档＋变量档
+#     两格对"搬原串"这一刀敏感：``"2h"``/``"dueAt"`` 原串都算不出时刻。绝对档那格原串与时刻同形，
+#     抓不到这一刀，故**故意不拿它当主判据**，只当档位未被改动的对照）。
+#     真库那一刀（160 MySQL ``@@sql_mode`` 含 STRICT_TRANS_TABLES，rust/php 本轮实测服务端给
+#     1292/22007 ``Incorrect datetime value: '2h' for column 'expire_time'``）另见
+#     ``test_i137a_column_lands_in_the_sql_repository`` 的 SQL 通道格 ＋ tests/jdbc_test.py 的 ⑱ 段。
+#  ② 求值的 args＝**发起参数**（已注入用户信息与 autoGenTitle 的那份）
+#     → ``..._takes_the_start_args`` ＋ ``..._takes_the_injected_copy_not_the_raw_caller_dict``
+#  ③ 定义没配（缺键／空串／纯空白／null）⇒ 该列保持 NULL，不赋 now()、不赋空串
+#     → ``..._not_configured_keeps_the_column_null``
+#  ④ 配了但算不出（误配／负数档）⇒ NULL，沿用既有落穿语义，不许兜底 now
+#     → ``..._unparsable_or_negative_keeps_the_column_null``
+#  ⑤ 求值器复用既有那一枚（档位顺序与语义一字不改）
+#     → ``..._same_ruler_as_task_rows`` ＋ ``..._variable_tier_beats_relative_tier_on_the_instance_row``
+
+_I137A_SQL_DDL = (
+    # 发起腿 SQL 通道用到的四张表，列名逐字对齐 tests/schema/schema-mysql.sql 与 repository/base.py 的 SQL；
+    # 形状照 _cc141_sql_repo / _i142b_sql_repo 的先例：真 SQLite ＋ 真 JdbcRepository，不用内存假仓。
+    "CREATE TABLE wf_process_define (id INTEGER PRIMARY KEY, name TEXT, display_name TEXT,"
+    " type TEXT, state INTEGER, content TEXT, version INTEGER, create_time TEXT, create_user TEXT,"
+    " update_time TEXT, update_user TEXT)",
+    "CREATE TABLE wf_process_instance (id INTEGER PRIMARY KEY, parent_id INTEGER,"
+    " process_define_id INTEGER, state INTEGER, parent_node_name TEXT, business_no TEXT,"
+    " operator TEXT, expire_time TEXT, variable TEXT, create_time TEXT, create_user TEXT,"
+    " update_time TEXT, update_user TEXT)",
+    "CREATE TABLE wf_process_task (id INTEGER PRIMARY KEY, process_instance_id INTEGER,"
+    " task_name TEXT, display_name TEXT, task_type INTEGER, perform_type INTEGER,"
+    " task_state INTEGER, operator TEXT, finish_time TEXT, expire_time TEXT, form_key TEXT,"
+    " task_parent_id INTEGER, variable TEXT, create_time TEXT, create_user TEXT,"
+    " update_time TEXT, update_user TEXT)",
+    "CREATE TABLE wf_process_task_actor (id INTEGER PRIMARY KEY, process_task_id INTEGER,"
+    " actor_id TEXT, create_time TEXT, create_user TEXT)",
+)
+
+
+def _i137a_sql_repo():
+    """真 SQLite ＋ 真 ``JdbcRepository``（内存仓绿 ≠ 落库绿，这一路钉的是**列真的进了库**）。"""
+    from jeeflow.repository.base import JdbcRepository
+    raw = sqlite3.connect(":memory:")
+    for ddl in _I137A_SQL_DDL:
+        raw.execute(ddl)
+    return raw, JdbcRepository(_SqliteAdapter(raw), _TestIDGen())
+
+
+def _i137a_content(root=_MISSING, specs=(("approve", "leader", _MISSING),),
+                   name: str = "expire137a") -> str:
+    """根上带/不带 expireTime 的流程 JSON。
+    节点一律**不配**到期表达式（specs 的 expr 默认 ``_MISSING``）⇒ 实例那一列是本组唯一变量，
+    任务行恒 NULL，两列的判据不会互相冒充。
+    ``root`` 传 ``_MISSING`` ＝ 根上不写这个键；传 ``None``/``""``/``"   "`` 原样进 JSON。"""
+    raw = json.loads(_expire_flow(list(specs), name))
+    if root is not _MISSING:
+        raw["expireTime"] = root
+    return json.dumps(raw, ensure_ascii=False)
+
+
+async def _i137a_start(root=_MISSING, args=None, define_name: str = "expire137a",
+                       specs=(("approve", "leader", _MISSING),)):
+    """发起一条流，返回 (repo, 引擎返回值, **仓储读回的持久行**)。
+    判据只吃第三项——引擎那个聚合对象上挂着没落库的字段也算"有值"（issues/113 形状）。"""
+    eng, repo, def_id = _expire_harness(_i137a_content(root, specs, define_name), define_name)
+    inst = await eng.start_process_instance_by_id(def_id, "zhangsan", dict(args or {}))
+    row = await repo.find_instance_by_id(inst.id)
+    assert row is not None, "夹具自证：实例行没读回（" + define_name + "）"
+    return repo, inst, row
+
+
+def _i137a_moment(value, who: str):
+    """值级判据的前半：这一列存的必须是**时刻**（datetime），不是别的什么。
+    搬原串那一刀在这里就断掉：``"2h"`` / ``"dueAt"`` 进列后 to_datetime 认不出 ⇒ None ⇒ 红。"""
+    assert value is not None, f"{who}：实例行 expire_time 为 NULL（写点没生效？）"
+    got = to_datetime(value)
+    assert got is not None, \
+        f"{who}：expire_time 存的不是时刻，实得 {value!r}（把表达式原串搬进 datetime 列＝" \
+        f"真库上是 1292/22007 Incorrect datetime value，内存里也只是假绿）"
+    return got
+
+
+@pytest.mark.asyncio
+async def test_i137a_instance_expire_is_a_moment_not_the_raw_expression():
+    """判据①：进列的是**求值结果**（时刻），不是表达式原串。
+    相对档钉"同行 expire − create ≈ 偏移"（带宽 [N−5s, N+60s]，同 issues/126 那把尺子）——
+    只判"非空"会被 now() 占位蒙过（差值≈0＝建单即逾期），判原串搬进来则连减法都做不了。"""
+    for expr, seconds, who in (("2h", 2 * 3600, "小时档"), ("90s", 90, "秒档"),
+                               ("30m", 30 * 60, "分钟档"), ("1d", 86400, "天档")):
+        _repo, _inst, row = await _i137a_start(expr, define_name=f"expire137a-{who}")
+        assert row.createTime is not None, f"{who}：对照列 create_time 就该有值"
+        create, expire = to_datetime(row.createTime), _i137a_moment(row.expireTime, f"{who} 配 {expr!r}")
+        delta = (expire - create).total_seconds()
+        assert seconds - 5 <= delta <= seconds + 60, \
+            f"{who} 配 {expr!r}：同行 expire − create = {delta}s，want ≈{seconds}s；" \
+            f"差值≈0 就是 now() 占位，差值算不出就是原串（实得 {row.expireTime!r}）"
+    # 绝对档对照：原串与时刻同形，这一档**抓不到搬原串那一刀**，只证明第 3 档没被改动
+    _repo, _inst, row = await _i137a_start("2026-12-31 10:00:00", define_name="expire137a-abs")
+    assert to_datetime(row.expireTime) == datetime(2026, 12, 31, 10, 0, 0), \
+        f"绝对档应原样算成那一刻，实得 {row.expireTime!r}"
+
+
+@pytest.mark.asyncio
+async def test_i137a_variable_tier_takes_the_start_args():
+    """判据②：求值用的 args ＝**发起参数**。表达式是个变量名 ⇒ 取该变量的值当到期时刻。
+    三种值形状（datetime 对象 / 毫秒时间戳 / 契约格式文本）必须给出**同一时刻**（与任务行那三档同判据）。"""
+    want = datetime(2026, 12, 31, 10, 0, 0)
+    for label, value in (("契约格式文本", "2026-12-31 10:00:00"),
+                         ("毫秒时间戳", int(want.timestamp() * 1000)),
+                         ("datetime 对象", want)):
+        _repo, _inst, row = await _i137a_start("dueAt", {"dueAt": value},
+                                               define_name=f"expire137a-var-{label}")
+        got = _i137a_moment(row.expireTime, f"变量档（{label}）")
+        assert abs((got - want).total_seconds()) < 1, \
+            f"变量档（{label}）应取 args 里那份值得 {want}，实得 {got!r}" \
+            f"（拿不到 args 就说明写点用的不是发起参数那份）"
+
+
+@pytest.mark.asyncio
+async def test_i137a_variable_tier_beats_relative_tier_on_the_instance_row():
+    """判据⑤（档位顺序）：实例行同样**变量档优先于相对档** —— args 里真有个键叫 "2h" 时
+    取的是变量值那一刻，不是 now+2h。这一格同时挡住"给实例行新造一把只认相对档的尺子"。"""
+    _repo, _inst, row = await _i137a_start("2h", {"2h": "2030-01-01 00:00:00"},
+                                           define_name="expire137a-order")
+    got = _i137a_moment(row.expireTime, "变量档压过相对档")
+    assert got == datetime(2030, 1, 1, 0, 0, 0), \
+        f"实例行的档位顺序与任务行分叉了：want 2030-01-01 00:00:00，实得 {got!r}"
+
+
+@pytest.mark.asyncio
+async def test_i137a_takes_the_injected_copy_not_the_raw_caller_dict():
+    """判据②（取哪一份的实读结论）：args 必须是**注入用户信息与 autoGenTitle 之后**的那份。
+    夹具：根上表达式写作变量名 ``autoGenTitle``，同时 caller 在 args 里塞一个**同名**的假时刻。
+    引擎发起腿在求值前已经把 ``autoGenTitle`` 覆写成 "<实名>的<流程名>-yyyy-MM-dd HH:mm"（标题串），
+    那份值解析不出 ⇒ 该列 NULL。写点若取的是注入**前**的 caller dict，这里会读出 2030-06-01 08:30:00。
+    基准侧同判据：java JeeflowEngineImpl 是 ``addUserInfoToArgs``/``addAutoGenTitle`` **就地**改过
+    的 ``args`` 才递给 ``FlowUtil.processTime``（顺序不可换）。
+    正向对照同格给出：没被注入覆写的键（dueAt）照样取得到值 ⇒ 这一格不是"永远 NULL"的恒真判据。"""
+    _repo, _inst, row = await _i137a_start(KEY_AUTO_GEN_TITLE,
+                                           {KEY_AUTO_GEN_TITLE: "2030-06-01 08:30:00"},
+                                           define_name="expire137a-injected")
+    assert row.expireTime is None, \
+        f"实例级求值必须吃**注入之后**那份参数：autoGenTitle 已被引擎改写成标题串（解析不出 ⇒ NULL），" \
+        f"读出 {row.expireTime!r} 说明取的是注入前的 caller dict"
+    assert row.variables.get(KEY_AUTO_GEN_TITLE) != "2030-06-01 08:30:00", \
+        "夹具自证：注入确实覆写了这个键（否则上一句恒真）"
+
+    _repo2, _inst2, row2 = await _i137a_start("dueAt", {"dueAt": "2030-06-01 08:30:00"},
+                                              define_name="expire137a-notinjected")
+    assert to_datetime(row2.expireTime) == datetime(2030, 6, 1, 8, 30), \
+        f"正向对照：没被注入覆写的变量照样取到值，实得 {row2.expireTime!r}"
+
+
+@pytest.mark.asyncio
+async def test_i137a_not_configured_keeps_the_column_null():
+    """判据③：定义**没配**顶层 expireTime（JSON 缺键 / 空串 / 纯空白 / null）⇒ 该列保持 NULL。
+    三档都不许赋 now()、不许赋空串（空串进 DATETIME 列在真库上是硬错，在内存里是"看着有值"的假绿）。
+    对照列 create_time 必须非空——否则"这一列空"是整行没落库，判不出档位。"""
+    for label, root in (("键缺失", _MISSING), ("空串", ""), ("纯空白", "   "), ("null", None)):
+        _repo, _inst, row = await _i137a_start(root, define_name=f"expire137a-none-{label}")
+        assert row.createTime is not None, f"{label}：对照列 create_time 应有值（整行得先落进库）"
+        assert row.expireTime is None, \
+            f"根上 {label} 时实例行不得被赋任何时间，实得 {row.expireTime!r}"
+
+
+@pytest.mark.asyncio
+async def test_i137a_unparsable_or_negative_keeps_the_column_null():
+    """判据④：配了但**算不出**（误配 / 负数相对档）⇒ NULL，沿用既有落穿语义，不许兜底 now()。
+    负数档放行＝建单即逾期（算出一个过去时刻），兜底 now＝建单即逾期（差值 0），两种病都在这格红。"""
+    for expr in ("not-a-time", "xh", "12x3h", "2.5h", "-5h", "-5d", "-30s",
+                 "2026-13-31 10:00:00", "2O26-12-31 10:00:00"):
+        _repo, _inst, row = await _i137a_start(expr, define_name=f"expire137a-bad")
+        assert row.createTime is not None, f"误配 {expr!r}：对照列 create_time 应有值"
+        assert row.expireTime is None, \
+            f"表达式 {expr!r} 算不出必须留 NULL，实得 {row.expireTime!r}" \
+            f"（≈create_time＝兜了 now()，早于 create_time＝放行了负数档）"
+
+
+@pytest.mark.asyncio
+async def test_i137a_same_ruler_as_task_rows():
+    """判据⑤：实例行与任务行**共用同一把尺子**（``process_time``，没有第二枚）。
+    同一份表达式同时写在根上与节点 properties 上 ⇒ 两行读出**同一时刻**；
+    再与直调 ``process_time`` 的返回值逐字对齐——尺子被换掉/包了兜底，这三方就分叉。"""
+    # 绝对/变量档可精确对齐
+    specs = (("approve", "leader", "dueAt"),)
+    eng_repo, eng_inst, row = await _i137a_start("dueAt", {"dueAt": "2026-12-31 10:00:00"},
+                                                 specs=specs, define_name="expire137a-shared")
+    task_rows = [t for t in await eng_repo.find_doing_tasks(eng_inst.id) if t.taskName == "approve"]
+    assert len(task_rows) == 1, f"夹具自证：approve 进行中行应恰好 1 条，实得 {len(task_rows)}"
+    want = datetime(2026, 12, 31, 10, 0, 0)
+    assert to_datetime(row.expireTime) == want, f"实例行：want {want}，实得 {row.expireTime!r}"
+    assert to_datetime(task_rows[0].expireTime) == want, \
+        f"任务行：want {want}，实得 {task_rows[0].expireTime!r}（两行不同尺子＝分叉）"
+    from jeeflow.engine import process_time as _pt
+    assert _pt("dueAt", {"dueAt": "2026-12-31 10:00:00"}) == want, "尺子本身的行为被改动了"
+
+    # 相对档：同一枚尺子给两行的偏移量同档（都是 now+2h，差值只来自取时的毫秒级先后）
+    eng_repo2, eng_inst2, row2 = await _i137a_start("2h", specs=(("approve", "leader", "2h"),),
+                                                    define_name="expire137a-shared-rel")
+    task2 = [t for t in await eng_repo2.find_doing_tasks(eng_inst2.id) if t.taskName == "approve"][0]
+    inst_at = _i137a_moment(row2.expireTime, "共用尺子（相对档）· 实例行")
+    task_at = _i137a_moment(task2.expireTime, "共用尺子（相对档）· 任务行")
+    assert abs((inst_at - task_at).total_seconds()) <= 5, \
+        f"同一份 \"2h\" 在实例行与任务行上给出 {inst_at} / {task_at}，差 >5s ⇒ 两处用了不同的尺子"
+
+
+@pytest.mark.asyncio
+async def test_i137a_column_lands_in_the_sql_repository():
+    """判据①＋落库：走**真 SQL 通道**（SQLite ＋ 真 JdbcRepository），直查 ``expire_time`` 那一列。
+    内存仓的 deepcopy 让"字段有值"廉价成立；这一格钉的是 INSERT 的位置参真把**时刻**带进了列。
+    搬原串那一刀在这里同样红：``'2h'`` 落进列后 to_datetime 认不出（真库上更硬——MySQL
+    STRICT_TRANS_TABLES 直接报 1292/22007 Incorrect datetime value，见 jdbc_test.py ⑱ 段）。"""
+    from jeeflow.repository.base import JdbcRepository
+    raw, repo = _i137a_sql_repo()
+    eng = EngineImpl(repo, _TestUserProv(), _TestIDGen())
+    now = datetime.now()
+
+    async def _start(root, define_name):
+        d = ProcessDefine(name=define_name, displayName="实例到期", type="test", state=1, version=1,
+                          content=_i137a_content(root, name=define_name),
+                          createTime=now, updateTime=now, createUser="t", updateUser="t")
+        await repo.save_define(d)
+        inst = await eng.start_process_instance_by_id(d.id, "zhangsan", {"amount": "1"})
+        return raw.execute("SELECT expire_time, create_time FROM wf_process_instance WHERE id=?",
+                           (inst.id,)).fetchone(), await repo.find_instance_by_id(inst.id)
+
+    col, back = await _start("2h", "i137a-sql")
+    assert col is not None, "SQL 通道夹具自证：实例行没落库"
+    stored, created = col[0], col[1]
+    assert stored is not None and stored != "2h", \
+        f"列里必须是求值结果，实得 {stored!r}（原串进 DATETIME 列在真库上是硬错）"
+    at, ct = to_datetime(stored), to_datetime(created)
+    assert at is not None, f"列值解析不成时刻（原串搬运？）：{stored!r}"
+    delta = (at - ct).total_seconds()
+    assert 2 * 3600 - 5 <= delta <= 2 * 3600 + 60, \
+        f"库里同行 expire − create = {delta}s，want ≈7200s（实得 expire={stored!r} create={created!r}）"
+    assert to_datetime(back.expireTime) == at, \
+        f"仓储读回与直查列不一致（列没进 SELECT 映射？）：直查 {stored!r} 读回 {back.expireTime!r}"
+
+    # 没配那一档：落库必须是 NULL 列（不是空串、不是 now）
+    col2, back2 = await _start(_MISSING, "i137a-sql-none")
+    assert col2[0] is None, f"定义没配顶层 expireTime 时列必须 NULL，实得 {col2[0]!r}"
+    assert back2.expireTime is None, f"仓储读回同判 NULL，实得 {back2.expireTime!r}"
+    assert col2[1] is not None, "对照列 create_time 应有值（整行确实落了库）"

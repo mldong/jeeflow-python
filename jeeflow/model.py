@@ -12,6 +12,12 @@ class FlowModel:
     name: str = ""
     displayName: str = ""
     type: str = ""
+    # 流程定义**顶层**的「期望完成时间」表达式（spec 02:21/55，设计器 JSON 根上的 expireTime 键；
+    # 对齐 Java ``ProcessModel.expireTime`` / ``LfModel.expireTime``）。
+    # 它是**表达式原串**（"2h" / "2026-12-31 10:00:00" / 变量名），不是时刻——
+    # 求值成时刻由引擎发起腿用那把唯一的尺子 ``engine.process_time`` 做（issues/137 A 裁定 A）。
+    # 缺键／空串 ⇒ 默认空串 ⇒ 实例那一列保持 NULL（不许赋 now()、不许赋空串进 datetime 列）。
+    expireTime: Optional[str] = ""
     nodes: list["FlowNode"] = field(default_factory=list)
     edges: list["FlowEdge"] = field(default_factory=list)
 
@@ -440,6 +446,10 @@ def parse_flow_model(raw: dict) -> FlowModel:
         name=raw.get("name", ""),
         displayName=raw.get("displayName", ""),
         type=raw.get("type", ""),
+        # 顶层 expireTime 一并读入（issues/137 A · 裁定 A 的前半：解析层要拿得到这条表达式，
+        # 发起腿才有东西可求值；JSON 里 "expireTime": null 照 Java 的 String 字段落成 None，
+        # 由发起那一处的"非空才写"守卫挡住 ⇒ 该列保持 NULL）
+        expireTime=raw.get("expireTime", ""),
         nodes=nodes,
         edges=edges,
     )

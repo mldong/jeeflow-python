@@ -1173,6 +1173,124 @@ async def main():
               states == {"142cc": 1, "": 0}, str(states))
         await _exec("DELETE FROM wf_process_cc_instance WHERE id = ?", [9_430_110])
 
+        # ── ⑱ issues/137 A · 裁定 A（批二 §3-4）：实例行 expire_time 的**真库腿** ──────────
+        # 病灶形状：本栈发起腿**一处都没给** wf_process_instance.expire_time 赋过值（该列恒 NULL），
+        # 本轮补的是"定义顶层 expireTime 表达式 → 求值 → 写实例行"这一处写点（基准＝java
+        # JeeflowEngineImpl.java:93-96 ＋ boot2 ProcessInstanceServiceImpl.java:157-160）。
+        # 这一段独有的卖点＝**内存绿 ≠ 落库绿**，两条只能在真库上证：
+        #   ① 列里进的必须是**求值结果（DATETIME 时刻）**，不是表达式原串——160 这台 MySQL 的
+        #      @@sql_mode 含 STRICT_TRANS_TABLES，把 '2h' 绑进 DATETIME(3) 列是**服务端硬错**
+        #      （兄弟栈 rust/php 本轮实测服务端给 1292 / 22007
+        #      "Incorrect datetime value: '2h' for column 'expire_time'"），整条发起腿直接炸；
+        #      SQLite/内存仓两种假仓都不会报这个错，所以 T0 全绿也可能真库红。
+        #   ② 定义没配／算不出 ⇒ 列必须 **IS NULL**（不是空串、不是 now()）。
+        # 夹具自带定义行（id 段与既有各段错开），**根上**配 expireTime、节点一律不配
+        # ⇒ 实例那一列是这一段唯一变量，任务行的 expire_time 恒 NULL 不会互相冒充。
+        from datetime import datetime as _dt137
+        _now137 = _dt137.now()
+        _NOKEY137 = object()      # 「根上不写 expireTime 键」这一档的哨兵
+
+        def _flow137a(root, name: str) -> str:
+            """start → approve(leader) → end，**根上**带/不带 expireTime（root=_NOKEY137 即不写键）"""
+            raw = {"name": name, "displayName": "实例到期真库", "type": "approval",
+                   "nodes": [
+                       {"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+                       {"id": "approve", "type": "snaker:task",
+                        "properties": {"assignee": "leader", "taskType": 0, "performType": 0},
+                        "text": {"value": "approve"}},
+                       {"id": "end", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}],
+                   "edges": [
+                       {"id": "e1", "sourceNodeId": "start", "targetNodeId": "approve", "properties": {}},
+                       {"id": "e2", "sourceNodeId": "approve", "targetNodeId": "end", "properties": {}}]}
+            if root is not _NOKEY137:
+                raw["expireTime"] = root
+            return json.dumps(raw, ensure_ascii=False)
+
+        async def _seed137a(did: int, dname: str, content: str):
+            await _exec("INSERT INTO wf_process_define (id, name, display_name, type, state, content,"
+                        " version, create_time, create_user, update_time, update_user)"
+                        " VALUES (?,?,?,?,1,?,1,?,?,?,?)",
+                        [did, dname, "实例到期真库", "approval", content,
+                         _now137, "py-test", _now137, "py-test"])
+
+        async def _inst_cols137a(iid):
+            """直查数据库取实例行的 (expire_time, create_time)——不看仓储返回体，只看库里的值"""
+            rows = await raw_rows(adapter, "SELECT expire_time, create_time"
+                                           " FROM wf_process_instance WHERE id=?", [iid])
+            return (rows[0][0], rows[0][1]) if rows else (None, None)
+
+        # 判据前提：这台库确实是严格模式（不是就如实报出来，别让"没报错"被当成证据）
+        _mode = str((await raw_rows(adapter, "SELECT @@sql_mode", [])) [0][0])
+        check("⑱ 前提：服务端 @@sql_mode 含 STRICT_TRANS_TABLES（原串进 datetime 列才会硬错）",
+              "STRICT_TRANS_TABLES" in _mode.upper(), _mode)
+
+        # 本段专用定义号段（mysql 900060–900065 / postgres 910060–910065），先清一遍再灌：
+        # 上一轮若中途崩过（真库腿是**写库**操作），残留行会让本轮主键撞车 1062。
+        _ids137 = [DEFINE_ID + n for n in (60, 61, 62, 63, 64, 65)]
+
+        async def _purge137():
+            for _did in _ids137:
+                await _exec("DELETE FROM wf_process_task_actor WHERE process_task_id IN"
+                            " (SELECT id FROM wf_process_task WHERE process_instance_id IN"
+                            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?))", [_did])
+                await _exec("DELETE FROM wf_process_task WHERE process_instance_id IN"
+                            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?)", [_did])
+                await _exec("DELETE FROM wf_process_cc_instance WHERE process_instance_id IN"
+                            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?)", [_did])
+                await _exec("DELETE FROM wf_process_instance WHERE process_define_id = ?", [_did])
+                await _exec("DELETE FROM wf_process_define WHERE id = ?", [_did])
+
+        await _purge137()
+
+        # ⑱.1 正向：根上配 "2h" ⇒ 真库列里是时刻，且同行 expire − create ≈ 2h
+        await _seed137a(_ids137[0], "py-expire137a-rel", _flow137a("2h", "py-expire137a-rel"))
+        _inst137_rel = None
+        try:
+            _inst137_rel = await eng.start_process_instance_by_id(_ids137[0], "zhangsan",
+                                                                 {"BUSINESS_NO": f"BIZ-{DB}-137a"})
+            _err137 = ""
+        except Exception as e:
+            _err137 = f"{type(e).__name__}: {e}"
+        check("⑱ 发起腿真库不炸（把 '2h' 原串绑进 DATETIME(3) 列＝服务端硬错，见 rust/php 1292/22007）",
+              _inst137_rel is not None, _err137)
+        if _inst137_rel is not None:
+            _exp137, _cre137 = await _inst_cols137a(_inst137_rel.id)
+            check("⑱ 真库列存的是求值结果（datetime），不是表达式原串",
+                  _exp137 is not None and not isinstance(_exp137, str), repr(_exp137))
+            _delta137 = (_exp137 - _cre137).total_seconds() if (_exp137 and _cre137) else None
+            check("⑱ 同行 expire − create ≈ 7200s（不是 now 占位的 0s）",
+                  _delta137 is not None and 2 * 3600 - 5 <= _delta137 <= 2 * 3600 + 60,
+                  f"{_delta137}s expire={_exp137} create={_cre137}")
+            _back137 = await repo.find_instance_by_id(_inst137_rel.id)
+            check("⑱ 仓储读回与直查列同一时刻（列真进了 SELECT 映射）",
+                  _back137 is not None and _back137.expireTime == _exp137,
+                  f"直查 {_exp137} / 读回 {getattr(_back137, 'expireTime', None)}")
+
+        # ⑱.2 变量档真库腿：根上写变量名，发起参数给时刻文本 ⇒ 列里就是那一刻
+        _d137_var = DEFINE_ID + 61
+        await _seed137a(_d137_var, "py-expire137a-var", _flow137a("dueAt", "py-expire137a-var"))
+        _want137 = _dt137(2026, 12, 31, 10, 0, 0)
+        _inst137_var = await eng.start_process_instance_by_id(
+            _d137_var, "zhangsan", {"dueAt": "2026-12-31 10:00:00"})
+        _exp137v, _ = await _inst_cols137a(_inst137_var.id)
+        check("⑱ 变量档吃**发起参数**：真库列＝2026-12-31 10:00:00",
+              _exp137v == _want137, repr(_exp137v))
+
+        # ⑱.3 没配 / 算不出 ⇒ 真库列 IS NULL（不写空串、不写 now）
+        for _label, _root, _did in (("键缺失", _NOKEY137, DEFINE_ID + 62),
+                                    ("空串", "", DEFINE_ID + 63),
+                                    ("误配", "not-a-time", DEFINE_ID + 64),
+                                    ("负数档", "-5h", DEFINE_ID + 65)):
+            _content = _flow137a(_root, f"py-expire137a-{_did}")
+            await _seed137a(_did, f"py-expire137a-n{_did}", _content)
+            _inst137n = await eng.start_process_instance_by_id(_did, "zhangsan")
+            _exp137n, _cre137n = await _inst_cols137a(_inst137n.id)
+            check(f"⑱ {_label} 那一档真库列必须是 NULL（对照列 create_time 已落库）",
+                  _exp137n is None and _cre137n is not None, repr(_exp137n))
+
+        # ⑱ 收尾：本段自带的定义与实例一律按 define id 级联清掉（不碰别人的数据）
+        await _purge137()
+
         # 清理本轮委托台账行（按显式 id，不碰别人的数据）
         conn = await adapter.acquire()
         try:

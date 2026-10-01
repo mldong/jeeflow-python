@@ -271,6 +271,18 @@ class EngineImpl(Engine):
                                variables=vars_, createTime=datetime.now(), updateTime=datetime.now(),
                                createUser=operator, updateUser=operator,
                                businessNo=str(vars_.get(KEY_BUSINESS_NO, "")))
+        # issues/137 A · 裁定 A（批二 §3-4）· **实例级 expire_time 的唯一写点**：
+        # 取**流程定义顶层** expireTime 表达式（spec 02:21/55「流程期望完成时间」），非空才求值写入。
+        # 基准＝Java JeeflowEngineImpl.java:93-96（``if (StringUtils.isNotEmpty(...)) instance.setExpireTime(
+        # FlowUtil.processTime(expireTime, args))``）与 boot2 内置版 ProcessInstanceServiceImpl.java:157-160；
+        # 本栈原形状是**这一句都没有** ⇒ wf_process_instance.expire_time 恒 NULL（本案病灶）。
+        # 三条口径逐条落到这里：① 进列的是**求值结果（时刻）**不是表达式原串——原串在 STRICT_TRANS_TABLES
+        # 的 MySQL 上是服务端硬错（rust/php 实测 1292/22007 Incorrect datetime value: '2h'）；
+        # ② 变量源＝**发起参数**（上面 ``_add_user_info`` / ``_add_auto_gen_title`` 注入完的那份 ``vars_``，
+        # 与 Java 就地改过的 ``args`` 同档；取成 caller 原始 args 会让被注入覆盖的键判错档）；
+        # ③④ 没配／算不出都留 NULL，不兜底 now()——守卫与尺子都是既有的那一枚（``_apply_expire_time``
+        # 包着的 ``process_time``，档位顺序与语义一字不改，不许新造第二把）。
+        _apply_expire_time(inst, flow.expireTime, vars_)
         await self.repo.save_instance(inst)
         # PROCESS_INSTANCE_START（码 1）：实例行 insert 之后 fire（spec §11.3 触发时机列）
         await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_START, inst.id,
@@ -1277,23 +1289,28 @@ def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime
         return None
 
 
-def _apply_expire_time(task: Optional[ProcessTask], expr: Any, args: Optional[dict]) -> None:
-    """建单五写点共用的那一把尺子（对齐 Java ``ProcessInstance.applyExpireTime`` 两个重载 +
+def _apply_expire_time(target: Any, expr: Any, args: Optional[dict]) -> None:
+    """到期时间**唯一**写入口：任务行建单五写点 + 实例行发起写点共用同一把尺子
+    （对齐 Java ``ProcessInstance.applyExpireTime`` 两个重载 +
     ``cb541d4`` 为绕过 createTask 直建行那一支开的公开入口 ``applyNodeExpireTime``）。
 
-    - ``expr`` 取节点属性 ``properties.expireTime``（设计器 JSON，Java ``TaskParser`` 的
+    - ``target`` 是带 ``expireTime`` 槽的行对象（``ProcessTask`` / ``ProcessInstance``）。
+    - ``expr`` 任务级取节点属性 ``properties.expireTime``、实例级取**流程定义顶层**
+      ``FlowModel.expireTime``（两处都是设计器 JSON 里的表达式原串，Java ``TaskParser`` 的
       ``EXPIRE_TIME_KEY`` 同名键）；非串按 Java ``getStr`` 归一为串。
-    - **节点没配 ⇒ 这一列保持 NULL**（owner 2026-09-28 口径：不造默认值，不写 now()/''/0）。
+    - **没配 ⇒ 这一列保持 NULL**（owner 2026-09-28 口径：不造默认值，不写 now()/''/0）。
       空白串（``"   "``）不算"没配"而是照 Java 交给 :func:`process_time` 求值 ⇒ 结果 ``None``。
     - ``args`` = 变量源两档：**建单四处＝实例变量**（普通建单 / 串行首位 / 并行全员 /
       串行推进出的下一位；boot2 的 ``execution.getArgs()``），
       **回退新建＝随行拷贝那份**（boot2 的 ``hisVariable``）。搞混这两档，
       "表达式是个变量名"这一格会跨栈给出不同答案。
+      实例级写点用**发起参数**（已注入用户信息与 autoGenTitle 的那份 ``vars_``），
+      基准＝Java ``JeeflowEngineImpl:93-96`` 就地改过的 ``args``。
     """
-    if task is None or expr is None:
+    if target is None or expr is None:
         return
     if not isinstance(expr, str):
         expr = str(expr)
     if not expr:
         return
-    task.expireTime = process_time(expr, args if isinstance(args, dict) else {})
+    target.expireTime = process_time(expr, args if isinstance(args, dict) else {})

@@ -7,7 +7,7 @@ from .model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, Inst
                     ProcessDesign, ProcessDesignHis, ProcessSurrogate,
                     InstanceStatsRow, TaskStatsRow)
 from .spi import ProcessRepository, ProcessExtRepository
-from .spi import normalize_actors, normalize_cc_actors, require_present_id
+from .spi import normalize_actors, normalize_cc_actors, require_present_id, actor_delete_forms
 from .surrogate import hydrate_enabled, to_datetime   # 判据本身已收口到 ProcessSurrogate.is_effective（issues/123）
 
 class CcRow(str):
@@ -131,8 +131,25 @@ class MemoryRepository(ProcessRepository):
             if a not in existing: existing.append(a)
         self._actors[task_id] = existing
     async def remove_task_actor(self, task_id, actors):
-        remove = set(actors)
-        self._actors[task_id] = [a for a in self._actors.get(task_id, []) if a not in remove]
+        """内存仓删除腿（issues/137 §3-6 · spec 06 §processTask/removeTaskActor 语义 6 ＋ §2.11
+        写点表末行「两形并集」）：判据与 SQL 仓 ``JdbcRepository.remove_task_actor``
+        **逐字同一条**（两仓分叉＝issues/117 场景 27），复用同一枚单点
+        ``spi.actor_delete_forms``。旧形状 ``remove = set(actors)`` 是**裸传**：既不产出
+        trim 形（第三方绕过门面直连仓储传 ``" 8601 "`` 时删不掉写侧归一后的规范行 ``8601``，
+        issues/142 §9.2），也不丢空值（``""`` 入参会把历史 ``actor_id=''`` 脏行删掉——
+        那是替脏数据做掉唯一痕迹）。
+
+        ⚠️ 与写侧 ``add_task_actor`` 的义务**不同、别照抄**：写侧取 trim 后的值落库，
+        删除腿必须「原值 ∪ trim 值」两形并集——只取一头各有一种假成功（见单点 docstring）。"""
+        # ①空值一律丢弃 ＋ ②非空值「原值 ∪ trim 值」两形进比较集（判据本体在 actor_delete_forms）
+        forms = actor_delete_forms(actors)
+        if not forms:
+            return  # ③并集为空 ⇒ 早退，一条"删除"都不发生（不得退化成清空该任务全部参与者）
+        rows = self._actors.get(task_id)
+        if rows is None:
+            return  # 任务不存在 ⇒ 零操作不抛异常（连空条目都不建）
+        remove = set(forms)
+        self._actors[task_id] = [a for a in rows if a not in remove]
     async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str):
         # issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与 JdbcRepository.create_cc_instance
         # 同一条判据：同一 (实例, 被抄送人) 已有 cc 行 ⇒ 跳过——①不新增行 ②不重置未读（state 保持

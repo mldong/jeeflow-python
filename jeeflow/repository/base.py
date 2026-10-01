@@ -23,7 +23,8 @@ from ..spi import QueryCondition
 
 from ..model import (ProcessDefine, ProcessInstance, ProcessTask, TaskState, InstanceState, CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDesign, ProcessDesignHis, ProcessSurrogate, InstanceStatsRow, TaskStatsRow)
 from ..spi import (IDGenerator, ProcessRepository, ProcessExtRepository,
-                   normalize_actors, normalize_cc_actors, require_present_id)
+                   normalize_actors, normalize_cc_actors, require_present_id,
+                   actor_delete_forms)
 
 # 当前协程上下文绑定的事务连接
 _tx_conn_var: contextvars.ContextVar = contextvars.ContextVar("jeeflow_tx_conn", default=None)
@@ -508,12 +509,27 @@ class JdbcRepository(ProcessRepository):
                 await self._insert_task_actors(conn, task_id, to_add)
 
     async def remove_task_actor(self, task_id: int, actors: list[str]) -> None:
-        if not actors:
-            return
+        """SQL 仓删除腿（issues/137 §3-6 · spec 06 §processTask/removeTaskActor 语义 6 ＋ §2.11
+        写点表末行「两形并集」）：判据与内存仓 ``MemoryRepository.remove_task_actor``
+        **逐字同一条**（两仓分叉＝issues/117 场景 27），复用同一枚单点
+        ``spi.actor_delete_forms``。旧形状把 ``actors`` **裸传**进 ``IN``：既不产出 trim 形
+        （第三方绕过门面直连仓储传 ``" 8601 "`` 时删不掉写侧归一后的规范行 ``8601``，
+        issues/142 §9.2），也不丢空值（``""`` 入参绑进 ``IN`` 会把历史 ``actor_id=''``
+        脏行批量误删——那是替脏数据做掉唯一痕迹）。
+
+        ⚠️ 与写侧 ``add_task_actor`` 的义务**不同、别照抄**：写侧取 trim 后的值落库，
+        删除腿必须「原值 ∪ trim 值」两形并集——只取 trim 形则门面按语义 6 交出的历史脏行
+        原值 ``" 9101 "`` 被削成 ``9101``，真库（MySQL NO PAD 排序规则）下那一行删不掉而
+        门面报成功（假成功）；判据本体见单点 docstring，这里不抄第二份。"""
+        # ①空值一律丢弃 ＋ ②非空值「原值 ∪ trim 值」两形进 IN（判据本体在 actor_delete_forms）
+        forms = actor_delete_forms(actors)
+        if not forms:
+            return  # ③并集为空 ⇒ 早退，一条 DELETE 都不发（不得退化成清空该任务全部参与者）
         async with self._conn() as conn:
+            # 占位符数量按 forms 长度算（不是入参 actors 的长度——空值已丢、两形可能变多）
             await conn.execute(self._sql(
-                f"DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id IN ({repeat_ph(len(actors))})"),
-                [task_id, *actors])
+                f"DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id IN ({repeat_ph(len(forms))})"),
+                [task_id, *forms])
 
     # ── CcInstance（抄送）──────────────────────────────────────────────────
 

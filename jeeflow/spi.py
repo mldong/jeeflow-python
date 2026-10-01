@@ -77,6 +77,61 @@ def normalize_actor_value(value) -> str:
     return out[0] if out else ""
 
 
+def actor_delete_forms(raw) -> list[str]:
+    """归属值**删除腿**展开（issues/137 §3-6 · spec 06 §processTask/removeTaskActor 语义 6，
+    owner 2026-10-02 拍「两形并集」）：把待删列表展开成 ``DELETE ... IN (...)`` 真正要绑的值——
+    **空值一律丢弃，非空值同时保留「原值」与「trim 值」两形**（按字面去重、保序）。
+
+    为什么必须两形、只取一头各有一种假成功（1.8.36 之前八栈正好分成这两派，没有一处两全）：
+
+    - 只取 **trim 值**（php/csharp/rust/moon 四栈八处的旧形状）⇒ 门面按语义 6 交出的历史脏行
+      原值 ``" 9101 "`` 被削成 ``9101``，真库（MySQL NO PAD 排序规则）下那一行删不掉，
+      门面却报成功——被摘的人待办还在；
+    - 只取 **原值**（go/node/python/java 四栈九处的旧形状，本栈两仓此前即裸传）⇒ 第三方绕过
+      门面直连仓储传 ``" 8601 "`` 时删不掉写侧归一后落库的规范行 ``8601``（issues/142 §9.2
+      那一路）；且空值照喂 ``DELETE``，会把历史 ``actor_id=''`` 脏行批量误删
+      （那是替脏数据做掉唯一痕迹）。
+
+    两形并集同时满足两侧：脏行按原值命中、规范行按 trim 形命中。按 §2.11 归一口径
+    ``" 9101 "`` 与 ``9101`` 本就是**同一个人**，两行都删掉才是"摘掉这个人"的正确结果，
+    不构成误删。
+
+    判据本体**复用既有归一单点** ``normalize_actors``（trim／判空／``None`` 不串化都在那一枚里，
+    本函数只加"原值也进集合"这一层，**不抄第二份 trim/判空代码**——spec §2.11 尾注明令）：
+    判空一律 ``strip() == ""``，``"0"`` 是合法 id 必须留下，且 ``"0"`` 与 ``"00"`` 是两个人
+    （**严禁 ``if not x`` 这种语言自带假值判据**）。去重按**字面**做，不按"strip 后相同"折叠
+    原值形：``" 9101 "`` 与 ``"  9101  "`` 是两种不同的原值形，都要保留。
+
+    :param raw: 待删归属值（``list``/``tuple``/逗号串/标量，与 ``normalize_actors`` 同形），
+        元素可为 ``None``（丢弃，**不得**串化成 ``"None"``）
+    :return: 展开后的删除值列表（保序、按字面去重、无空值）；入参为 ``None`` 或全为空值时
+        返回**空列表**——调用方（仓储删除侧）据此**早退，一条 ``DELETE`` 都不发**
+        （不得退化成"清空该任务全部参与者"）
+    """
+    out: list[str] = []
+    if raw is None:
+        return out
+    if isinstance(raw, str):
+        items: Any = raw.split(",")        # 逗号串腿：与 normalize_actors 同一套入参形状分派
+    elif isinstance(raw, (list, tuple)):
+        items = raw                        # 数组腿
+    else:
+        items = [raw]                      # 标量（含数字 id）按单个归属值
+    for item in items:
+        if item is None:
+            continue
+        # trim 与判空的判据本体交给既有单点（丢空即 ①"空值一律丢弃，不喂 DELETE"），不另抄
+        trimmed = normalize_actors([item])
+        if not trimmed:
+            continue                       # None/空串/纯空白 ⇒ 丢弃
+        original = item if isinstance(item, str) else str(item)
+        if original not in out:
+            out.append(original)           # ② 原值形：保住修复前落下的未 trim 历史脏行
+        if trimmed[0] not in out:
+            out.append(trimmed[0])         # ② trim 形：保住写侧归一后落库的规范行
+    return out
+
+
 def require_present_id(value, label: str = "processTaskId"):
     """主键类参数**另判一档**（spec 06 §2.11 末段）：``processTaskId`` 缺失/空串/``0`` 必须响亮报错。
 
@@ -154,7 +209,26 @@ class ProcessRepository(ABC):
         场景 27 那把尺子**（rust 实测：sqlx 仓盲插、同栈内存仓判重，两个答案）。"""
         ...
     @abstractmethod
-    async def remove_task_actor(self, task_id: int, actors: list[str]) -> None: ...
+    async def remove_task_actor(self, task_id: int, actors: list[str]) -> None:
+        """摘除任务参与者（**删除腿**，spec 06 §processTask/removeTaskActor 语义 6 ＋ §2.11
+        写点表末行 · owner 2026-10-02 拍「两形并集」）。
+
+        实现方义务是**三件事**（判据本体＝本模块 ``actor_delete_forms`` 那一枚，两仓与第三方
+        实现一律走它，不许另抄）：
+
+        ① **空值一律丢弃、不喂 ``DELETE``**——``None``／``""``／纯空白都不进 ``IN``，否则历史
+        ``actor_id=''`` 脏行会被批量误删（那是替脏数据做掉唯一痕迹）；
+        ② **非空值同时以「原值」与「trim 值」两形进 ``IN``**（按字面去重、保序；两形相同则只
+        一份）——只取 trim 形删不掉修复前落下的未 trim 历史脏行 ``" 9101 "``（真库 NO PAD
+        排序规则下门面报成功而人没被摘），只取原值则绕过门面直连仓储传 ``" 8601 "`` 时删不掉
+        写侧归一后落库的规范行 ``8601``（issues/142 §9.2）；
+        ③ 并集为空 ⇒ **早退，一条 ``DELETE`` 都不发**（不得退化成"清空该任务全部参与者"）。
+
+        ⚠️ **与写侧义务 ``add_task_actor`` 不同、别照抄**：写侧是"落库与比较一律取 trim 后的
+        值"（归一后只落一行），删除腿却必须**多带一份原值**——两形并集才两头都删得掉。
+        判空一律 ``str(x).strip() == ""``，**严禁 ``if not x``**（``"0"`` 是合法 id，且 ``"0"``
+        与 ``"00"`` 是两个人）。内存仓与 SQL 仓**同一条判据、同一个答案**（issues/117 场景 27）。"""
+        ...
     @abstractmethod
     async def create_cc_instance(self, instance_id: int, creator: str, *actor_ids: str) -> None:
         """落 cc 行（**写侧判重＝幂等空操作**，issues/141 G2 · spec 06-facade.md §4）。

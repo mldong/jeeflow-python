@@ -12,6 +12,10 @@ import dataclasses
 import inspect
 import asyncio
 import json
+import logging
+import os
+import re
+import traceback
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -47,10 +51,177 @@ CC_ACTORS = KEY_CC_ACTORS
 # issues/139（八栈同批）：流程定义 content 解析失败的**对外** msg 是逐字固定文案，
 # 基准＝Java 参考实现 jeeflow-core/parser/ModelParser.java:47
 # `throw new RuntimeException("读取流程定义 JSON 失败", e)`——原始异常只作 cause 挂在错误对象上，
-# 一律不进 msg（门面顶层 `flow()` 的 `str(e)` 会把 message 原样送进出口，拼进去就是泄漏解析器细节）。
+# 一律不进 msg（门面顶层 `flow()` 出 msg 时只透**引擎自己写的**文案，见下方 §2.12 判别式；
+# 解析器原文属内部信息，拼进 message 就是泄漏）。
 # deploy / processDefine/redeploy / processDesign/redeploy 三条腿共用这一句，对齐 Java 三条腿
 # 同走一个 ModelParser.parse 的形状。
 MSG_READ_DEFINE_JSON_FAIL = "读取流程定义 JSON 失败"
+
+
+# ─── issues/137 §3-1 · 门面内部异常出口（spec 06-facade.md §2.12）───────────────────────
+#
+# 门面顶层 `flow()` 是所有内部异常的共性通道。旧形状在 `except Exception as e` 里直接
+# `self._error(str(e))`，于是运行时异常、解析器、DB 驱动、集成方 provider 写的原文一路进用户面
+# （java 侧 137 案实测出口 `msg=For input string: "x"`，本栈对偶是 `could not convert string
+# to float: 'x'`、`'NoneType' object has no attribute 'x'`、`Expecting value: line 1 column 1`、
+# `aiomysql` 的连接原文一类）。
+# 现在：判据是「这段文案是谁写的」——引擎自己写的中文契约文案照旧**逐字**透出（八栈＋十三个
+# 集成壳＋前端 toast 都按原文对齐，收窄就是静默改契约面），外来/内部原文一律换成
+# `INTERNAL_FAILURE_MSG`，原文连同栈只进日志与错误对象的 cause。
+
+#: 内部异常对外只说这一句（固定文案，八栈逐字同一串，不许改措辞——owner 2026-10-02 第 3 问拍 A）
+INTERNAL_FAILURE_MSG = "流程处理失败"
+
+#: 门面自己的 logger，对齐 java `Logger.getLogger(JeeflowFacade.class.getName())`。
+#: 原文只进这里（`exc_info=` 带完整异常对象＋栈＋它自己的 `__cause__`），不进 msg。
+_log = logging.getLogger(__name__)
+
+#: 第 5 条「抛出点在不在引擎主包」的归属基准（＝本文件所在的 `jeeflow/` 目录）
+_ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+#: 第 4 条的「运行时／解析器／IO 类型族」——java `JeeflowFacade.jvmInternal` 的本栈等价件。
+#: ⚠️ **`ValueError` 本身不在这一族**：本栈 102 处契约文案全是裸 `raise ValueError('中文')`
+#: （普查见 docs/批三-3-1-落地记录-2026-10-02.md §1.5 与本轮报告），把它整族判内部＝把整个
+#: 契约面静默改写成固定文案。ValueError 只按「CPython 内置解析文案模板」（下面那个正则）
+#: 与「非契约载体的子类」（UnicodeError / json.JSONDecodeError）两条例外收。
+_RUNTIME_INTERNAL_TYPES = (
+    TypeError,          # java NullPointerException / ClassCastException 的对偶（None 上取属性、错类型下标）
+    AttributeError,     # 同上：`'NoneType' object has no attribute 'x'`（java 反射族的对偶也在这）
+    NameError,          # 含 UnboundLocalError
+    LookupError,        # 含 KeyError / IndexError（java IndexOutOfBoundsException）
+    ArithmeticError,    # java ArithmeticException（含 ZeroDivisionError / OverflowError）
+    RuntimeError,       # 含 RecursionError（java StackOverflowError）/ NotImplementedError / asyncio 内部错
+    MemoryError,        # java VirtualMachineError 的近似对偶
+    ImportError,        # java LinkageError（含 ModuleNotFoundError）
+    OSError,            # java IOException（IOError 是它的别名；含 ConnectionError / TimeoutError）
+    SyntaxError,        # 含 IndentationError / TabError（eval / compile 腿）
+    AssertionError,
+    StopIteration, StopAsyncIteration,
+    UnicodeError,       # ⚠ ValueError 的子类，但引擎不拿它当契约载体 ⇒ 解码/编码原文属内部
+    json.JSONDecodeError,  # ⚠ 同上：解析器原文。issues/139 已在解析腿挡掉，这里是兜底
+)
+
+#: python **没有** `NumberFormatException` 这种独立类型：数字／时间解析腿抛的是裸 `ValueError`，
+#: 与 102 处契约文案同一个类型 ⇒ 这一族只能按 CPython 内置文案模板识别（java 第 4 条
+#: `NumberFormatException` 那一格的本栈等价件）。模板**不写死**：由
+#: tests/test_facade_internal_error_no_leak.py::test_criterion_4_numeric_parse_templates
+#: 当场把内置函数调炸取真实文案来钉（换 CPython 版本漂了当场红）。
+_FOREIGN_VALUE_ERROR_RE = re.compile(
+    r"\A(?:could not convert string to float"        # float('x')
+    r"|invalid literal for int\(\) with base \d+"    # int('x') / int('x', 16)
+    r"|complex\(\) arg is a malformed string"        # complex('x')
+    r"|non-hexadecimal number found in fromhex\(\)"  # bytes.fromhex('zz')
+    r"|Invalid isoformat string"                     # datetime.fromisoformat('zz')
+    r"|time data .* does not match format"           # datetime.strptime('zz', fmt)
+    r"|unconverted data remains"                     # strptime 尾部残余
+    r")"
+)
+
+
+def runtime_internal_detail(exc_type, message: Optional[str]) -> bool:
+    """判别式第 4 条：异常类型属**运行时／解析器／IO／驱动自己抛的族** ⇒ 内部。
+
+    三条腿（任一命中即内部）：
+      a. `_RUNTIME_INTERNAL_TYPES` 里的内置类型族（含 `ValueError` 的两个非契约子类）；
+      b. `ValueError` ＋ CPython 内置数字/时间解析文案模板（python 无 `NumberFormatException`）；
+      c. **类型不是 `builtins` 定义的** ⇒ 驱动／第三方类型族。
+         `aiomysql` / `asyncpg` / `pymysql` / `psycopg` / `sqlite3` 的 `Error` 全都只
+         `extends Exception`、类型名上零共性，而核心包**零依赖**（`pyproject.toml`
+         `dependencies = []`）不能 import 它们来 isinstance ⇒ 只能按定义模块判。
+         前提已普查：引擎自己的契约文案 100% 是 `builtins` 的 `ValueError`（102 处）
+         与 `NotImplementedError`（1 处，`meta.py:100`），零第三方类型 ⇒ c 不会误伤契约面。
+         c 还兜住 `repository/base.py:224` 那种「驱动异常在引擎包内被裸 `raise` 重抛」的腿：
+         重抛会把 `base.py` 压成栈顶帧，第 5 条按帧归属会**误判成引擎写的**。
+
+    纯函数：只吃「类型 ＋ 文案」两个值，不碰异常对象、不产生副作用。
+    """
+    if not isinstance(exc_type, type):
+        return False
+    if issubclass(exc_type, _RUNTIME_INTERNAL_TYPES):
+        return True
+    if message and issubclass(exc_type, ValueError) and _FOREIGN_VALUE_ERROR_RE.match(message):
+        return True
+    module = getattr(exc_type, "__module__", "") or ""
+    return module != "builtins" and not module.startswith("jeeflow")
+
+
+def thrown_inside_engine(trace) -> bool:
+    """第 5 条的归属判据：栈顶帧（最内层）是否落在引擎主包目录 `jeeflow/` 里。
+
+    ``trace`` 的形状与 java ``StackTraceElement[]`` 对齐——**下标 0 = 最内层帧**，元素是文件名
+    （java 那边取 ``trace[0].getClassName()``，这边取 ``trace[0]`` 的路径）。
+
+    java 还要额外排除 ``com.mldong.jeeflow.test.``（测试桩抛的不算引擎契约文案）；python 的
+    测试目录 ``tests/`` 本就在包外，天然落到「不在引擎包」⇒ 无需第二条排除。
+    ``jeeflow/memory.py``（内存仓，演示/测试夹具）虽在包内，但普查显示它**零 raise**，
+    不构成"夹具文案冒充引擎契约文案"的口子。
+
+    纯函数：只吃文件名序列。
+    """
+    if not trace:
+        return False
+    try:
+        rel = os.path.relpath(os.path.abspath(str(trace[0])), _ENGINE_DIR)
+    except (TypeError, ValueError):   # Windows 跨盘符时 relpath 抛 ValueError ⇒ 判不出归属，按"不在包内"
+        return False
+    return rel != os.pardir and not rel.startswith(os.pardir + os.sep)
+
+
+def is_foreign_detail(exc_type, message, cause, trace) -> bool:
+    """「这段文案能不能原样进 `msg`」——判别式五条，逐条同 spec 06-facade.md §2.12（顺序即优先级）。
+
+    返回 ``True`` ⇒ 属内部信息 ⇒ 出口只给 :data:`INTERNAL_FAILURE_MSG`。
+    java 参考实现＝``JeeflowFacade.isForeignDetail(type, message, cause, trace)``，函数名按本栈
+    snake_case 直译（``isForeignDetail`` ↔ ``is_foreign_detail``，八栈可 grep 互查）。
+
+    **四个入参全是已经抽好的值**（类型／文案／cause／栈帧文件名），不碰异常对象也不产生副作用
+    ⇒ 「文案判据」与「记日志那一半副作用」可以各自单测（spec §2.12 判据形状要求）。
+    从活异常对象抽四元组的那一层是 :func:`foreign_detail_of`，里面**零判据逻辑**。
+
+    五条：
+      1. 没有可用 message ⇒ 内部（兜底只会吐类型名或空串；java 对偶＝``message == null``）；
+      2. 属契约异常族 ⇒ 逐字透出（本条返回 False）。**本栈这一条无处落**：``jeeflow/*.py``
+         里零 ``class *Error/*Exception`` 定义（普查见 docs/批三-3-1 §1.5 python 行），引擎契约
+         文案全是裸 ``raise ValueError('中文')`` ⇒ 判据重心在 1/3/4/5，此处只留空档以便八栈逐条比对；
+      3. 裸包装：message 恰等于 ``str(cause)``（``raise X(str(e)) from e`` / ``raise X(e)``）⇒ 内部。
+         附带认 java ``String.valueOf(cause)`` 那个形状（``"<cause 的类型名>: 原文"``，
+         如 ``"OperationalError: (1045, ...)"``），因为那是同一件事的另一种写法；
+      4. 运行时／解析器／IO／驱动类型族 ⇒ 内部（见 :func:`runtime_internal_detail`）；
+      5. 抛出点不在引擎主包（标准库、集成方 provider、测试桩）⇒ 内部
+         （见 :func:`thrown_inside_engine`）。
+    """
+    # ① 没有可用 message
+    if message is None or not str(message).strip():
+        return True
+    # ② 契约异常族——本栈无此类型（见 docstring），留空档
+    # ③ 裸包装
+    if cause is not None:
+        cause_text = str(cause)
+        if cause_text and message in (cause_text, f"{type(cause).__name__}: {cause_text}"):
+            return True
+    # ④ 运行时／解析器／驱动类型族
+    if runtime_internal_detail(exc_type, str(message)):
+        return True
+    # ⑤ 抛出点不在引擎主包
+    return not thrown_inside_engine(trace)
+
+
+def foreign_detail_of(exc: BaseException) -> bool:
+    """把活异常对象拆成四元组喂给 :func:`is_foreign_detail`（**抽取层，零判据逻辑**）。
+
+    - ``message``：``str(exc)``（java ``e.getMessage()`` 的对偶；``args`` 为空时得 ``''``，
+      由第 1 条判内部——`raise NotImplementedError` 这类无参异常正是这个形状）；
+    - ``cause``：``__cause__``（``raise ... from e``）优先，回落 ``__context__``（隐式链）。
+      java 只有一个 ``getCause()``，python 这两条都对应"下层原文"；
+    - ``trace``：``traceback.extract_tb`` 是**外层→内层**，反转成 java ``getStackTrace()``
+      的**内层→外层**序，于是 ``trace[0]`` 在两边都指最内层帧。
+      ⚠️ C 层内置函数（``float()`` / ``json.loads`` 一类）**不压栈帧**，栈顶帧是调用它的引擎
+      文件 ⇒ 第 5 条对"引擎代码里调内置解析器"这一族无效，必须靠第 4 条的文案模板兜。
+    """
+    cause = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+    tb = exc.__traceback__
+    frames = tuple(f.filename for f in reversed(traceback.extract_tb(tb))) if tb is not None else ()
+    return is_foreign_detail(type(exc), str(exc), cause, frames)
 
 
 class JeeflowFacade:
@@ -98,6 +269,14 @@ class JeeflowFacade:
             # ToStringSerializer）——前端 JS number 无法承载雪花 id（>2^53）
             return self._ok(_stringify_ids(data))
         except Exception as e:
+            # issues/137 §3-1（spec 06-facade.md §2.12）：判别规则与理由见 is_foreign_detail——
+            # 引擎自己写的中文契约文案照旧**逐字**透出（八栈＋十三个集成壳＋前端 toast 都按原文
+            # 对齐，在这条上收窄就是静默改契约面），只把运行时／解析器／驱动／集成方 provider
+            # 写的原文换成固定文案；原文连同栈只进日志（`exc_info=` ⇒ cause 分离的"日志"那一半，
+            # 与 issues/139「内部细节不进 msg」同一条尺子）。
+            if foreign_detail_of(e):
+                _log.error("[jeeflow] action 执行失败: action=%s", action, exc_info=e)
+                return self._error(INTERNAL_FAILURE_MSG)
             return self._error(str(e))
 
     # ── 流程定义 / 实例 ─────────────────────────────────────────────────────
@@ -1347,8 +1526,16 @@ class JeeflowFacade:
         """流程定义 content → JSON（issues/139：Java ModelParser.parse 的同位单一解析点）。
 
         解析失败对外只出逐字固定文案 ``MSG_READ_DEFINE_JSON_FAIL``，原始异常作 ``__cause__``
-        留在错误对象上（``raise ... from e``）——门面顶层 ``flow()`` 用 ``str(e)`` 出 msg，
-        拼进去就是把解析器文本（异常类名/位置/内容片段）透给前端与日志。
+        留在错误对象上（``raise ... from e``）——门面顶层 ``flow()`` 出 msg 时只透**引擎自己写的**
+        文案（issues/137 §3-1 判别式，见 ``is_foreign_detail``），解析器文本（异常类名/位置/
+        内容片段）属内部信息，拼进 message 就是把它透给前端。
+
+        本腿即 spec §2.12「覆盖面每栈至少两处」的第 ② 处（bizData／JSON 解析族）：
+        ① 门面顶层 catch（``flow()`` 的 ``except Exception``）；② 这里。
+        判据两侧都有牙：``ValueError(MSG_READ_DEFINE_JSON_FAIL)`` 抛出点在 ``jeeflow/facade.py``
+        ⇒ 第 5 条判"引擎写的"、``ValueError`` 不在第 4 条类型族里 ⇒ **契约文案照旧逐字透出**；
+        而 ``__cause__`` 上那个 ``json.JSONDecodeError`` 若被搬进 message，第 3 条（裸包装）
+        与第 4 条（``json.JSONDecodeError`` 在族里）会双双把它挡成固定文案。
         """
         try:
             return json.loads(content)

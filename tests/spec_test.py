@@ -7016,11 +7016,20 @@ async def test_i142_62_custom_handler_own_exception_still_propagates():
     with pytest.raises(RuntimeError, match="handler-boom"):
         await eng.execute_process_task(apply_task.id, "zhangsan", {"submitType": 1})
 
-    # 门面腿：不外抛但**绝不报成功**（顶层 catch 把消息原样送出，不是 code=0 静默）
+    # 门面腿：不外抛但**绝不报成功**。出口 msg 是固定文案 `流程处理失败`，handler 自己写的原文
+    # 只进日志与错误对象（issues/137 §3-1 · spec 06-facade §2.12：集成方 provider 写的原文属
+    # **内部实现细节**，判据按「谁写的这段文案」判——不是引擎写的就不外透）。
+    # ⚠️ 改前这一格断言的是 `"handler-boom" in msg`，等于把泄漏机制当成了判据的一部分；
+    # 本格的**真实意图**是"处理器自身炸不得被吞成成功"，那由 `code != 0` 与上面 :7016 的
+    # **引擎直用腿**（`pytest.raises(RuntimeError, match="handler-boom")`，打的是引擎 API 不是门面出口，
+    # 不受 §2.12 约束、原样保留）共同承担，两者改后都仍成立 ⇒ 这是**改读法**不是改判据
+    # （owner 2026-10-02 拍板；java 基准同形状也出固定文案，`isForeignDetail` 第 5 条：
+    #  抛出点 `com.example.Boom` 不在引擎主包 ⇒ 判内部）。
     r2 = await facade.flow("processInstance/startAndExecute",
                            {"processDefineId": did, "operator": "zhangsan"})
-    assert r2["code"] != 0 and "handler-boom" in str(r2.get("msg", "")), \
-        f"处理器自身炸不得被吞成成功: {r2}"
+    assert r2["code"] != 0, f"处理器自身炸不得被吞成成功: {r2}"
+    assert str(r2.get("msg", "")) == "流程处理失败", \
+        f"集成方 handler 的原文属内部细节，出口只给固定文案（spec 06 §2.12）: {r2}"
 
 
 # ═══ Test 142 B 批：任务参与者写侧归属值归一（契约 06 §2.11）═══════════════════════

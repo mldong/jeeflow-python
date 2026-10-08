@@ -109,6 +109,26 @@ class JdbcProcessExtRepository(ProcessExtRepository):
             rows = await conn.fetchall(self._sql(sql), args)
         return [self._map_design(r) for r in rows], total
 
+    @staticmethod
+    def _surrogate_ownership_effective(filters: Optional[dict], conditions: Optional[list]) -> bool:
+        """归属列 operator 的**有效值**判定（issues/152 ② · spec 06 §4.5 归属不变式第二层）。
+
+        与 `jeeflow/memory.py::_surrogate_ownership_effective` 逐字同判据（条款 6 双仓同答案）：
+        Filters 的 `operator` 键给了就以它为准；否则看 conditions 里 `t.operator` 的那条 EQ；
+        **两形都没给＝归属条件缺失 ⇒ False（空页）**，缺失档与空值档同判，绝不"这条不加"放出全库。
+        """
+        def ok(v) -> bool:
+            return not (v is None or (isinstance(v, str) and not v.strip()))
+
+        for col, val in (filters or {}).items():
+            if col == "operator":
+                return ok(val)
+        for c in conditions or []:
+            if getattr(c, "column", None) == "t.operator" and \
+                    str(getattr(c, "operator", "EQ")).upper() == "EQ":
+                return ok(c.value)
+        return False
+
     def _build_ext_where(self, conditions: list, whitelist: set) -> tuple[str, tuple]:
         """m_ 条件 WHERE 构建（issues/05-5，白名单 + 参数化）"""
         sql = ""
@@ -117,6 +137,14 @@ class JdbcProcessExtRepository(ProcessExtRepository):
             if c.column not in whitelist:
                 continue
             val = c.value
+            # issues/152 ②（spec 06-facade.md §4.5 归属不变式，与 base._build_where 同一条尺子）：
+            # 落在**归属列**上的 EQ 条件值为空 ⇒ 空页（AND 1=0），不是"这条条件不加"。
+            # 只收归属列——下面那句"空值当作没填"是 m_LIKE_* 等**可选过滤**的通用放行，
+            # 照字面改成"空值即空页"会把可选过滤一起改坏（本函数同时服务 page_designs）。
+            blank_val = val is None or (isinstance(val, str) and not val.strip())
+            if blank_val and c.operator.upper() == "EQ" and c.column in _OWNERSHIP_COLUMNS:
+                sql += " AND 1=0"
+                continue
             if val is None or val == "":
                 continue
             op = c.operator.upper()
@@ -205,6 +233,9 @@ class JdbcProcessExtRepository(ProcessExtRepository):
     async def page_surrogates(self, page_num: int = 1, page_size: int = 10,
                               filters: Optional[dict] = None,
                               conditions: Optional[list[QueryCondition]] = None) -> tuple[list[ProcessSurrogate], int]:
+        # issues/152 ②：归属条件缺失或空值 ⇒ 空页（与 memory.page_surrogates 同一条判据，条款 6）
+        if not self._surrogate_ownership_effective(filters, conditions):
+            return [], 0
         sql = f"SELECT {self._SURROGATE_COLS} FROM wf_process_surrogate t WHERE 1=1"
         count_sql = "SELECT COUNT(*) FROM wf_process_surrogate t WHERE 1=1"
         args: list[Any] = []

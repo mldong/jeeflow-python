@@ -617,6 +617,33 @@ def _has_cc_ownership(actor_id, conditions) -> bool:
     return False
 
 
+def _surrogate_ownership_effective(filters, conditions) -> bool:
+    """委托分页的归属列 `t.operator` 有没有被给出**有效**值（issues/152 ② · spec 06 §4.5 归属不变式）。
+
+    本栈委托归属有两形（java 只有 conditions 一形）：`filters` 的 `operator` 键，以及
+    `conditions` 里 `column == "t.operator"` 的那条 EQ。**任一形给了空值形态**
+    （None／空串／全空白）⇒ 判"归属没给有效值" ⇒ **空页**，绝不折叠成"这条不加"放出全库台账。
+
+    归属条件**必填**：两形都没给（缺失档）与给了空值形态（空值档）**同判** ⇒ 空页，
+    与 §2.5 抄送侧"条件缺失或为空值时返回空页"一条尺子；门面的第一层已保证经门面进来的调用
+    必带归一后的归属值（缺键／空串／全空白 ⇒ demo 缺省 user1），这一道防的是绕过门面直调仓储的调用方。
+    与 `repository/ext.py` 的 `_build_ext_where` ＋ `page_surrogates` 同一条判据
+    （条款 6：同栈两仓必须同答案）。
+    """
+    for col, val in (filters or {}).items():
+        if col == "operator":
+            # Filters 这一形给了就以它为准：空值形态 ⇒ 空页，有效值 ⇒ 放行
+            return _effective_ownership(val)
+    for cond in conditions or []:
+        if getattr(cond, "column", None) == "t.operator" and \
+                str(getattr(cond, "operator", "EQ")).upper() == "EQ":
+            return _effective_ownership(cond.value)
+    # 两形都没给 ⇒ 归属条件缺失 ⇒ 空页（spec 06 §2.5「归属条件必填——条件缺失或为空值时返回空页」，
+    # 与 ccList 同一条尺子；issues/152 复核时发现本栈原写作"没给即不过滤"，与 java/csharp/moon/rust
+    # 的"缺失档也空页"分叉，按条文统一到 fail-closed）
+    return False
+
+
 def _match_conditions(conditions, fields: dict) -> bool:
     """条件全匹配（操作符对齐 JDBC buildWhere；列不在字段中则跳过）"""
     for c in conditions or []:
@@ -738,12 +765,17 @@ class MemoryExtRepository(ProcessExtRepository):
         self._surrogates.pop(id, None)
 
     async def page_surrogates(self, page_num=1, page_size=10, filters=None, conditions=None):
+        # issues/152 ②（spec 06-facade.md §4.5 归属不变式 · 条款 6 双仓同答案）：归属列空值形态
+        # ⇒ **空页**，不是"这条不加"。判据单点在 _surrogate_ownership_effective（与
+        # repository/ext.py 的 _build_ext_where + page_surrogates 同一条尺子）。
+        if not _surrogate_ownership_effective(filters, conditions):
+            return [], 0
         rows = []
         for s in self._surrogates.values():
             ok = True
             for col, val in (filters or {}).items():
                 if val is None or val == "":
-                    continue
+                    continue    # 非归属列的"空值当没填"通用放行（m_LIKE_* 那族），本案只收归属列
                 key = "processName" if col == "process_name" else col
                 if str(getattr(s, key, "")) != str(val):
                     ok = False

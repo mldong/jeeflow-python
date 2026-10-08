@@ -820,10 +820,19 @@ class JeeflowFacade:
         ext = self._ext_repo()
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
+        # issues/152 ②：t.operator 是**归属列**，与 java JeeflowFacade.surrogatePage 的
+        # `query.add("t.operator", "EQ", operatorArg(args))` 同形注入（spec 06-facade.md §4.5
+        # 归属不变式 / §2.5 归属列表本轮新增 processSurrogate/page 一行）——引擎自己保证
+        # 「我的委托」只看自己授出的行，不再靠集成壳注入 operator 才成立。
+        # 改前是 `filters={"operator": …} if args.get("operator") else None`：假值（缺键／空串／
+        # 全空白）一律不过滤 ⇒ 全库台账（issues/152 §6 记的"py 假值不过滤出全量"那一格）。
+        # 值走本栈已有的 _operator_arg 归一（缺键／空串／全空白 ⇒ demo 缺省 user1），
+        # 仓储层第二道兜底见 memory.page_surrogates 与 repository.ext（两仓同判据，条款 6）。
+        conditions = list(self._parse_m_query(args))
+        conditions.append(QueryCondition(column="t.operator", operator="EQ",
+                                         value=self._operator_arg(args)))
         rows, total = await ext.page_surrogates(page_num, page_size,
-                                                filters={"operator": str(args["operator"])}
-                                                if args.get("operator") else None,
-                                                conditions=self._parse_m_query(args))
+                                                filters=None, conditions=conditions)
         return self._page_data([self._surrogate_row_to_dict(s) for s in rows],
                                total, page_num, page_size)
 
@@ -870,11 +879,19 @@ class JeeflowFacade:
 
     @staticmethod
     def _apply_surrogate_fields(s, args: dict, operator: str):
-        """委托写入公共字段。授权人（operator）仅在显式传入时覆盖，避免 update
+        """委托写入公共字段。授权人（operator）仅在**显式给了非空值**时覆盖，避免 update
         时清空原授权人（前端编辑表单不带 operator；集成层注入时 operator=授权人，覆盖无害）"""
         s.processName = str(args.get("processName", ""))
         if "operator" in args:
-            s.operator = str(args.get("operator"))
+            # issues/152 ③：只认非空的显式值。空串／全空白／None **不得**落进 operator——
+            # 那种行是「死行」：get_surrogate 的 `WHERE operator = ?` 永不命中它，台账看得见、
+            # 待办永远不并人（spec 06-facade.md §2.5 空串＝缺键同档、§4.5「新建时授权人」⚠️ 段）。
+            # 空白档因此什么都不写：save 路径的 s.operator 已由调用方预置成归一值（缺省 user1），
+            # update 路径保留原授权人（spec 06:1108 那条缺省保留原值，本轮不动）。
+            # 注：改前 `str(args.get("operator"))` 在值为 None 时还会写出字面量 "None" 的授权人。
+            explicit = "" if args.get("operator") is None else str(args.get("operator"))
+            if explicit.strip():
+                s.operator = explicit
         s.surrogate = str(args.get("surrogate", ""))
         s.startTime = JeeflowFacade._parse_surrogate_time(args.get("startTime"))
         s.endTime = JeeflowFacade._parse_surrogate_time(args.get("endTime"))

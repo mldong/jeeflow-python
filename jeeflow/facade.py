@@ -1085,6 +1085,12 @@ class JeeflowFacade:
             raise ValueError("id 缺失或非法")
         his = await self._repo.find_history_tasks(instance_id)
         return [{
+            # issues/154④：审批记录九键之首＝任务行主键，且**显式**字符串化——19 位雪花 id
+            # 出 number 会被 JS 截精度（同 issues/75/92 那族坑）。本栈出口有 _stringify_ids
+            # 兜底 pass（issues/38 E9），但引擎不得依赖它：pass 只认 id / *Id 键名形状，
+            # 键名一变（复数 id 数组那类）就静默退回 int。对齐 java
+            # `String.valueOf(t.getTaskId())` 的显式档。
+            "id": str(t.id),
             "taskName": t.taskName, "displayName": t.displayName,
             "taskType": int(t.taskType) if t.taskType is not None else None,
             "performType": int(t.performType) if t.performType is not None else None,

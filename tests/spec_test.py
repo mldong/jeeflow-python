@@ -724,6 +724,18 @@ async def test_facade_view_endpoints():
     r = await facade.flow("processInstance/approvalRecord", {"id": instance_id})
     assert r["code"] == 0 and len(r["data"]) == 2, r  # apply + task1
 
+    # ── issues/154④：审批记录九键之首＝ id（任务行主键），且必须是**字符串** ──
+    # 19 位雪花 id 出 number 会被 JS 截精度（issues/75/92 那族坑）。
+    rec_rows = r["data"]
+    assert all("id" in row for row in rec_rows), rec_rows
+    assert all(isinstance(row["id"], str) and row["id"] for row in rec_rows), rec_rows
+    # ── issues/154①：行序按 id 单调升（口径① 的 ORDER BY id ASC 出口形状）──
+    rec_ids = [int(row["id"]) for row in rec_rows]
+    assert rec_ids == sorted(rec_ids) and len(set(rec_ids)) == len(rec_ids), rec_ids
+    # id 与持久任务行逐一对号（同一条读路 find_history_tasks）
+    persisted = await repo.find_history_tasks(int(instance_id))
+    assert {row["id"] for row in rec_rows} == {str(t.id) for t in persisted}, rec_rows
+
     r = await facade.flow("processInstance/highLight", {"id": instance_id})
     assert r["code"] == 0, r
     assert "task1" in r["data"]["activeNodeNames"], r

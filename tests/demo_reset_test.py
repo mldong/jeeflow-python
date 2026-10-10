@@ -26,6 +26,22 @@ T003 起 reset 会复跑业务种子 driver（引擎真实启动），断言从�
    解析为空"的行（reset 后零参与者任务行计数为 0），撤兜底只改这种行的参与者集合，改不到状态分布；
    该形状由 jeeflow-python/tests/spec_test.py 的 `test_i142_hr1_*` 四格单独钉（实测：把旧兜底
    还原回来，本文件仍绿、那四格按预期红 ⇒ 顶到的是形状格，不是这里的读数）。
+
+   ⚠️ 2026-10-10（issues/161 A 档落地后）：读数 **15/10 → 18/7**。不是本矩阵改了，而是引擎删掉了
+   161 的"蒙臂"（决策无命中时无条件取 edges[0]）、对齐 java 抛错语义后，FINISHED 第 5/8/9 行
+   （F5/F8/F9，define=12）走不到 20 了：三行 extras 写的是 `deptLeader`（那是给 15 文件编号下
+   的 `11-assignee-vars.json` 用的），而 flows 目录现为 16 个文件、排序下 define=12 已是
+   `10-mixed-mode.json`——其决策边 `finalAmount > 5000` / `finalAmount <= 5000` 在三行都没给
+   `finalAmount` 时双双求不出真，旧形状蒙 edges[0]＝e8 才"看似办结"。删蒙臂后按 java 语义抛
+   `decision节点无法确定下一步执行路线`（任务照常被消耗、实例停在 10）。
+   **这不是本栈独有**：go/node/rust/moon 的决策无命中是"静默停住"，同样停在 10——2026-10-10
+   实测 go demo 重置后跨 8 用户聚合读数就是 **18 进行中 / 7 已完成**（25 行不变、卡住的正是
+   define=12 那三行），本栈旧 15/10 恰是蒙臂产物、八栈里的独一份。种子自身也把这当异常：advance
+   未达 20 会打印 `[seed] FIN ... 终态=10（期望 20）`。要回到矩阵"9 行已完成"的原意需另立一轮
+   把三行修回 assignee-vars 语义（改 id 或补判定变量）——牵动八仓种子，不在本批。
+   本档落地后期待的控制台噪声：3 条 `decision节点无法确定下一步执行路线`（F5/F8/F9）＋ 2 条
+   `task not doing`（F2=07 会签：issues/163 修好后 2/4 票即合并，advance 快照里剩余两位
+   尝试办理时行已废弃）。
 """
 import sys
 import os
@@ -51,7 +67,7 @@ async def test_reset_clears_and_reseeds():
     assert len(ext_repo._surrogates) == 8, f"reset 后委托应为 8 条，实际 {len(ext_repo._surrogates)}"
     assert len(repo._defines) == before_defines, "种子定义应重载"
 
-    # 落点：15 state=10 + 10 state=20（issues/141 G9 裁定后重算，理由见模块 docstring）
+    # 落点：18 state=10 + 7 state=20（issues/161 A 档 2026-10-10 落地后重算，理由见模块 docstring）
     states = [inst.state for inst in repo._instances.values()]
-    assert states.count(10) == 15, f"进行中应 15 条，实际 {states.count(10)}"
-    assert states.count(20) == 10, f"已完成应 10 条，实际 {states.count(20)}"
+    assert states.count(10) == 18, f"进行中应 18 条，实际 {states.count(10)}"
+    assert states.count(20) == 7, f"已完成应 7 条，实际 {states.count(20)}"

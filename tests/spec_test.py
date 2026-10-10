@@ -1,6 +1,7 @@
 """jeeflow SPEC 合规测试 — Python 版（boot2 兼容）"""
 import json
 import os
+import re
 import sqlite3
 import sys
 import pytest
@@ -38,6 +39,17 @@ class _TestIDGen(IDGenerator):
 
 class _TestExprEval(ExpressionEvaluator):
     async def eval(self, expr: str, vars: dict):
+        # issues/163：会签门控 `#nrOf...`（引擎以裸名并进求值原料；演示/壳侧求值器同款剥 # 查）
+        if expr.strip().startswith("#"):
+            m = re.match(r"^\s*#(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$", expr)
+            if not m:
+                return False
+            used = vars.get(m.group(1))
+            if used is None:
+                return False
+            used, val = float(used), float(m.group(3))
+            return {">": used > val, ">=": used >= val, "<": used < val,
+                    "<=": used <= val, "==": used == val, "!=": used != val}[m.group(2)]
         amt = vars.get("amount")
         if amt is not None:
             if expr == "amount > 1000": return float(amt) > 1000
@@ -200,13 +212,19 @@ async def test_06_countersign_sequential():
 
 @pytest.mark.asyncio
 async def test_07_countersign_ratio():
+    """07：4 人并行、阈值 `#nrOfCompletedInstances==2`（**嵌套在 properties.field**，设计器输出形）。
+
+    issues/163 起本栈也读嵌套形并真求值 ⇒ 完成 2 个即放行——与 java
+    `JeeflowFullTest.test07CountersignRatio`（同样只投 2 票、断言 FINISHED）同形状；
+    改前形状是"读不到 cond ⇒ 四人全投才 DONE"。审计口径见 hub `issues/163`。"""
     eng, repo = setup()
     df = load_flow(repo, "07-countersign-ratio.json")
     inst = await _start_and_execute(eng, repo, df.id, "applicant")
     doing = await repo.find_doing_tasks(inst.id)
     assert len(doing) == 4  # 4 parallel tasks
 
-    for a in ["userA", "userB", "userC", "userD"]:
+    # 完成 2 个即可（阈值 #nrOfCompletedInstances==2）
+    for a in ["userA", "userB"]:
         d = await repo.find_doing_tasks(inst.id)
         task = d[0]
         await repo.add_task_actor(task.id, [a])
@@ -214,6 +232,7 @@ async def test_07_countersign_ratio():
 
     inst = await repo.find_instance_by_id(inst.id)
     assert inst.state == InstanceState.DONE
+    assert len(await repo.find_doing_tasks(inst.id)) == 0  # 放行后剩余两位被废弃
 
 
 # ─── Test 08: Reject (boot2 style: jump back to apply) ──────────────────────────

@@ -7,9 +7,12 @@
 ⚠️ 矩阵"行数"与落库"状态读数"自 2026-09-30 起不再相等（issues/141 G9 · spec 02 §6.1）：
 IN_PROGRESS 的 I15 用的是 08-custom-node.json（define=10），该流程 apply 之后就是 custom1
 **记录类节点**——按裁定它不建待办、落一条已完成历史行并直接走到 end ⇒ I15 实测办结成
-state=20。本栈实测状态读数 **15 进行中 / 10 已完成**（行数仍 16/9，实例总数 25 不变），
-tests/demo_reset_test.py 钉的是状态读数。下方 `ok_in/ok_fin` 计数的是"种子行跑成功几条"，
-不是状态分布，别拿它对数。
+state=20。此后读数再于 2026-10-10 因 issues/161 A 档翻新为 **18 进行中 / 7 已完成**：
+F5/F8/F9（define=12＝10-mixed-mode，extras 里那组 deptLeader 本是给旧编号下的
+assignee-vars 写的）在三行没给 finalAmount 时决策无路可走——旧形状靠被删掉的"蒙臂"装成
+办结，对齐 java 后如实停住（java 抛错、go/node/rust/moon 静默停）。逐行理由与八栈对照见
+tests/demo_reset_test.py 模块 docstring；行数仍 16/9，实例总数 25 不变。
+下方 `ok_in/ok_fin` 计数的是"种子行跑成功几条"，不是状态分布，别拿它对数。
 """
 
 IN_PROGRESS = [

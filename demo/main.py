@@ -84,10 +84,14 @@ def demo_user_search(query: dict):
     return all_rows[start:start + page_size], len(all_rows)
 
 class SimpleExprEvaluator(ExpressionEvaluator):
-    """简易 SpEL 表达式：支持 amount >/>=/</<=/== number"""
+    """简易 SpEL 表达式：支持 amount >/>=/</<=/== number；
+
+    issues/163：`#` 前缀门控变量（会签放行条件 `#nrOfCompletedInstances>=2`）同样吃——
+    引擎并行分支会把 nrOfInstances 等计数以裸名并进求值原料（rust gate_vars 同款），
+    这里剥掉 `#` 按裸名查即可（查不到仍判 false，与 java SpEL catch ⇒ false 同档）。"""
     async def eval(self, expr: str, vars: dict):
         import re
-        m = re.match(r"^\s*(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$", expr)
+        m = re.match(r"^\s*#?(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$", expr)
         if not m:
             return False
         key, op, val = m.group(1), m.group(2), float(m.group(3))
@@ -134,8 +138,9 @@ def load_seed():
 load_seed()
 
 # T003：业务数据种子（引擎真实启动 16 行 IN_PROGRESS + 9 行 FINISHED + 8 委托），/api/reset 复跑。
-# ⚠️ 落库状态读数自 issues/141 G9（spec 02 §6.1 记录类节点不建待办）起是 15 进行中 / 10 已完成
-#    ——I15（define=10 自定义节点流程）发起后直接办结，理由见 demo/seed_business.py 文件头。
+# ⚠️ 落库状态读数：issues/141 G9 起 15 进行中 / 10 已完成（I15＝自定义节点流程发起即办结）；
+#    issues/161 A 档（2026-10-10 删决策蒙臂）后翻新为 18 进行中 / 7 已完成（F5/F8/F9 决策无路
+#    可走如实停住，与 go/node/rust/moon 同读数）——逐行理由见 tests/demo_reset_test.py docstring。
 # 兼容 uvicorn reload：worker 在运行中的事件循环里 import 本模块，此时挂后台任务而非 asyncio.run。
 try:
     asyncio.get_running_loop()

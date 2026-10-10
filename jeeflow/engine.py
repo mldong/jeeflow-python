@@ -334,6 +334,15 @@ class EngineImpl(Engine):
             await self._fire_post(cur_node, inst)
             ct = cur_node.properties.get("countersignType", "")
             cs_cond = str(cur_node.properties.get("countersignCompletionCondition", "") or "").strip()
+            # issues/163 附带读形对齐：设计器把条件写进 `properties.field` 子对象（共享夹具 07
+            # 就是这个形状），java/php/csharp/rust/moon 五栈都读了嵌套形、只有本栈（及 go/node）
+            # 只读顶层 ⇒ 同一份 07 定义在 java 测试里 2/4 放行、本栈 4/4 才放行。顶层优先、
+            # 嵌套兜底（rust/moon 同序；两处都写且打架属退化形状，不承诺与 java 的
+            # "ext 优先" 同分叉）。
+            if not cs_cond:
+                _fld = cur_node.properties.get("field")
+                if isinstance(_fld, dict):
+                    cs_cond = str(_fld.get("countersignCompletionCondition", "") or "").strip()
             # issues/91：会签一票否决仅当节点配置 ONE_VOTE_VETO（忽略大小写）时生效，
             # submitType=20 才跳过会签"未完成即停留"门控提前流转；否则为软拒绝——
             # 否决者任务正常完成、countersignDisagreeFlag=1 已记录为变量（供下游参考），
@@ -371,8 +380,32 @@ class EngineImpl(Engine):
                 else:
                     return await self.repo.find_instance_by_id(inst.id)
             if (ct in ("PARALLEL",) or ct.startswith("RATIO")) and not cs_veto:
-                doing = await self.repo.find_doing_tasks(inst.id)
-                if doing: return await self.repo.find_instance_by_id(inst.id)
+                cs_expr = cs_cond != "" and cs_cond.upper() != "ONE_VOTE_VETO"
+                if cs_expr:
+                    # issues/163：并行/比例会签的放行表达式**真求值**——基准＝java
+                    # CountersignHandler 并行分支（:86-106：cond 非空交求值器，catch ⇒ false）
+                    # ＋ rust gate_vars（engine.rs:1122-1124：门控计数以**裸名**并进原料）。
+                    # 计数口径对齐 java buildCountersignVars：total＝该节点全部成员行、
+                    # activate＝DOING、completed＝已完成（读 inst.tasks：_prepare_execute_task
+                    # 里 complete_task＋_sync_task_to_aggregate 已把本单同步进聚合，计数是新鲜的）。
+                    members = [t for t in inst.tasks if t.taskName == cur_node.id]
+                    gate_vars = {
+                        "nrOfInstances": len(members),
+                        "nrOfActivateInstances": sum(1 for t in members if t.taskState == TaskState.DOING),
+                        "nrOfCompletedInstances": sum(1 for t in members if t.taskState == TaskState.DONE),
+                    }
+                    merged = False
+                    try:
+                        result = await self.expr_eval_or_default().eval(cs_cond, {**vars_, **gate_vars})
+                        merged = _is_truthy(result)
+                    except Exception:  # 对齐 java :100 `catch (Exception ignored) { merged = false; }`
+                        merged = False
+                    if not merged:
+                        return await self.repo.find_instance_by_id(inst.id)
+                    # merged ⇒ 落穿到下面的 abandon＋跟进边（与"全部完成"走同一出口）
+                else:
+                    doing = await self.repo.find_doing_tasks(inst.id)
+                    if doing: return await self.repo.find_instance_by_id(inst.id)
 
             # issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
             # 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
@@ -733,7 +766,6 @@ class EngineImpl(Engine):
     async def _evaluate_decision(self, flow, inst, node, operator, vars_, parent_id: int = 0):
         # 收集所有出边
         edges = [e for e in flow.edges if e.sourceNodeId == node.id]
-        if not edges: return
         # 求值腿无条件执行（issues/160）：旧形状是 `if self.expr_eval:`，宿主没注册 SPI 时整段跳过，
         # 于是"定支"其实由下面两条回退臂蒙出来（amount=500 与 5000 落进同一条边），而门面那一腿
         # 对同一个实例判"没走"。现在两腿共用 ``expr_eval_or_default`` 这一个出口。
@@ -745,16 +777,19 @@ class EngineImpl(Engine):
             if _is_truthy(result):
                 target = _find_node(flow, edge.targetNodeId)
                 if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
-        # 回退：取第一条没有 expr 的边作为默认路径
+        # 回退：取第一条没有 expr 的边作为默认路径（issues/161：保留——这是"默认分支"语义，
+        # 不是本案要删的那条臂）
         for edge in edges:
             expr = edge.properties.get("expr", "")
             if not expr:
                 target = _find_node(flow, edge.targetNodeId)
                 if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
-        # 最后的回退：取第一条边
-        if edges:
-            target = _find_node(flow, edges[0].targetNodeId)
-            if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
+        # issues/161 A（owner 2026-10-10 拍）：旧形状此处还有第二条回退臂"无条件取 edges[0]"，
+        # 与 java 参考实现分叉——`DecisionModel.exec` 遍历完 getOutputs() 仍 !found 即抛
+        # `JeeflowException(WfErrEnum.NOT_FOUND_NEXT_NODE)`。同一份坏定义（两 expr 全 false /
+        # 变量缺失）python 蒙第一支走、java 显式失败。删蒙臂对齐 java（文案逐字取 WfErrEnum）。
+        # 零出边档（无任何可走边）java 空 outputs 同样抛，此处一并覆盖。
+        raise ValueError("decision节点无法确定下一步执行路线")
 
     async def _create_task(self, node: FlowNode, inst: ProcessInstance, operator: str, vars_: dict,
                            process_name: str = "", parent_id: int = 0, is_first: bool = False):

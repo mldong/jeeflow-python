@@ -14,7 +14,11 @@ from .model import (
 )
 from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
 from .spi import normalize_actors
+from .default_evaluator import DefaultExpressionEvaluator
 from .extensions import EngineExtensions, EventType, ProcessEvent
+
+# 无状态 ⇒ 模块级单件（rust 侧同形：静态 ``DefaultExpressionEvaluator``）
+_DEFAULT_EXPRESSION_EVALUATOR = DefaultExpressionEvaluator()
 
 KEY_SUBMIT_TYPE   = "submitType"
 KEY_BUSINESS_NO   = "BUSINESS_NO"
@@ -136,11 +140,24 @@ class EngineImpl(Engine):
         self.ext.ext_repository = ext_repo
         return self
 
+    def expr_eval_or_default(self) -> ExpressionEvaluator:
+        """决策/条件表达式的**单一求值出口**（issues/160）：宿主注册了 SPI 就走宿主，
+        没注册走引擎内置 ``DefaultExpressionEvaluator``。
+
+        运行时 ``_evaluate_decision`` 与门面 ``highLight`` 必须都从这里取，否则同一个实例
+        会出现"运行时走了那条支、门面判没走"的分叉——本栈此前更宽：运行时整段不求值、
+        靠"取第一条边"蒙方向，门面抛「未配置」又被裸 ``except`` 吞掉，走过的决策边连同
+        它之后的整条路径一起丢（rust 的同形修复见 issues/158 ＋ ``expression_evaluator_or_default``）。
+        有了默认件，spec/06 §4.6 义务 2 那条"未注册才允许整档判 false"的降级档在本栈结构性不可达。
+        """
+        return self.expr_eval if self.expr_eval is not None else _DEFAULT_EXPRESSION_EVALUATOR
+
     async def eval_expr(self, expr: str, vars_: dict) -> Any:
-        """表达式求值（v1.5.0，门面 highLight 决策分支过滤用）"""
-        if self.expr_eval is None:
-            raise ValueError("ExpressionEvaluator 未配置")
-        return await self.expr_eval.eval(expr, vars_)
+        """表达式求值（v1.5.0，门面 highLight 决策分支过滤用）
+
+        issues/160：不再在 SPI 缺失时抛「未配置」——宿主没注册时回落引擎内置默认件，
+        与运行时定支**同一条通道**（``expr_eval_or_default``）。"""
+        return await self.expr_eval_or_default().eval(expr, vars_)
 
     # ─── 委托查询流程名解析（spec 06 §4.5 条款 1.1 全栈唯一实现）────────────────
 
@@ -717,15 +734,17 @@ class EngineImpl(Engine):
         # 收集所有出边
         edges = [e for e in flow.edges if e.sourceNodeId == node.id]
         if not edges: return
-        # 先尝试表达式求值
-        if self.expr_eval:
-            for edge in edges:
-                expr = edge.properties.get("expr", "")
-                if not expr: continue
-                result = await self.expr_eval.eval(expr, vars_)
-                if _is_truthy(result):
-                    target = _find_node(flow, edge.targetNodeId)
-                    if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
+        # 求值腿无条件执行（issues/160）：旧形状是 `if self.expr_eval:`，宿主没注册 SPI 时整段跳过，
+        # 于是"定支"其实由下面两条回退臂蒙出来（amount=500 与 5000 落进同一条边），而门面那一腿
+        # 对同一个实例判"没走"。现在两腿共用 ``expr_eval_or_default`` 这一个出口。
+        evaluator = self.expr_eval_or_default()
+        for edge in edges:
+            expr = edge.properties.get("expr", "")
+            if not expr: continue
+            result = await evaluator.eval(expr, vars_)
+            if _is_truthy(result):
+                target = _find_node(flow, edge.targetNodeId)
+                if target: return await self._execute_node(flow, inst, target, operator, vars_, parent_id)
         # 回退：取第一条没有 expr 的边作为默认路径
         for edge in edges:
             expr = edge.properties.get("expr", "")

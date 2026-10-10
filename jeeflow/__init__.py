@@ -7,6 +7,7 @@ from .repository import JdbcRepository, TsIDGenerator, MySqlAdapter, PostgresAda
 from .spi import (ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator,
                   normalize_actors, normalize_cc_actors, normalize_actor_value, require_present_id,
                   actor_delete_forms)
+from .default_evaluator import DefaultExpressionEvaluator, evaluate_builtin
 from .builtin import (register_builtin_assignments, OperatorAssignmentHandler, FormFieldAssigneeHandler,
                       DeptLeaderAssignmentHandler, DeptMainLeaderAssignmentHandler,
                       ApplicantDeptLeaderAssignmentHandler, ApplicantDeptMainLeaderAssignmentHandler,

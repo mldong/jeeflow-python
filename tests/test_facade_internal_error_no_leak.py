@@ -366,7 +366,8 @@ def test_criterion_4_never_misfires_on_engine_contract_value_error():
         (_F_FACADE, "未知 action: processDefine/bogus"),
         (_F_FACADE, _PARSE_MSG),                        # issues/139 解析腿：契约文案，必须逐字透出
         # engine.py
-        (_F_ENGINE, "ExpressionEvaluator 未配置"),
+        # issues/160：本表原有 `(_F_ENGINE, "ExpressionEvaluator 未配置")` 一条——那条 raise 已随
+        # "SPI 缺失"档被引擎内置默认件变成结构性不可达而删除，留着等于把不存在的文案当契约面念
         (_F_ENGINE, "define not found: 2084320543834124290"),
         (_F_ENGINE, "no start node"),
         (_F_ENGINE, "根据节点名称[no-such-node]无法找到节点模型"),

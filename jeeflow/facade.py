@@ -975,8 +975,17 @@ class JeeflowFacade:
                 node_progress = await self._build_node_progress(flow, his)
                 await self._collect_path(flow, "start", active, history, edges, set(),
                                          inst.variables, his)
-            except Exception:
-                pass
+            except Exception as e:
+                # issues/160：块级降级的**面**与 java `JeeflowFacade.highLight:582` 的
+                # `catch (Exception ignored)` 同档（定义 content 坏形状不该让整条 highLight 报错），
+                # 但不再静默——本案当年就是被这条静默通道藏住的：求值 SPI 缺失抛出的 ValueError
+                # 在这里被当成"内容坏形状"一起吞掉，走过的决策边连同它之后的整条路径全丢，
+                # 而流程照常流转，只有流程图暴露它。SPI 缺失那一档已由引擎内置默认件
+                # （``engine.expr_eval_or_default``）变成结构性不可达，这里留可诊断日志兜住其余
+                # 任何异常，**不许再新增第二条静默通道**（issues/156 php 同指纹）。
+                _log.warning("[jeeflow] highLight 模型补全腿异常，边集/节点补全/nodeProgress 将降级"
+                             "（实例与任务行不受影响）: instanceId=%s, defineId=%s",
+                             instance_id, inst.defineId, exc_info=e)
         return {"activeNodeNames": active, "historyNodeNames": history,
                 "historyEdgeNames": edges, "nodeProgress": node_progress}
 

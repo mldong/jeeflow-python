@@ -164,7 +164,11 @@ class MyIdGen(IDGenerator):
 
 ## ExpressionEvaluator（可选）
 
-决策/会签表达式求值（不实现则表达式分支不生效）：
+决策/会签表达式求值。**不实现也照样定支**——引擎自带内置件
+`jeeflow.default_evaluator.DefaultExpressionEvaluator`（issues/160，spec/06 §4.6 义务 2 的"求值通道"条）：
+变量代入（`${var}` / `#var` / 裸名）＋ 比较运算（`>= <= != == > <`）＋ 布尔字面量，
+**不含 `&&` / `||`**；关系运算要求两侧都是数字，非数字操作数判 false（不拿字典序蒙方向）。
+运行时的决策定支与门面 `highLight` 的边重算**共用这一个出口**，宿主注册了本 SPI 则宿主优先：
 
 ```python
 class MyExpr(ExpressionEvaluator):

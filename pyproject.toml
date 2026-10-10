@@ -1,6 +1,6 @@
 [project]
 name = "jeeflow"
-version = "1.8.40"
+version = "1.8.41"
 description = "Lightweight async workflow engine - Python implementation"
 license = { text = "Apache-2.0" }
 authors = [{ name = "mldong" }]

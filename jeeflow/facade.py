@@ -973,7 +973,7 @@ class JeeflowFacade:
             try:
                 flow = json.loads(def_.content)
                 node_progress = await self._build_node_progress(flow, his)
-                await self._collect_path(flow, "start", "", active, history, edges, set(),
+                await self._collect_path(flow, "start", active, history, edges, set(),
                                          inst.variables, his)
             except Exception:
                 pass
@@ -1027,14 +1027,15 @@ class JeeflowFacade:
             progress[name] = item
         return progress
 
-    async def _collect_path(self, flow: dict, node_id: str, edge_name: str,
+    # issues/157：边名收录在**源节点循环内**、活跃判断之前（逐字同位于 java
+    # `JeeflowFacade.collectPath`）。此前是把边名当递归实参传的，
+    # ⇒ 目标节点当前活跃的那条边既不下钻也不收录，"进当前待办的那一跳"永远是灰的。
+    async def _collect_path(self, flow: dict, node_id: str,
                             active: list, history: list, edges: list, visited: set,
                             vars_: dict, history_tasks: list):
         if node_id in visited:
             return
         visited.add(node_id)
-        if edge_name and edge_name not in edges:
-            edges.append(edge_name)
         src = self._find_node(flow, node_id)
         for e in flow.get("edges", []):
             if e.get("sourceNodeId") != node_id:
@@ -1044,6 +1045,9 @@ class JeeflowFacade:
                 expr = (e.get("properties") or {}).get("expr")
                 if expr and not await self._eval_decision_expr(flow, src, expr, vars_, history_tasks):
                     continue
+            eid = e.get("id")
+            if eid and eid not in edges:
+                edges.append(eid)
             target = self._find_node(flow, e.get("targetNodeId"))
             if not target:
                 continue
@@ -1051,8 +1055,8 @@ class JeeflowFacade:
             if tid not in active and tid not in history:
                 history.append(tid)
             if tid in active:
-                continue
-            await self._collect_path(flow, tid, e.get("id"), active, history, edges, visited,
+                continue  # 遇活跃节点停止深入（边名已在上面收录）
+            await self._collect_path(flow, tid, active, history, edges, visited,
                                      vars_, history_tasks)
 
     async def _eval_decision_expr(self, flow: dict, decision: dict, expr: str,

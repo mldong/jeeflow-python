@@ -814,6 +814,35 @@ async def test_highlight_filters_decision_branch():
     assert "task2" not in hl["historyNodeNames"], hl
     assert "task3" in hl["historyNodeNames"], hl
 
+# ─── Test 03.6: 指向活跃节点的那一跳也要进高亮（issues/157） ─────────────────
+
+@pytest.mark.asyncio
+async def test_highlight_collects_edge_into_active_node():
+    """与 03.5 唯一区别＝停在分支上（task2 活跃）。边名收录绑在递归实参上时 e3 收不到。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, None)
+    df = load_flow(repo, "03-decision-expr.json")
+    inst = await _start_and_execute(eng, repo, df.id, "applicant", {"amount": 5000})
+    doing = await repo.find_doing_tasks(inst.id)
+    for t in doing:
+        if t.taskName == "task1":
+            await repo.add_task_actor(t.id, ["leader"])
+            await eng.execute_process_task(t.id, "leader")
+
+    doing = await repo.find_doing_tasks(inst.id)
+    assert [t.taskName for t in doing] == ["task2"], doing
+
+    r = await facade.flow("processInstance/highLight", {"id": inst.id})
+    assert r["code"] == 0, r
+    hl = r["data"]
+    assert "task2" in hl["activeNodeNames"], hl
+    assert "e3" in hl["historyEdgeNames"], hl          # 本案主判据
+    for e in ("e0", "e_apply_1", "e2"):
+        assert e in hl["historyEdgeNames"], hl
+    assert "e4" not in hl["historyEdgeNames"], hl       # 没走的分支边
+    assert "e5" not in hl["historyEdgeNames"], hl       # 活跃节点自己的出边（停止深入）
+    assert "task3" not in hl["historyNodeNames"], hl
+
 # ─── Test 05-1: 三个 detail 返回 jsonObject ───────────────────────────────────
 
 @pytest.mark.asyncio

@@ -504,6 +504,17 @@ async def main():
         n = await raw_count(adapter, "SELECT COUNT(1) FROM biz_tx_probe WHERE tag = ?", [tag_escape])
         check("persist 腿(对照)：未接线时行应逃逸留存 1（降级运行态红样）", n == 1, f"n={n}")
 
+        # ⑥-c 接线且动作成功 ⇒ 业务行必须真落库（补"写了"的正向读数；防 ⑥-a 的
+        # n==0 被"压根没写"与"写了又回滚"两种根因同形骗过）
+        repo.reset_inject()
+        fP3 = build_persist_facade(writer)
+        tag_ok = "pytier-persist-ok"
+        r = await fP3.flow("processInstance/startAndExecute", {
+            "processDefineId": DEFINE_ID_SYNC, "operator": "zhangsan", "f_tag": tag_ok})
+        check("persist 腿(正向)：动作应成功", r.get("code", 0) == 0, str(r))
+        n = await raw_count(adapter, "SELECT COUNT(1) FROM biz_tx_probe WHERE tag = ?", [tag_ok])
+        check("persist 腿(正向)：接线且成功时业务行必须真落库", n == 1, f"n={n}")
+
         await cleanup(adapter)
         await purge_defines(adapter)
     finally:

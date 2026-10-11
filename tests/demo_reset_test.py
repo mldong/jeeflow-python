@@ -42,6 +42,16 @@ T003 起 reset 会复跑业务种子 driver（引擎真实启动），断言从�
    本档落地后期待的控制台噪声：3 条 `decision节点无法确定下一步执行路线`（F5/F8/F9）＋ 2 条
    `task not doing`（F2=07 会签：issues/163 修好后 2/4 票即合并，advance 快照里剩余两位
    尝试办理时行已废弃）。
+
+   ⚠️ 2026-10-11（issues/166 A 档落地后）：读数 **18/7 → 15/10**（回到 2026-09-30 的口径）。
+   种子矩阵 F5/F8/F9 三行的 extras 补 `finalAmount: 8000`（>5000 ⇒ 走 e8→task4(boss)→end，
+   与旧蒙臂路径同形）——三行的 deptLeader 本是 15 文件编号时代 assignee-vars 的判定变量，
+   flows 目录插入 06-…-expire.json 后 define=12 已是 `10-mixed-mode.json`（**八仓同序**，
+   16 文件，逐家现读核实），按 drifted 编号补齐判定变量即恢复"9 行已完成"原意；不是改引擎、
+   也不是把 id 改回去（B 案要八栈编号对齐同一约定，无用户可见收益，未取）。
+   同轮 164-A（go/node/rust/moon 决策零命中从"静默停住"改报错）已落地，但种子修好后
+   三行根本走不到零命中档 ⇒ 各栈重置读数同回 15/10。F2 的 2 条 `task not doing` 噪声仍在
+   （issues/163 会签 2/4 合并的固有形状）；3 条 decision 报错噪声随种子修复消失。
 """
 import sys
 import os
@@ -67,7 +77,8 @@ async def test_reset_clears_and_reseeds():
     assert len(ext_repo._surrogates) == 8, f"reset 后委托应为 8 条，实际 {len(ext_repo._surrogates)}"
     assert len(repo._defines) == before_defines, "种子定义应重载"
 
-    # 落点：18 state=10 + 7 state=20（issues/161 A 档 2026-10-10 落地后重算，理由见模块 docstring）
+    # 落点：15 state=10 + 10 state=20（issues/166 A 档 2026-10-11 落地后翻回，理由见模块
+    # docstring；161 档时期的 18/7 读数随 F5/F8/F9 补 finalAmount 一起作废）
     states = [inst.state for inst in repo._instances.values()]
-    assert states.count(10) == 18, f"进行中应 18 条，实际 {states.count(10)}"
-    assert states.count(20) == 7, f"已完成应 7 条，实际 {states.count(20)}"
+    assert states.count(10) == 15, f"进行中应 15 条，实际 {states.count(10)}"
+    assert states.count(20) == 10, f"已完成应 10 条，实际 {states.count(20)}"

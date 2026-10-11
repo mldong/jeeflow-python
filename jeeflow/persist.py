@@ -49,6 +49,20 @@ class DynamicTableWriter(ABC):
     def fill_system_fields(self, data: dict[str, Any], is_insert: bool) -> None:
         """按配置列名填充系统字段（未配置的列跳过）"""
 
+    # ── async 写腿（audit8 R9 C99 ⑥）──────────────────────────────────────────
+    # 拦截器在异步引擎内以 await a_* 调用：默认回落同步实现（既有集成方实现零改动）；
+    # 支持事务并入的实现（JdbcDynamicTableWriter）覆写——活动事务内走事务连接、
+    # 不自行 commit，提交/回滚归事务 owner（spec/12 §12.2 覆盖面）。
+
+    async def a_insert(self, table_name: str, data: dict[str, Any]) -> Any:
+        return self.insert(table_name, data)
+
+    async def a_update(self, table_name: str, data: dict[str, Any], where_column: str, where_value: Any) -> int:
+        return self.update(table_name, data, where_column, where_value)
+
+    async def a_exists(self, table_name: str, biz_key: str, biz_key_value: Any) -> bool:
+        return self.exists(table_name, biz_key, biz_key_value)
+
 
 # ─── JdbcDynamicTableWriter ────────────────────────────────────────────────────
 
@@ -100,7 +114,18 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         self.strict_column_match: bool = False
         # 主键生成器（issues/21）：非自增主键表（雪花/应用生成）插入时生成主键值，入参表名
         self.primary_key_generator: Optional[Callable[[str], Any]] = None
+        # audit8 R9 C99 ⑥：事务连接解析器（集成方接线，如
+        # ``writer.tx_conn_provider = jeeflow.repository.base.current_tx_conn``）——
+        # 返回活动事务的异步连接（SqlConnection 包装）时 a_* 写腿并入动作事务；
+        # None（未注入/无活动事务）回落同步自 commit 连接＝§12.1 条 4 显式降级。
+        # 前提：事务连接与本 writer 同一数据库同一方言（三壳接线即本前提）。
+        self.tx_conn_provider: Optional[Callable[[], Any]] = None
         self._cache: dict[str, list[_Column]] = {}
+
+    def _tx_conn(self):
+        """活动事务连接（无 provider / 无活动事务 → None）。"""
+        provider = self.tx_conn_provider
+        return provider() if provider is not None else None
 
     # ── 表结构探测 ──
 
@@ -165,7 +190,8 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         cols = self._table_columns(table_name)
         return [c for c in columns if self._find_table_column(cols, c) is not None]
 
-    def insert(self, table_name: str, data: dict[str, Any]) -> Any:
+    def _build_insert(self, table_name: str, data: dict[str, Any]) -> tuple[str, list[Any]]:
+        """组装 INSERT（列过滤 + 主键生成 + 方言占位符）——同步/异步两路共用。"""
         _check_table_name(table_name)
         cols = self._table_columns(table_name)
         names: list[str] = []
@@ -189,7 +215,10 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
             raise ValueError(f"persist: no matching columns for {table_name}")
         placeholder = self._placeholder()
         placeholders = ",".join([placeholder] * len(names))
-        query = f"INSERT INTO {table_name} ({','.join(names)}) VALUES ({placeholders})"
+        return f"INSERT INTO {table_name} ({','.join(names)}) VALUES ({placeholders})", values
+
+    def insert(self, table_name: str, data: dict[str, Any]) -> Any:
+        query, values = self._build_insert(table_name, data)
         cur = self._execute(query, values)
         self._conn.commit()
         return cur.lastrowid
@@ -205,6 +234,17 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
     def update(self, table_name: str, data: dict[str, Any], where_column: str, where_value: Any) -> int:
         """参数化 UPDATE（SYNC 同步演进，issues/24）：列过滤（宽松匹配）+ 条件列排除 +
         参数化 SET，返回受影响行数。对齐 Java JdbcDynamicTableWriter.update。"""
+        built = self._build_update(table_name, data, where_column, where_value)
+        if built is None:
+            return 0
+        query, values = built
+        cur = self._execute(query, values)
+        self._conn.commit()
+        return cur.rowcount
+
+    def _build_update(self, table_name: str, data: dict[str, Any], where_column: str,
+                      where_value: Any) -> Optional[tuple[str, list[Any]]]:
+        """组装 UPDATE；无更新列返回 None（同步返回 0 / 异步同样返回 0）。"""
         _check_table_name(table_name)
         if not where_column:
             raise ValueError(f"persist: update {table_name} requires where column")
@@ -220,13 +260,46 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
                 sets.append(f"{col.name} = {self._placeholder()}")
                 values.append(data[key])
         if not sets:
-            return 0  # 无更新列（如结束节点仅状态探测未命中）
+            return None  # 无更新列（如结束节点仅状态探测未命中）
         placeholder = self._placeholder()
         query = f"UPDATE {table_name} SET {','.join(sets)} WHERE {where_column} = {placeholder}"
         values.append(where_value)
-        cur = self._execute(query, values)
-        self._conn.commit()
-        return cur.rowcount
+        return query, values
+
+    # ── async 写腿（audit8 R9 C99 ⑥）：事务内并入 / 无事务回落 ─────────────────
+
+    async def a_insert(self, table_name: str, data: dict[str, Any]) -> Any:
+        """事务内：走事务连接（不 commit，提交/回滚归 owner；返回 None——异步包装不暴露 lastrowid，
+        主键值由生成器写进 data）；无事务：回落同步自 commit 腿。"""
+        tx = self._tx_conn()
+        if tx is None:
+            return self.insert(table_name, data)
+        query, values = self._build_insert(table_name, data)
+        await tx.execute(query, tuple(values))
+        return None
+
+    async def a_update(self, table_name: str, data: dict[str, Any], where_column: str, where_value: Any) -> int:
+        tx = self._tx_conn()
+        if tx is None:
+            return self.update(table_name, data, where_column, where_value)
+        built = self._build_update(table_name, data, where_column, where_value)
+        if built is None:
+            return 0
+        query, values = built
+        # 异步包装无 rowcount 出口（SqlConnection 协议只有 execute/fetchone/fetchall）——
+        # UPDATE 走 execute；调用方（persist 拦截器）不消费行数，返回 0 占位并在新行为上不依赖它
+        await tx.execute(query, tuple(values))
+        return 0
+
+    async def a_exists(self, table_name: str, biz_key: str, biz_key_value: Any) -> bool:
+        tx = self._tx_conn()
+        if tx is None:
+            return self.exists(table_name, biz_key, biz_key_value)
+        _check_table_name(table_name)
+        self._table_columns(table_name)  # 表不存在提前报错（元数据读走同步连接，与事务无关）
+        query = f"SELECT COUNT(1) FROM {table_name} WHERE {biz_key} = {self._placeholder()}"
+        row = await tx.fetchone(query, (biz_key_value,))
+        return bool(row and row[0] > 0)
 
     def fill_system_fields(self, data: dict[str, Any], is_insert: bool) -> None:
         now = time.strftime(_TIME_LAYOUT)
@@ -364,19 +437,21 @@ class PersistPostInterceptor(FlowInterceptor):
         if not self._mark_chain(node, instance):
             return
         # 幂等：以 process_instance_id 为键，先查后插
-        if self.writer.exists(table_name, "process_instance_id", instance.id):
+        # audit8 R9 C99 ⑥：写腿走 a_* —— 活动动作事务内并入同一条连接（exists 看得到未提交行）
+        if await self.writer.a_exists(table_name, "process_instance_id", instance.id):
             return
         data = self._extract_fields(instance, None, False, True)  # 只 f_ 全量
         self._fill_context(data, instance)
         self.writer.fill_system_fields(data, True)
-        self.writer.insert(table_name, data)
+        await self.writer.a_insert(table_name, data)
 
     # ── SYNC（1.8.0 同步演进：发起入库 → 节点推进 → 结束定稿） ──
 
     async def _handle_sync(self, node, instance: ProcessInstance, table_name: str) -> None:
         if not self._mark_chain(node, instance):
             return  # 同链同节点不重复（节点级，issues/19 演进）
-        exists = self.writer.exists(table_name, "process_instance_id", instance.id)
+        # audit8 R9 C99 ⑥：exists 走 a_*（事务内看得到本动作未提交的那行，幂等判定才正确）
+        exists = await self.writer.a_exists(table_name, "process_instance_id", instance.id)
 
         # 任务节点（TYPE_TASK/TYPE_CUSTOM）才更新业务字段：f_ 按节点字段权限过滤；
         # 结束/网关等非任务节点只定稿状态，避免全量覆盖任务节点的只读/隐藏限制
@@ -394,10 +469,10 @@ class PersistPostInterceptor(FlowInterceptor):
         self._fill_context(data, instance)
         if not exists:
             self.writer.fill_system_fields(data, True)
-            self.writer.insert(table_name, data)
+            await self.writer.a_insert(table_name, data)
             return
         self.writer.fill_system_fields(data, False)  # 只填 update 组
-        self.writer.update(table_name, data, "process_instance_id", instance.id)
+        await self.writer.a_update(table_name, data, "process_instance_id", instance.id)
 
     # ── 公共 ──
 

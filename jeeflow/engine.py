@@ -223,10 +223,12 @@ class EngineImpl(Engine):
         - 手动 ``processInstance/createCCInstance`` —— 门面调本方法（不再自己建行、不再自己 fire）。
 
         ⚠️ **契约位置**：cc 行的写入与事件都在**引擎执行路径内**，因此与同一次 ``start``/``execute``
-        里的实例/任务写库处在**同一个事务作用域**——本栈的事务约定是
-        ``JdbcProcessRepository.with_tx``（``contextvars`` 绑连接，spec 05 §7.4）：调用方把
-        ``engine.start/execute`` 包进 ``with_tx`` 时，cc 行 insert 与任务/实例更新同连接同事务、
-        一起提交一起回滚；未包时逐条 autocommit（与本栈其余写库点同档）。
+        里的实例/任务写库处在**同一个事务作用域**——audit8 R9（145-3）起五个写入口
+        （``start_process_instance_by_id``/``execute_process_task`` 等）**自包事务**
+        （spec/12 §12.2 原子面）：仓储提供 ``with_tx``（``contextvars`` 绑连接）⇒ 入口内写库
+        全收一条事务、失败整体回滚；嵌套调用（门面动作级包裹内）经 join 支并入最外层、
+        提交/回滚归最外层 owner。仓储无 ``with_tx``（自定义/内存实现）⇒ 显式裸跑＝§12.1
+        条 4 降级，行为与修前一致。
         抄送腿若留在门面（本轮之前的形状），门面是在 ``engine.*`` **返回之后**才执行的 ⇒
         任何只包住引擎调用的事务都盖不到 cc 行，且**直连引擎 API 的调用方（不经门面）
         传 ``f_ccActors``/``tf_ccActors`` 根本不建 cc 行**——这正是本轮要搬掉的病灶。
@@ -274,7 +276,23 @@ class EngineImpl(Engine):
 
     # ─── Start ────────────────────────────────────────────────────────────────
 
+    async def _in_tx(self, fn):
+        """audit8 R9 145-3：引擎入口内包事务（spec/12 §12.2 原子面）。
+
+        仓储提供 ``with_tx``（JdbcRepository）⇒ 整个入口收进一条事务；入口内的嵌套
+        调用经 join 支并入最外层（不双开、提交/回滚归最外层）。仓储无 ``with_tx``
+        （自定义/内存实现）⇒ 显式裸跑＝§12.1 条 4 降级，行为与修前一致。
+        """
+        with_tx = getattr(self.repo, "with_tx", None)
+        if with_tx is None:
+            return await fn()
+        return await with_tx(fn)
+
     async def start_process_instance_by_id(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+        # audit8 R9 145-3：入口事务包裹（错误处理/事件在包裹内外语义见 spec/12 §12.2）
+        return await self._in_tx(lambda: self._start_process_instance_by_id_impl(define_id, operator, args))
+
+    async def _start_process_instance_by_id_impl(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         def_ = await self.repo.find_define_by_id(define_id)
         if not def_: raise ValueError(f"define not found: {define_id}")
         flow = parse_flow_model(json.loads(def_.content))
@@ -317,6 +335,10 @@ class EngineImpl(Engine):
     # ─── Execute ──────────────────────────────────────────────────────────────
 
     async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+        # audit8 R9 145-3：入口事务包裹（与 start 同口径）
+        return await self._in_tx(lambda: self._execute_process_task_impl(task_id, operator, args))
+
+    async def _execute_process_task_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         # issues/127 / spec §11.7 办理时抄送（tf_ccActors）：**覆盖面只有本条腿**——钩子挂在这里，
         # 不挂在共用的 ``_prepare_execute_task`` 里（形状基准＝go engine_impl.go:102-105 传钩子、
         # :206/:228/:265 三个 jump 入口传 nil；java 基准 JeeflowEngineImpl 的 handleCcActors 唯一
@@ -427,6 +449,10 @@ class EngineImpl(Engine):
     # ─── Reject ───────────────────────────────────────────────────────────────
 
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+        # audit8 R9 145-3：入口事务包裹（与 start 同口径）
+        return await self._in_tx(lambda: self._execute_and_jump_to_end_impl(task_id, operator, args))
+
+    async def _execute_and_jump_to_end_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         # 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
         # spec §11.7 边界 2：jumpToEnd 档不带 cc 钩子（显式 None，同 go :206 传 nil）——
         # 这一档传 tf_ccActors 也零 cc 行、零码 4。
@@ -444,6 +470,11 @@ class EngineImpl(Engine):
 
     async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None,
                                      target_task_name: str = None) -> ProcessInstance:
+        # audit8 R9 145-3：入口事务包裹（与 start 同口径）
+        return await self._in_tx(lambda: self._execute_and_jump_task_impl(task_id, operator, args, target_task_name))
+
+    async def _execute_and_jump_task_impl(self, task_id: int, operator: str, args: dict[str, Any] = None,
+                                          target_task_name: str = None) -> ProcessInstance:
         # 空 target＝血缘回退（spec §11.3 码 6 的"退回"族）；命名 target＝跳转（码 5 族）
         # spec §11.7 边界 2：ROLLBACK / JUMP 两档都不挂 cc 钩子（显式 None，同 go :228）
         task, inst, flow, vars_ = await self._prepare_execute_task(
@@ -470,6 +501,11 @@ class EngineImpl(Engine):
 
     async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str,
                                                    args: dict[str, Any] = None) -> ProcessInstance:
+        # audit8 R9 145-3：入口事务包裹（与 start 同口径）
+        return await self._in_tx(lambda: self._execute_and_jump_to_first_task_node_impl(task_id, operator, args))
+
+    async def _execute_and_jump_to_first_task_node_impl(self, task_id: int, operator: str,
+                                                        args: dict[str, Any] = None) -> ProcessInstance:
         # 退发起人＝spec §11.3 码 6 的"退回"族（载荷 submitType=6 分档，不另开号）
         # spec §11.7 边界 2：退发起人档不挂 cc 钩子（显式 None，同 go :265）
         _, inst, flow, vars_ = await self._prepare_execute_task(

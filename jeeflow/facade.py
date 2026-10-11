@@ -264,7 +264,12 @@ class JeeflowFacade:
             handler = getattr(self, "_" + action.replace("/", "_"), None)
             if handler is None:
                 return self._error(f"未知 action: {action}")
-            data = await handler(args)
+            # audit8 R9 145-3：整次 dispatch 收进一次事务（spec/12 §12.2 原子面）——
+            # 门面自组复合动作（startAndExecute 三拍、deploy/redeploy 两拍）中途失败整体回滚；
+            # 引擎入口内包裹经 join 支并入本层（不双开）。仓储无 with_tx（自定义实现）裸跑降级＝§12.1 条 4。
+            # ⚠ 失败信封在包裹外生成（下面 except）：先整体回滚、再转失败信封。
+            with_tx = getattr(self._repo, "with_tx", None)
+            data = await (with_tx(lambda: handler(args)) if with_tx else handler(args))
             # issues/38 E9 出口统一：id 类字段转 string（对齐 Node 全程 string / Java 全局
             # ToStringSerializer）——前端 JS number 无法承载雪花 id（>2^53）
             return self._ok(_stringify_ids(data))

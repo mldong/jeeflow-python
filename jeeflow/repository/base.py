@@ -30,6 +30,16 @@ from ..spi import (IDGenerator, ProcessRepository, ProcessExtRepository,
 _tx_conn_var: contextvars.ContextVar = contextvars.ContextVar("jeeflow_tx_conn", default=None)
 
 
+def current_tx_conn():
+    """audit8 R9 C99 ⑥：当前活动事务连接（无事务返回 None）。
+
+    集成方把本函数接到 `JdbcDynamicTableWriter.tx_conn_provider`，persist 业务表写
+    在动作事务内即走同一条事务连接并入回滚（spec/12 §12.2 覆盖面）；无事务时写腿
+    回落自身自 commit 连接＝§12.1 条 4 显式降级运行态。
+    """
+    return _tx_conn_var.get()
+
+
 class TsIDGenerator(IDGenerator):
     """默认 ID 生成器：时间戳毫秒 + 同毫秒递增序号（对齐 Java nextId 默认实现）"""
 
@@ -212,7 +222,13 @@ class JdbcRepository(ProcessRepository):
     # ── 事务（spec §7.4：contextvars 绑定连接）────────────────────────────
 
     async def with_tx(self, fn):
-        """开启事务，回调内仓储调用走同一连接；异常回滚，成功提交。"""
+        """开启事务，回调内仓储调用走同一连接；异常回滚，成功提交。
+
+        audit8 R9 145-3：**join 支**——contextvars 已绑定活动事务时直接并入最外层
+        （不双开连接、不提前提交，提交/回滚归最外层 owner；spec/12 §12.2 归属面）。
+        """
+        if _tx_conn_var.get() is not None:
+            return await fn()
         conn = await self._adapter.acquire()
         try:
             await conn.begin()

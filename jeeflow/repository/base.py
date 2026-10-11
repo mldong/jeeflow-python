@@ -297,12 +297,17 @@ class JdbcRepository(ProcessRepository):
                  define.createTime, define.createUser, define.updateTime, define.updateUser))
 
     async def update_define(self, define: ProcessDefine) -> None:
+        # audit8 R5：update 路径零值不再兜底成 1——0 是合法取值（停用态/版本 0），
+        # `or 1` 会把停用定义复活、把原版本号打回 1；缺省（None）才回落 1（对齐 Java null 语义）
         async with self._conn() as conn:
             await conn.execute(self._sql(
                 "UPDATE wf_process_define SET name=?, display_name=?, type=?, state=?,"
                 " content=?, version=?, update_time=?, update_user=? WHERE id=?"),
-                (define.name, define.displayName, define.type, int(define.state or 1),
-                 define.content, int(define.version or 1), datetime.now(), define.updateUser,
+                (define.name, define.displayName, define.type,
+                 int(define.state) if define.state is not None else 1,
+                 define.content,
+                 int(define.version) if define.version is not None else 1,
+                 datetime.now(), define.updateUser,
                  define.id))
 
     async def update_define_state(self, define_id: int, state: int) -> None:

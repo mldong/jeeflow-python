@@ -427,6 +427,14 @@ class JeeflowFacade:
                              type=flow.get("type", "approval"),
                              content=content,
                              updateUser=str(args.get("operator", "system")))
+        # audit8 R5/spec 06：redeploy 是原地替换内容——先读再写保留原 state/version
+        # （定值默认 1/1 会把停用定义复活、把原版本号打回 1）
+        last = await self._repo.find_define_by_id(define_id)
+        if last is not None:
+            def_.state = last.state
+            def_.version = last.version
+            def_.createTime = last.createTime
+            def_.createUser = last.createUser
         await self._repo.update_define(def_)
         return None
 

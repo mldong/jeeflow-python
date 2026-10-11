@@ -1133,6 +1133,67 @@ async def test_design_deploy_redeploy_is_deployed():
     assert r["code"] == 0, r
     assert (await repo.find_define_by_id(define_id2)).version == 5
 
+    # audit8 R5：同替换语义，state 也必须保持——停用后再 redeploy 不得被复活
+    r = await facade.flow("processDefine/upAndDown", {"id": define_id2, "state": 0})
+    assert r["code"] == 0, r
+    r = await facade.flow("processDesign/redeploy", {"id": design_id, "operator": "zhangsan"})
+    assert r["code"] == 0, r
+    d_after = await repo.find_define_by_id(define_id2)
+    assert d_after.state == 0, f"designRedeploy 后 state 应保持停用 0, got {d_after.state}"
+    assert d_after.version == 5, f"designRedeploy 后 version 仍应保持 5, got {d_after.version}"
+
+
+@pytest.mark.asyncio
+async def test_define_redeploy_preserves_version_state():
+    """audit8 R5/spec 06：processDefine/redeploy 原地替换内容——version/state 不变"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    with open(os.path.join(FLOW_DIR, "01-simple.json"), encoding="utf-8") as f:
+        content = f.read()
+
+    # 部署（首次 version=0）→ 停用
+    r = await facade.flow("processDefine/deploy", {"content": content})
+    assert r["code"] == 0, r
+    define_id = int(r["data"]["processDefineId"])
+    r = await facade.flow("processDefine/upAndDown", {"id": define_id, "state": 0})
+    assert r["code"] == 0, r
+
+    # 原地替换内容 → version/state 原样保持
+    # （修复前：门面新建对象带默认 state=1/version=1，memory 腿整对象覆盖把停用态复活、版本打回 1）
+    r = await facade.flow("processDefine/redeploy", {"processDefineId": define_id,
+                                                     "content": content, "operator": "lisi"})
+    assert r["code"] == 0, r
+    d = await repo.find_define_by_id(define_id)
+    assert d.version == 0, f"redeploy 后 version 应保持 0, got {d.version}"
+    assert d.state == 0, f"redeploy 后 state 应保持停用 0, got {d.state}"
+    assert d.updateUser == "lisi", d.updateUser
+
+
+@pytest.mark.asyncio
+async def test_r5_update_define_sql_keeps_zero_state_version():
+    """audit8 R5：SQL 仓 update_define 不得把 state=0/version=0 兜底成 1（停用定义被复活、版本被打回）；
+    真 SQLite ＋ 真 JdbcRepository（对齐 _cc141_sql_repo 的先例）。"""
+    raw, repo = _cc141_sql_repo()
+    d = ProcessDefine(name="r5-sql", displayName="R5", type="test", state=1, version=1,
+                      content="{}", createUser="t", updateUser="t")
+    await repo.save_define(d)
+    await repo.update_define_state(d.id, 0)
+    loaded = await repo.find_define_by_id(d.id)
+    assert loaded.state == 0, loaded.state
+    loaded.displayName = "R5 v2"
+    await repo.update_define(loaded)
+    after = await repo.find_define_by_id(d.id)
+    assert after.state == 0, f"update_define 后停用态应保持 0, got {after.state}"
+
+    # version=0（save 的 INSERT 兜底让它存不进来，直改列造形状）→ 整对象回写后仍 0
+    raw.execute("UPDATE wf_process_define SET version=0 WHERE id=?", (d.id,))
+    loaded2 = await repo.find_define_by_id(d.id)
+    assert loaded2.version == 0, loaded2.version
+    loaded2.displayName = "R5 v3"
+    await repo.update_define(loaded2)
+    after2 = await repo.find_define_by_id(d.id)
+    assert after2.version == 0, f"update_define 后 version 应保持 0, got {after2.version}"
+
 
 @pytest.mark.asyncio
 async def test_form_data_contract():

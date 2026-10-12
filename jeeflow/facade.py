@@ -230,12 +230,14 @@ class JeeflowFacade:
     def __init__(self, engine: Engine, repo: ProcessRepository,
                  ext_repo: Optional[ProcessExtRepository] = None,
                  user_search: Optional[callable] = None,
-                 org_prov: Optional["OrgUserProvider"] = None):
+                 org_prov: Optional["OrgUserProvider"] = None,
+                 user_search_by_id: Optional[callable] = None):
         self._engine = engine
         self._repo = repo
         self._ext = ext_repo
         self._user_search = user_search  # 可空：candidatePage 用户分页搜索依赖
         self._org_prov = org_prov  # 可空：candidatePage candidateGroups 角色取人（v1.6.0）
+        self._user_search_by_id = user_search_by_id  # 可空：candidatePage 候选映射第一级（issues/178 R12）
         self._meta_reader = None  # 可空：bizData 业务数据读取器（issue 30，注入式）
         # issues/116 批次 D：委托代理自动生效是**引擎内置、默认开启**能力，数据源就是门面的扩展仓储。
         # 集成方只要给门面传了 ext_repo 即零配置生效（对齐内置版白拿体验）；未传则引擎侧静默跳过。
@@ -251,6 +253,11 @@ class JeeflowFacade:
     def set_user_search(self, fn: callable) -> "JeeflowFacade":
         """注入用户搜索钩子：fn(query: dict) -> (rows: list[dict], total: int)"""
         self._user_search = fn
+        return self
+
+    def set_user_search_by_id(self, fn: callable) -> "JeeflowFacade":
+        """注入候选映射第一级钩子（issues/178 R12）：fn(user_id: str) -> dict | None（可协程）"""
+        self._user_search_by_id = fn
         return self
 
     def set_org_provider(self, org_prov: "OrgUserProvider") -> "JeeflowFacade":
@@ -1248,6 +1255,29 @@ class JeeflowFacade:
                 rows.append({"label": t.displayName, "value": t.taskName})
         return rows
 
+    @staticmethod
+    def _candidate_row(actor_id: str, src: Optional[dict]) -> dict:
+        """candidatePage 候选行键归一（issues/178 R12；形状照 java :992-1012）：
+        id=src.id→src.userId→actor_id（一律字符串化）；realName=src.realName→id；
+        userId/userName/deptName 仅在 src 给出时透传。src 为 None＝两级都未命中 ⇒ 兜底 {actor, actor}。"""
+        if src is None:
+            src = {"userId": actor_id, "realName": actor_id}
+        rid = actor_id
+        if src.get("id") is not None:
+            rid = str(src.get("id"))
+        elif src.get("userId") is not None:
+            rid = str(src.get("userId"))
+        row = {"id": rid}
+        rn = src.get("realName")
+        row["realName"] = rn if rn is not None else rid
+        if src.get("userId") is not None:
+            row["userId"] = src.get("userId")
+        if src.get("userName") is not None:
+            row["userName"] = src.get("userName")
+        if src.get("deptName") is not None:
+            row["deptName"] = src.get("deptName")
+        return row
+
     async def _processTask_candidatePage(self, args: dict) -> dict:
         page_num = self._to_int(args.get("pageNum")) or 1
         page_size = self._to_int(args.get("pageSize")) or 10
@@ -1270,8 +1300,28 @@ class JeeflowFacade:
             except Exception:
                 pass
         if candidates:
-            # issues/80：行键对齐前端 UserSelect（valueField='id'）——补 id 键，保留 userId 兼容旧消费方
-            rows = [{"id": c, "userId": c, "realName": c} for c in candidates]
+            # issues/178 R12（spec 06:728 优先级链，形状照 java JeeflowFacade.java:945-1012）：
+            # 第一级 user_search_by_id（findById，可同步/异步）→ 第二级 engine.user_prov.get_user → 兜底；
+            # 修前恒兜底 {c,c,c}（provider 真名被丢，C99 ⑩ 派 3）。
+            rows = []
+            for c in candidates:
+                src = None
+                if self._user_search_by_id is not None:
+                    r = self._user_search_by_id(c)
+                    if inspect.isawaitable(r):
+                        r = await r
+                    if r:
+                        src = r
+                if src is None and self._engine.user_prov is not None:
+                    try:
+                        u = await self._engine.user_prov.get_user(c)
+                    except Exception:
+                        u = None
+                    if u is not None:
+                        src = {"userId": u.userId, "realName": u.realName}
+                        if u.deptName:
+                            src["deptName"] = u.deptName
+                rows.append(self._candidate_row(c, src))
             return self._page_data(rows, len(rows), page_num, page_size)
         # 无模型候选 → 用户分页搜索（依赖 user_search 钩子）
         if self._user_search is None:

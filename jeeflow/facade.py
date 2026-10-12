@@ -1287,14 +1287,24 @@ class JeeflowFacade:
         visited = set()
 
         async def collect(node: dict):
-            v = (node.get("properties") or {}).get("candidateUsers", "")
+            # issues/177 R11：顶层优先、`field` 子对象兜底（形状对齐 163 会签条件腿）
+            props = node.get("properties") or {}
+            field = props.get("field") if isinstance(props.get("field"), dict) else {}
+
+            def prop_str(key):
+                v = props.get(key, "")
+                if v:
+                    return v
+                return field.get(key, "")
+
+            v = prop_str("candidateUsers")
             if v:
                 for s in str(v).split(","):
                     s = s.strip()
                     if s and s not in result:
                         result.append(s)
             # candidateGroups：按角色取人（v1.6.0，对齐 boot4 GlobalCandidateHandler）
-            g = (node.get("properties") or {}).get("candidateGroups", "")
+            g = prop_str("candidateGroups")
             if g and self._org_prov is not None:
                 for rc in str(g).split(","):
                     rc = rc.strip()

@@ -378,7 +378,9 @@ class JeeflowFacade:
             start_next_op = flow_args.get(KEY_PROCESS_START_NEXT_NODE_OPERATOR)
             if start_next_op:
                 flow_args[KEY_NEXT_NODE_OPERATOR] = start_next_op
-            await self._engine.execute_process_task(task.id, operator, flow_args)
+            # issues/176：spec 04:60-62——apply 节点由 flow.auto 代执行（operator 列=flow.auto，
+            # 不进发起人已办）；u_* 注入由引擎跳过（对齐 boot2 ProcessInstanceServiceImpl:317 AUTO_ID）
+            await self._engine.execute_process_task(task.id, KEY_AUTO_ID, flow_args)
         return {"processInstanceId": inst.id}
 
     async def _processDefine_deploy(self, args: dict) -> dict:

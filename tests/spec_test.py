@@ -990,7 +990,10 @@ async def test_facade_empty_operator_is_same_as_absent_key():
     # 正向对照：user1 档非空，否则下面"三档相等"是 0==0 的自等假绿
     assert len(await _rows_of(facade, "processInstance/page", {"operator": "user1"})) == 1
     assert len(await _rows_of(facade, "processInstance/ccList", {"operator": "user1"})) == 1
-    assert len(await _rows_of(facade, "processTask/doneList", {"operator": "user1"})) >= 1
+    # issues/176：apply 行由 flow.auto 代执行（spec 04:60-62）⇒ 不进发起人已办（user1 档 0）；
+    # 留痕仍在 ⇒ 改锚 flow.auto 档证明"数据真的在"（两单各 1 行），否则 doneList 那格 0==0 是自等假绿
+    assert len(await _rows_of(facade, "processTask/doneList", {"operator": "user1"})) == 0
+    assert len(await _rows_of(facade, "processTask/doneList", {"operator": "flow.auto"})) == 2
     assert len(await _rows_of(facade, "processTask/todoList", {"operator": "leader"})) >= 1
 
     for action in ("processInstance/page", "processTask/todoList",
@@ -6766,7 +6769,9 @@ async def test_i141_g9_custom_clazz_handler_runs_and_return_lands_in_vars():
     r = await facade.flow("processInstance/startAndExecute",
                           {"processDefineId": define_id, "operator": "userB"})
     iid = int(r["data"]["processInstanceId"])
-    assert seen == [("custom1", "userB")], f"handler 应按 clazz 名解析并执行一次: {seen}"
+    # issues/176：apply 腿改由 flow.auto 代执行（spec 04:60-62）⇒ 同一次执行栈里跑的 custom
+    # 节点拿到的 operator 也随之为 flow.auto（boot2 :317 同形：AUTO 腿内一切执行主体=flow.auto）
+    assert seen == [("custom1", "flow.auto")], f"handler 应按 clazz 名解析并执行一次: {seen}"
     inst = await repo.find_instance_by_id(iid)
     # 夹具的 custom1 properties 里 "val": "customResult" ⇒ 返回值落 customResult
     assert inst.variables.get("customResult") == "customExecuted", \

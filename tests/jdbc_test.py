@@ -218,7 +218,9 @@ async def main():
               doing[0].actorIds == ["zhangsan"], str(doing[0].actorIds))
 
         # ── ③ 完成 apply（startAndExecute 语义）→ task1（leader）
-        inst = await eng.execute_process_task(doing[0].id, "zhangsan")
+        # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+        _new_tasks = await eng.execute_process_task(doing[0].id, "zhangsan")
+        inst = await repo.find_instance_by_id(doing[0].processInstanceId)
         done = await repo.find_done_tasks(inst.id)
         check("apply 已完成且处理人是发起人",
               len(done) == 1 and done[0].taskName == "apply" and done[0].actorId == "zhangsan",
@@ -230,7 +232,9 @@ async def main():
         check("task1 参与者为 leader", doing[0].actorIds == ["leader"], str(doing[0].actorIds))
 
         # ── ④ 完成 task1 → end → 实例完成
-        inst = await eng.execute_process_task(doing[0].id, "leader", {"comment": "ok"})
+        # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+        _new_tasks = await eng.execute_process_task(doing[0].id, "leader", {"comment": "ok"})
+        inst = await repo.find_instance_by_id(doing[0].processInstanceId)
         check("流程实例完成", inst.state == InstanceState.DONE, str(inst.state))
 
         # ── ⑤ 重新连接验证持久化（直查数据库）

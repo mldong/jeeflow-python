@@ -1,6 +1,7 @@
 """引擎核心——对标 Java EngineImpl"""
 import logging
 import inspect
+import contextvars
 import json, re, time, random
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
@@ -16,6 +17,26 @@ from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluat
 from .spi import normalize_actors
 from .default_evaluator import DefaultExpressionEvaluator
 from .extensions import EngineExtensions, EventType, ProcessEvent
+
+# audit8 R92（spec04 §完成任务）：执行族公开方法回传**本次动作产出的任务行**。
+# 基准＝java ``JeeflowEngineImpl`` 四法返回 ``exec.getProcessTaskList()``——那份清单只由
+# ``Execution.addTask/addTasks`` 喂（建单/会签/回退复活行；记录类节点的历史行走另一条通道、
+# 不进清单），``exec == null`` 时 ``Collections.emptyList()`` ⇒ 空档出 ``[]`` 而不是 ``None``。
+#
+# 为什么用 contextvars 而不是把 out 参数一路传下去：本栈的建单腿散在十余个私有方法里
+# （``_execute_process_task_impl`` 的串行推进支、``_rollback_to_parent``、``_create_task``、
+# ``_create_task_with_actors``…），逐个改签名比 go 那 12 处更碎；而 asyncio 每个 Task 持有自己的
+# context 拷贝 ⇒ 公开方法入口 ``set`` 一枚**每次调用新建的 list**、建单腿 ``get`` 后追加，
+# 并发办理互不串味（go 用 typed ctx 值、node 用 AsyncLocalStorage，同一件事的三种宿主形状）。
+_NEW_TASKS: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar("jeeflow_new_tasks", default=None)
+
+
+def _append_new_task(task: ProcessTask) -> None:
+    """建单腿落库成功后的登记口；作用域外（直连私有方法的测试）静默不记。"""
+    sink = _NEW_TASKS.get()
+    if sink is not None:
+        sink.append(task)
+
 
 # 无状态 ⇒ 模块级单件（rust 侧同形：静态 ``DefaultExpressionEvaluator``）
 _DEFAULT_EXPRESSION_EVALUATOR = DefaultExpressionEvaluator()
@@ -94,10 +115,10 @@ class Engine:
     """引擎接口"""
 
     async def start_process_instance_by_id(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
-    async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
-    async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
-    async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None, target_task_name: str = None) -> ProcessInstance: ...
-    async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
+    async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]: ...
+    async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]: ...
+    async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None, target_task_name: str = None) -> list[ProcessTask]: ...
+    async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]: ...
     async def handle_cc_actors(self, instance_id: int, operator: str, cc_actors: Any) -> list[str]:
         """抄送唯一漏斗（spec §11.7）：门面手动 ``createCCInstance`` 与引擎发起/办理两条腿共用；
         自定义引擎实现若不提供，手动抄送腿就只剩"写行不 fire"，属 §11.2 原则 1 的缺支。
@@ -334,9 +355,16 @@ class EngineImpl(Engine):
 
     # ─── Execute ──────────────────────────────────────────────────────────────
 
-    async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+    async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]:
         # audit8 R9 145-3：入口事务包裹（与 start 同口径）
-        return await self._in_tx(lambda: self._execute_process_task_impl(task_id, operator, args))
+        # audit8 R92（spec04）：回传本次动作产出的任务行（作用域见文件头 _NEW_TASKS 注释）
+        created: list[ProcessTask] = []
+        token = _NEW_TASKS.set(created)
+        try:
+            await self._in_tx(lambda: self._execute_process_task_impl(task_id, operator, args))
+        finally:
+            _NEW_TASKS.reset(token)
+        return created
 
     async def _execute_process_task_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         # issues/127 / spec §11.7 办理时抄送（tf_ccActors）：**覆盖面只有本条腿**——钩子挂在这里，
@@ -396,6 +424,7 @@ class EngineImpl(Engine):
                         _apply_expire_time(nt, (cur_node.properties or {}).get("expireTime"), inst.variables)
                         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
                         await self.repo.save_task(nt)
+                        _append_new_task(nt)
                         # PROCESS_TASK_START（码 3）：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
                         await self._fire_task_start(inst, nt, cur_node.id, operator)
                         return await self.repo.find_instance_by_id(inst.id)
@@ -448,9 +477,16 @@ class EngineImpl(Engine):
 
     # ─── Reject ───────────────────────────────────────────────────────────────
 
-    async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+    async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]:
         # audit8 R9 145-3：入口事务包裹（与 start 同口径）
-        return await self._in_tx(lambda: self._execute_and_jump_to_end_impl(task_id, operator, args))
+        # audit8 R92（spec04）：回传本次动作产出的任务行（作用域见文件头 _NEW_TASKS 注释）
+        created: list[ProcessTask] = []
+        token = _NEW_TASKS.set(created)
+        try:
+            await self._in_tx(lambda: self._execute_and_jump_to_end_impl(task_id, operator, args))
+        finally:
+            _NEW_TASKS.reset(token)
+        return created
 
     async def _execute_and_jump_to_end_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         # 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
@@ -469,9 +505,16 @@ class EngineImpl(Engine):
     # ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）──
 
     async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None,
-                                     target_task_name: str = None) -> ProcessInstance:
+                                     target_task_name: str = None) -> list[ProcessTask]:
         # audit8 R9 145-3：入口事务包裹（与 start 同口径）
-        return await self._in_tx(lambda: self._execute_and_jump_task_impl(task_id, operator, args, target_task_name))
+        # audit8 R92（spec04）：回传本次动作产出的任务行（作用域见文件头 _NEW_TASKS 注释）
+        created: list[ProcessTask] = []
+        token = _NEW_TASKS.set(created)
+        try:
+            await self._in_tx(lambda: self._execute_and_jump_task_impl(task_id, operator, args, target_task_name))
+        finally:
+            _NEW_TASKS.reset(token)
+        return created
 
     async def _execute_and_jump_task_impl(self, task_id: int, operator: str, args: dict[str, Any] = None,
                                           target_task_name: str = None) -> ProcessInstance:
@@ -500,9 +543,16 @@ class EngineImpl(Engine):
     # ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）───────
 
     async def execute_and_jump_to_first_task_node(self, task_id: int, operator: str,
-                                                   args: dict[str, Any] = None) -> ProcessInstance:
+                                                   args: dict[str, Any] = None) -> list[ProcessTask]:
         # audit8 R9 145-3：入口事务包裹（与 start 同口径）
-        return await self._in_tx(lambda: self._execute_and_jump_to_first_task_node_impl(task_id, operator, args))
+        # audit8 R92（spec04）：回传本次动作产出的任务行（作用域见文件头 _NEW_TASKS 注释）
+        created: list[ProcessTask] = []
+        token = _NEW_TASKS.set(created)
+        try:
+            await self._in_tx(lambda: self._execute_and_jump_to_first_task_node_impl(task_id, operator, args))
+        finally:
+            _NEW_TASKS.reset(token)
+        return created
 
     async def _execute_and_jump_to_first_task_node_impl(self, task_id: int, operator: str,
                                                         args: dict[str, Any] = None) -> ProcessInstance:
@@ -629,6 +679,7 @@ class EngineImpl(Engine):
                            nt.variables)
         await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
         await self.repo.save_task(nt)
+        _append_new_task(nt)
         await self._fire_task_start(inst, nt, prev.id, operator)
         return nt
 
@@ -702,18 +753,21 @@ class EngineImpl(Engine):
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
+                    _append_new_task(nt)
                     await self._fire_task_start(inst, nt, node.id, operator)
             elif ct == "SEQUENTIAL":
                 nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
                 nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
+                _append_new_task(nt)
                 await self._fire_task_start(inst, nt, node.id, operator)
             else:
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
+                    _append_new_task(nt)
                     await self._fire_task_start(inst, nt, node.id, operator)
         else:
             nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
@@ -721,6 +775,7 @@ class EngineImpl(Engine):
                 nt.actorIds = actors
             await self._apply_surrogate(nt, process_name)
             await self.repo.save_task(nt)
+            _append_new_task(nt)
             await self._fire_task_start(inst, nt, node.id, operator)
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
@@ -873,6 +928,7 @@ class EngineImpl(Engine):
                     _apply_expire_time(nt, expire_expr, inst.variables)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
+                    _append_new_task(nt)
                     # PROCESS_TASK_START（码 3）：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
                     await self._fire_task_start(inst, nt, node.id, operator)
             elif ct == "SEQUENTIAL":
@@ -888,6 +944,7 @@ class EngineImpl(Engine):
                 nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
                 await self._apply_surrogate(nt, process_name)
                 await self.repo.save_task(nt)
+                _append_new_task(nt)
                 await self._fire_task_start(inst, nt, node.id, operator)
             else:
                 # 同 PARALLEL 档：零参与者也要落一行，不吃空列表
@@ -897,6 +954,7 @@ class EngineImpl(Engine):
                     _apply_expire_time(nt, expire_expr, inst.variables)
                     await self._apply_surrogate(nt, process_name)
                     await self.repo.save_task(nt)
+                    _append_new_task(nt)
                     await self._fire_task_start(inst, nt, node.id, operator)
         else:
             # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
@@ -909,6 +967,7 @@ class EngineImpl(Engine):
                 nt.actorIds = actors
             await self._apply_surrogate(nt, process_name)
             await self.repo.save_task(nt)
+            _append_new_task(nt)
             await self._fire_task_start(inst, nt, node.id, operator)
 
     async def _exec_custom_node(self, flow: FlowModel, inst: ProcessInstance, node: FlowNode,

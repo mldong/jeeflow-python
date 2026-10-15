@@ -78,7 +78,9 @@ async def main():
     check("生成 1 个待办", len(doing) == 1 and doing[0].taskName == "task1",
           f"task={doing[0].taskName}")
     await repo.add_task_actor(doing[0].id, ["leader"])
-    inst = await eng.execute_process_task(doing[0].id, "leader")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "leader")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     check("完成后流程结束", inst.state == InstanceState.DONE, f"state={inst.state}")
     print()
 
@@ -100,7 +102,9 @@ async def main():
     doing = await repo.find_doing_tasks(inst.id)
     check("第3步 task3", len(doing) == 1 and doing[0].taskName == "task3")
     await repo.add_task_actor(doing[0].id, ["userC"])
-    inst = await eng.execute_process_task(doing[0].id, "userC")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "userC")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     check("完成", inst.state == InstanceState.DONE, f"state={inst.state}")
     print()
 
@@ -112,7 +116,9 @@ async def main():
     doing = await repo.find_doing_tasks(inst97.id)
     await repo.add_task_actor(doing[0].id, ["bob"])
     done_task_id = doing[0].id
-    inst97 = await eng.execute_process_task(done_task_id, "bob")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(done_task_id, "bob")
+    inst97 = await repo.find_instance_by_id(inst97.id)
     # 核心：实例 u_realName 不被操作人 bob 覆盖
     check("execute 后实例 u_realName 仍=alice", inst97.variables.get("u_realName") == "alice",
           f"got={inst97.variables.get('u_realName')}")
@@ -128,7 +134,9 @@ async def main():
     # 深层节点再办一次（userB 办 task2），实例 u_realName 仍为 alice
     doing = await repo.find_doing_tasks(inst97.id)
     await repo.add_task_actor(doing[0].id, ["userB"])
-    inst97 = await eng.execute_process_task(doing[0].id, "userB")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "userB")
+    inst97 = await repo.find_instance_by_id(doing[0].processInstanceId)
     check("深层节点后实例 u_realName 仍=alice", inst97.variables.get("u_realName") == "alice",
           f"got={inst97.variables.get('u_realName')}")
     print()
@@ -144,7 +152,9 @@ async def main():
     check("金额>1000 → task2", doing[0].taskName == "task2",
           f"got {doing[0].taskName}")
     await repo.add_task_actor(doing[0].id, ["manager"])
-    inst = await eng.execute_process_task(doing[0].id, "manager")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "manager")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     check("完成", inst.state == InstanceState.DONE)
     print()
 
@@ -159,7 +169,9 @@ async def main():
     check("金额≤1000 → task3", doing[0].taskName == "task3",
           f"got {doing[0].taskName}")
     await repo.add_task_actor(doing[0].id, ["director"])
-    inst = await eng.execute_process_task(doing[0].id, "director")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "director")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     check("完成", inst.state == InstanceState.DONE)
     print()
 
@@ -175,7 +187,9 @@ async def main():
     inst2 = await repo.find_instance_by_id(inst.id)
     check("完成 A 后仍在进行", inst2.state == InstanceState.DOING)
     await repo.add_task_actor(tB.id, ["userB"])
-    inst = await eng.execute_process_task(tB.id, "userB")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(tB.id, "userB")
+    inst = await repo.find_instance_by_id(tB.processInstanceId)
     check("完成 B 后流程结束", inst.state == InstanceState.DONE)
     print()
 
@@ -202,7 +216,9 @@ async def main():
     doing = await repo.find_doing_tasks(inst.id)
     check("下一步串行任务", len(doing) == 1)
     await repo.add_task_actor(doing[0].id, ["userB"])
-    inst = await eng.execute_process_task(doing[0].id, "userB")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "userB")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     check("完成后流程结束", inst.state == InstanceState.DONE)
     print()
 
@@ -212,7 +228,9 @@ async def main():
     doing = await repo.find_doing_tasks(inst.id)
     check("启动", len(doing) == 1)
     await repo.add_task_actor(doing[0].id, ["applicant"])
-    inst = await eng.execute_and_jump_to_end(doing[0].id, "applicant")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_and_jump_to_end(doing[0].id, "applicant")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     check("状态=REJECT", inst.state == InstanceState.REJECT, f"state={inst.state}")
     check("所有待办已废弃", len(await repo.find_doing_tasks(inst.id)) == 0)
     print()
@@ -370,7 +388,9 @@ async def main():
           and sorted(doing16[0].actorIds) == ["roleA", "roleB"],
           f"actors={[t.actorIds for t in doing16]}")
     await repo.add_task_actor(doing16[0].id, doing16[0].actorIds)
-    inst16 = await eng16.execute_process_task(doing16[0].id, "roleA")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng16.execute_process_task(doing16[0].id, "roleA")
+    inst16 = await repo.find_instance_by_id(doing16[0].processInstanceId)
     check("⑤ 流程结束", inst16.state == InstanceState.DONE, f"state={inst16.state}")
     print()
 

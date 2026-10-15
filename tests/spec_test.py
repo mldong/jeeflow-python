@@ -97,7 +97,9 @@ async def test_01_simple_flow():
     assert len(doing) == 1 and doing[0].taskName == "task1"
 
     await repo.add_task_actor(doing[0].id, ["leader"])
-    inst = await eng.execute_process_task(doing[0].id, "leader")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "leader")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     assert inst.state == InstanceState.DONE
 
 
@@ -122,7 +124,9 @@ async def test_02_multi_task():
     assert len(doing) == 1 and doing[0].taskName == "task3"
 
     await repo.add_task_actor(doing[0].id, ["boss"])
-    inst = await eng.execute_process_task(doing[0].id, "boss")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "boss")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     assert inst.state == InstanceState.DONE
 
 
@@ -140,7 +144,9 @@ async def test_03_decision_expr():
     doing = await repo.find_doing_tasks(inst.id)
     assert len(doing) == 1 and doing[0].taskName == "task2"  # 金额>1000 → 经理审批
     await repo.add_task_actor(doing[0].id, ["manager"])
-    inst = await eng.execute_process_task(doing[0].id, "manager")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "manager")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     assert inst.state == InstanceState.DONE
 
 
@@ -162,7 +168,9 @@ async def test_04_fork_join():
     assert inst.state == InstanceState.DOING
 
     await repo.add_task_actor(tB.id, ["userB"])
-    inst = await eng.execute_process_task(tB.id, "userB")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(tB.id, "userB")
+    inst = await repo.find_instance_by_id(tB.processInstanceId)
     assert inst.state == InstanceState.DONE
 
 
@@ -204,7 +212,9 @@ async def test_06_countersign_sequential():
     task = doing[0]
 
     await repo.add_task_actor(task.id, ["userB"])
-    inst = await eng.execute_process_task(task.id, "userB")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(task.id, "userB")
+    inst = await repo.find_instance_by_id(task.processInstanceId)
     assert inst.state == InstanceState.DONE
 
 
@@ -247,7 +257,9 @@ async def test_08_reject():
 
     # leader 驳回，跳回 apply
     await repo.add_task_actor(doing[0].id, ["leader"])
-    inst = await eng.execute_and_jump_task(doing[0].id, "leader", target_task_name="apply")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_and_jump_task(doing[0].id, "leader", target_task_name="apply")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     # 应有新的 apply 待办给 applicant
     doing = await repo.find_doing_tasks(inst.id)
     assert len(doing) == 1 and doing[0].taskName == "apply"
@@ -383,7 +395,9 @@ async def test_system_execute_flow_auto():
     doing = await repo.find_doing_tasks(inst.id)
 
     # ① flow.auto 非参与者身份放行（startAndExecute 契约）
-    inst = await eng.execute_process_task(doing[0].id, "flow.auto")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "flow.auto")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     doing = await repo.find_doing_tasks(inst.id)
     assert doing[0].taskName == "task1", f"flow.auto 应放行执行: {doing[0].taskName}"
 
@@ -392,7 +406,9 @@ async def test_system_execute_flow_auto():
     assert reloaded.variables.get("u_userId") == "applicant", f"flow.auto 应跳过用户注入: {reloaded.variables.get('u_userId')}"
 
     # ③ flow.admin 放行
-    inst = await eng.execute_process_task(doing[0].id, "flow.admin")
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing[0].id, "flow.admin")
+    inst = await repo.find_instance_by_id(doing[0].processInstanceId)
     doing = await repo.find_doing_tasks(inst.id)
     assert doing[0].taskName == "task2", f"flow.admin 应放行执行: {doing[0].taskName}"
 
@@ -7023,7 +7039,9 @@ async def test_i142_hr1_zero_actor_row_blocks_join_without_reentry():
     rows_before, starts_before = len(repo._tasks), sum(
         1 for e in events if e.type is EventType.PROCESS_TASK_START)
 
-    inst2 = await eng.execute_process_task(doing["tok"].id, "leader", {"submitType": 1})
+    # R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    _new_tasks = await eng.execute_process_task(doing["tok"].id, "leader", {"submitType": 1})
+    inst2 = await repo.find_instance_by_id(doing["tok"].processInstanceId)
     left = await repo.find_doing_tasks(inst2.id)
     assert [t.taskName for t in left] == ["tempty"], f"有人那条办完后只剩零参与者那条卡着: {left}"
     all_rows = await repo.find_history_tasks(inst2.id)

@@ -560,20 +560,22 @@ class JeeflowFacade:
         flow_args = {k: v for k, v in args.items() if k not in ("processTaskId", "operator")}
         flow_args["submitType"] = submit_type
         # boot3 execute 分发（spec §11.2）
+        # audit8 R92：执行族四法现回传「本次动作产出的任务行」，而本动作一直不用返回值
+        # （下面直接 ``return None``）⇒ 去掉 `inst =` 这条名不副实的绑定，HTTP 出口形状不动。
         if submit_type == SUBMIT_REJECT:
-            inst = await self._engine.execute_and_jump_to_end(task_id, operator, flow_args)
+            await self._engine.execute_and_jump_to_end(task_id, operator, flow_args)
         elif submit_type == SUBMIT_ROLLBACK:
-            inst = await self._engine.execute_and_jump_task(task_id, operator, flow_args)
+            await self._engine.execute_and_jump_task(task_id, operator, flow_args)
         elif submit_type == SUBMIT_JUMP:
-            inst = await self._engine.execute_and_jump_task(task_id, operator, flow_args,
-                                                             str(args.get("taskName", "")))
+            await self._engine.execute_and_jump_task(task_id, operator, flow_args,
+                                                     str(args.get("taskName", "")))
         elif submit_type == SUBMIT_ROLLBACK_TO_OPERATOR:
-            inst = await self._engine.execute_and_jump_to_first_task_node(task_id, operator, flow_args)
+            await self._engine.execute_and_jump_to_first_task_node(task_id, operator, flow_args)
         elif submit_type == SUBMIT_COUNTERSIGN_DISAGREE:
             flow_args["countersignDisagreeFlag"] = 1
-            inst = await self._engine.execute_process_task(task_id, operator, flow_args)
+            await self._engine.execute_process_task(task_id, operator, flow_args)
         else:  # 0 APPLY / 1 AGREE / 5 重新提交
-            inst = await self._engine.execute_process_task(task_id, operator, flow_args)
+            await self._engine.execute_process_task(task_id, operator, flow_args)
         # issues/127 办理时抄送（tf_ccActors）**不在这里**——键随 flow_args 进引擎，由
         # engine.handle_cc_actors 在任务更新（update_task）的同一次调用栈里落 cc 行、
         # 落库后逐人 fire CC_CREATE(4)（spec §11.7）。

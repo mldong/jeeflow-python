@@ -7970,3 +7970,28 @@ async def test_i137a_column_lands_in_the_sql_repository():
     assert col2[0] is None, f"定义没配顶层 expireTime 时列必须 NULL，实得 {col2[0]!r}"
     assert back2.expireTime is None, f"仓储读回同判 NULL，实得 {back2.expireTime!r}"
     assert col2[1] is not None, "对照列 create_time 应有值（整行确实落了库）"
+
+
+# ─── issues/232 R64 拍 A: autoGenTitle 钉秒 ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_auto_gen_title_seconds_232():
+    """autoGenTitle 钉秒 `yyyy-MM-dd HH:mm:ss`（Python 半边）。
+
+    变异＝格式串回退 `%H:%M`（分钟档）时两条判据复红；
+    回归腿＝expire_time 解析格见 i137a 系列（本判据不动该腿）。
+    """
+    eng, repo = setup()
+    df = load_flow(repo, "01-simple.json")
+    inst = await _start_and_execute(eng, repo, df.id, "applicant")
+    title = inst.variables[KEY_AUTO_GEN_TITLE]
+    assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", title), \
+        f"标题应以秒级时间戳结尾（钉秒）: {title!r}"
+    assert not re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", title), \
+        f"标题不得停在分钟粒度（改前形状）: {title!r}"
+    assert title.startswith("用户applicant的01-simple.json-"), \
+        f"标题前缀形状 {real_name_prefix()} 应保持: {title!r}"
+
+
+def real_name_prefix():
+    return "{realName}的{displayName}-"

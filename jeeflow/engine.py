@@ -1069,9 +1069,9 @@ class EngineImpl(Engine):
         if u.postName: vars_[KEY_POST_NAME] = u.postName
 
     def _add_auto_gen_title(self, display_name: str, vars_: dict):
-        """issue 29：自动生成标题（对齐 boot3 FlowUtil.addAutoGenTitle）"""
+        """issue 29：自动生成标题；issues/232 R64 拍 A 钉秒 yyyy-MM-dd HH:mm:ss（标题专用格式化点，勿并 expire_time 腿）"""
         real_name = vars_.get(KEY_REAL_NAME, "")
-        title = f"{real_name}的{display_name}-{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        title = f"{real_name}的{display_name}-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         vars_[KEY_AUTO_GEN_TITLE] = title
 
     def _next_id(self) -> int:

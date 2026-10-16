@@ -135,7 +135,8 @@ class EngineImpl(Engine):
         self.id_gen = id_gen
         self.expr_eval = expr_eval
         self.ext: Optional[EngineExtensions] = None
-        self._ic_cache: dict = {}   # 定义级拦截器解析缓存（issue 34，按 defineId）
+        self._ic_cache: dict = {}   # 拦截器解析缓存（issue 34 ＋ audit8 R91，键＝defineId|节点|档位）
+        self._ic_root_cache: dict = {}   # 流程根 pre/post 声明缓存（每 defineId 只回查一行定义）
         # 定义行 name 缓存（spec 06 §4.5 条款 1.1 回落路径，按 defineId）——
         # 委托查询的流程名解析全栈唯一入口是 _surrogate_process_name，缓存只是它的取数底座
         self._define_name_cache: dict = {}
@@ -146,6 +147,7 @@ class EngineImpl(Engine):
             ext.ext_repository = self.ext.ext_repository
         self.ext = ext
         self._ic_cache.clear()
+        self._ic_root_cache.clear()
 
     def attach_ext_repository(self, ext_repo) -> "EngineImpl":
         """接入扩展仓储（委托自动生效的查询数据源，issues/116 批次 D）
@@ -1141,50 +1143,71 @@ class EngineImpl(Engine):
 
     async def _fire_pre(self, node, inst) -> bool:
         if not self.ext: return True
-        for ic in sorted(await self._resolve_interceptors(inst), key=lambda x: x.order):
+        for ic in sorted(await self._resolve_interceptors(node, inst, "pre"), key=lambda x: x.order):
             if not await ic.pre_handle(node, inst): return False
         return True
 
     async def _fire_post(self, node, inst):
         if not self.ext: return
-        for ic in sorted(await self._resolve_interceptors(inst), key=lambda x: x.order, reverse=True):
+        for ic in sorted(await self._resolve_interceptors(node, inst, "post"), key=lambda x: x.order, reverse=True):
             await ic.post_handle(node, inst)
 
-    async def _resolve_interceptors(self, inst) -> list:
-        """定义级拦截器解析（issue 34，对齐 Java 模型级 postInterceptors）：
-        流程定义顶层 postInterceptors 声明 → 按名从 interceptor_registry 取（未声明该流程不触发）；
-        未声明 → 回落引擎级列表（向后兼容现状）。结果按 defineId 缓存。
+    async def _resolve_interceptors(self, node, inst, phase: str) -> list:
+        """定义级／节点级拦截器解析（issue 34 ＋ audit8 R91，对齐 java ``NodeModel.java:49-59``）：
+        档位＝pre／post 两档各自独立取串——节点 properties 声明优先，串空才回落流程根同名键，
+        **两档不叠加**（spec02 §3「节点级拦截器的优先序、回落与键形」）；两档都没声明才回落引擎级
+        列表（向后兼容）。解析键＝注册名（键形按丙＝注册表里沿用 java 全类名串，本栈不另发明短名）。
+        缓存键含 defineId＋节点＋档位（issues/234 §4.2：按 defineId 单键会把两个节点的声明串档）。
         issues/60：解析与校验分离——定义读取/JSON 解析失败回落引擎级（现状语义），
-        声明中存在未注册名时抛 ValueError（不静默跳过），且错误不写缓存保证持续报错。"""
+        声明中存在未注册名时抛 ValueError（不静默跳过，带档位与节点 id），且错误不写缓存保证持续报错。"""
         if not self.ext:
             return []
         define_id = getattr(inst, "defineId", None)
         if define_id is None:
             return list(self.ext.interceptors)
-        cached = self._ic_cache.get(define_id)
+        prop = f"{phase}Interceptors"
+        cache_key = f"{define_id}|{getattr(node, 'id', '')}|{phase}"
+        cached = self._ic_cache.get(cache_key)
         if cached is not None:
             return cached
-        ic_list = list(self.ext.interceptors)
-        declared = None
+        declared = str((getattr(node, "properties", None) or {}).get(prop) or "").strip()
+        if not declared:
+            ic_list = list(self.ext.interceptors)
+            declared = (await self._root_interceptor_decl(define_id))[phase]
+            if not declared:
+                self._ic_cache[cache_key] = ic_list
+                return ic_list
+        ic_list = []
+        for name in declared.split(","):
+            name = name.strip()
+            if not name:
+                continue
+            if name not in (self.ext.interceptor_registry or {}):
+                raise ValueError(f"{prop} 声明的拦截器未注册: {name}（nodeId={getattr(node, 'id', '')}）")
+            ic_list.append(self.ext.interceptor_registry[name])
+        self._ic_cache[cache_key] = ic_list
+        return ic_list
+
+    async def _root_interceptor_decl(self, define_id) -> dict:
+        """流程根 pre/post 声明**每一定义只读一行**（audit8 R91：节点档按 defineId|节点|档位缓存后，
+        若每个节点都去回查定义行，就把 issue 34 的"读一次"放大成逐任务读——``spec_test`` 的
+        ``test_surrogate_define_name_fallback_reads_define_once_not_per_task`` 钉的正是这个次数）。
+        读取/JSON 解析失败按现状语义视作"根级未声明"，同样缓存。"""
+        cached = self._ic_root_cache.get(define_id)
+        if cached is not None:
+            return cached
+        decl = {"pre": "", "post": ""}
         try:
             def_ = await self.repo.find_define_by_id(define_id)
             if def_ is not None:
                 content = def_.content
                 meta = json.loads(content) if isinstance(content, str) else json.loads(content.decode("utf-8"))
-                declared = str(meta.get("postInterceptors") or "").strip()
+                decl = {"pre": str(meta.get("preInterceptors") or "").strip(),
+                        "post": str(meta.get("postInterceptors") or "").strip()}
         except Exception:
             pass
-        if declared:
-            ic_list = []
-            for name in declared.split(","):
-                name = name.strip()
-                if not name:
-                    continue
-                if name not in (self.ext.interceptor_registry or {}):
-                    raise ValueError(f"postInterceptors 声明的拦截器未注册: {name}")
-                ic_list.append(self.ext.interceptor_registry[name])
-        self._ic_cache[define_id] = ic_list
-        return ic_list
+        self._ic_root_cache[define_id] = decl
+        return decl
 
     async def fire_event(self, evt: ProcessEvent):
         """公开事件发布入口（issues/102）：门面层的**转办/撤回**等非引擎执行链内的事实经此 fire。

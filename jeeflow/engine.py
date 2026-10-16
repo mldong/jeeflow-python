@@ -1209,6 +1209,19 @@ class EngineImpl(Engine):
         self._ic_root_cache[define_id] = decl
         return decl
 
+    async def run_after_commit(self, fn) -> None:
+        """提交后腿通道（audit8 R77 读法一，issues/234 §4.3／spec12 §12.3.1）：监听器/集成层把
+        "必须看到已提交世界"的那一腿（反查、外发通知、二次写）交到这里声明 ⇒ COMMIT 之后执行、
+        回滚整批丢弃（登记表在 ``repository.base`` 的 ``with_tx`` 最外层上）。
+        没有活动事务、或仓储没提供 ``after_commit`` ⇒ 立即执行，行为与上一版逐字一致。
+        ⚠ 引擎自身的 fire 不经过这里：派发点与"监听器随事件拿到动作事务连接"由 145-3 钉住。"""
+        after = getattr(self.repo, "after_commit", None)
+        if after is not None and after(fn):
+            return
+        r = fn()
+        if hasattr(r, "__await__"):
+            await r
+
     async def fire_event(self, evt: ProcessEvent):
         """公开事件发布入口（issues/102）：门面层的**转办/撤回**等非引擎执行链内的事实经此 fire。
         ⚠️ 抄送（CC_CREATE）**不走这里**——已由引擎侧 ``handle_cc_actors`` 漏斗在 cc 行落库后

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import inspect
 import json
 import re
 import time
@@ -38,6 +39,38 @@ def current_tx_conn():
     回落自身自 commit 连接＝§12.1 条 4 显式降级运行态。
     """
     return _tx_conn_var.get()
+
+
+class _AfterCommitScope:
+    """提交后腿登记表（audit8 R77 读法一，spec12 §12.3.1／issues/234 §4.3）。
+
+    与连接绑定分离（``_tx_conn_var`` 的既有语义一行没动）：最外层 ``with_tx`` 建一张表，
+    嵌套调用经 contextvars 归到同一张；``fire()`` 必须在事务上下文**解绑之后**调用，
+    否则登记腿的反查会踩在已 COMMIT 的连接上。单条回调自家异常只打印、不打断主流程。
+    """
+
+    __slots__ = ("cbs", "done")
+
+    def __init__(self):
+        self.cbs: list = []
+        self.done = False
+
+    def discard(self):
+        self.done = True
+        self.cbs = []
+
+    async def fire(self):
+        cbs, self.cbs = self.cbs, []
+        for cb in cbs:
+            try:
+                r = cb()
+                if inspect.isawaitable(r):
+                    await r
+            except Exception as e:
+                print(f"[jeeflow] afterCommit 回调失败: {e}")
+
+
+_after_commit_var: contextvars.ContextVar = contextvars.ContextVar("jeeflow_after_commit", default=None)
 
 
 class TsIDGenerator(IDGenerator):
@@ -226,25 +259,46 @@ class JdbcRepository(ProcessRepository):
 
         audit8 R9 145-3：**join 支**——contextvars 已绑定活动事务时直接并入最外层
         （不双开连接、不提前提交，提交/回滚归最外层 owner；spec/12 §12.2 归属面）。
+
+        audit8 R77 读法一（spec12 §12.3.1）：最外层另挂一张**提交后腿登记表**（与连接绑定分离，
+        既有 ``_tx_conn_var`` 语义一行没动）——嵌套调用经 contextvars 归到同一张表；
+        COMMIT 之后逐条执行（跑在已解绑事务连接的上下文里），回滚则整批丢弃。
         """
         if _tx_conn_var.get() is not None:
             return await fn()
         conn = await self._adapter.acquire()
+        scope = _AfterCommitScope()
+        committed = False
+        token = _tx_conn_var.set(conn)
+        ac_token = _after_commit_var.set(scope)
         try:
             await conn.begin()
-            token = _tx_conn_var.set(conn)
             try:
                 result = await fn()
             except BaseException:
                 await conn.rollback()
+                scope.discard()  # R77：回滚 ⇒ 提交后腿整批丢弃（监听器不得看到未提交的世界）
                 raise
-            else:
-                await conn.commit()
-                return result
-            finally:
-                _tx_conn_var.reset(token)
+            await conn.commit()
+            committed = True
+            scope.done = True
         finally:
+            _after_commit_var.reset(ac_token)
+            _tx_conn_var.reset(token)
             await self._adapter.release(conn)
+        if committed:
+            await scope.fire()
+        return result
+
+    def after_commit(self, fn) -> bool:
+        """登记「本次事务提交之后」执行的回调（audit8 R77 读法一；java 形状＝监听器侧自取
+        afterCommit，php R25 已收口同形）。返回 False＝当前无活动事务 ⇒ 调用方须自行立即执行
+        （门面级没外包事务模板的栈，「落库后」与「提交后」等价）。"""
+        scope = _after_commit_var.get()
+        if scope is None or scope.done:
+            return False
+        scope.cbs.append(fn)
+        return True
 
     @contextlib.asynccontextmanager
     async def _conn(self):

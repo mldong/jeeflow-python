@@ -91,7 +91,7 @@ repo = JdbcRepository(MySqlAdapter(pool))  # 关系表主键用内置时间戳 I
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
 
-**事务（spec §7.4）**：`with_tx` 用 `contextvars.ContextVar` 把事务连接绑定到当前协程上下文，回调内所有仓储调用走同一连接；异常自动回滚：
+**事务（规范 05「事务约定」节）**：`with_tx` 用 `contextvars.ContextVar` 把事务连接绑定到当前协程上下文，回调内所有仓储调用走同一连接；异常自动回滚：
 
 ```python
 async def do_biz():
@@ -101,7 +101,7 @@ async def do_biz():
 await repo.with_tx(do_biz)
 ```
 
-> 约定：**业务层是事务 owner**——先 `with_tx` 再调引擎方法，引擎核心不感知事务。
+> 约定：**业务层是事务 owner**——先 `with_tx` 再调引擎方法，引擎对事务是「可选参与」而非「不感知」（权威＝规范 05 事务约定第 1 条／规范 12 §12.1 原则 3）。
 
 > **`page_cc_instances` 的归属条件必填**（issues/141 G1 · [规范 06](../../spec/06-facade) §2.5）：
 > "抄送我"这类取数入口必须带归属列 `cc.actor_id` 的**有效**条件——本栈有两形（Java 只有一形）：

@@ -4,7 +4,7 @@
 - 本文件是**唯一维护点**：15 个仓储方法的 SQL 逻辑、行映射、ID 生成
 - SQL 占位符统一使用 `?`，由各数据库适配器（`SqlAdapter`）转换为自家风格
   （MySQL `%s` / PostgreSQL `$n` / 原生 `?`）
-- 事务（spec §7.4）：`with_tx` 用 `contextvars.ContextVar` 绑定当前协程上下文的事务连接
+- 事务（规范 05「事务约定」节）：`with_tx` 用 `contextvars.ContextVar` 绑定当前协程上下文的事务连接
 
 新增数据库 = 写一个适配器（约 80 行）：实现 `SqlAdapter` + 连接包装（execute/fetchone/
 fetchall/begin/commit/rollback）。参考 `mysql.py` / `postgres.py`。
@@ -252,7 +252,7 @@ class JdbcRepository(ProcessRepository):
     def _sql(self, sql: str) -> str:
         return convert_placeholder(sql, self._adapter.placeholder)
 
-    # ── 事务（spec §7.4：contextvars 绑定连接）────────────────────────────
+    # ── 事务（规范 05「事务约定」节：contextvars 绑定连接）────────────────────────────
 
     async def with_tx(self, fn):
         """开启事务，回调内仓储调用走同一连接；异常回滚，成功提交。
@@ -439,7 +439,7 @@ class JdbcRepository(ProcessRepository):
                 (int(inst.state), inst.parentNodeName, inst.businessNo, inst.operator,
                  inst.expireTime, json.dumps(inst.variables, ensure_ascii=False),
                  inst.updateTime, inst.updateUser, inst.id))
-            # v1.0.1：级联持久化聚合根内任务状态变更（同连接，spec §7.4）
+            # v1.0.1：级联持久化聚合根内任务状态变更（同连接，规范 05「事务约定」节）
             for task in inst.tasks:
                 if task.id:
                     await self._update_task_with_conn(conn, task)

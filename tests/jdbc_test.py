@@ -272,7 +272,7 @@ async def main():
         t = await repo.find_task_by_id(doing[0].id)
         check("被拒后任务仍进行中", t is not None and t.taskState == TaskState.DOING, str(t.taskState))
 
-        # ── ⑦ 事务（spec §7.4）：提交 / 回滚 / 事务内绑定读
+        # ── ⑦ 事务（规范 05「事务约定」节）：提交 / 回滚 / 事务内绑定读
         await cleanup(adapter)
         tx_inst_id = DEFINE_ID + 1
         tx_cc_id = DEFINE_ID + 1

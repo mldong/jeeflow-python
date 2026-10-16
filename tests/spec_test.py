@@ -2366,7 +2366,7 @@ async def test_event_recorder_canonical_sequence_and_cc_branch():
 class _WriteSpyRepo(MemoryRepository):
     """记录**写库顺序**的内存仓——证 cc 行的写点落在 ``engine.*`` 这次调用的**内部**。
 
-    本栈的事务约定是 ``JdbcProcessRepository.with_tx``（``contextvars`` 绑连接，spec 05 §7.4）：
+    本栈的事务约定是 ``JdbcProcessRepository.with_tx``（``contextvars`` 绑连接，规范 05「事务约定」节）：
     调用方把 ``engine.start/execute`` 包进 ``with_tx`` 时，只有写点在引擎调用栈内，
     cc 行才与实例/任务写库同处一个事务。门面在 ``engine.*`` **返回之后**建 cc 行（本轮之前的形状）
     ⇒ 该事务盖不到 cc 行，且不用门面的调用方根本不建 cc 行。

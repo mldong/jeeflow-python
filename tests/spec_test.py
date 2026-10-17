@@ -2047,6 +2047,14 @@ async def test_facade_design_remove_ids_form_matrix():
     await gone(e)
 
 
+def test_r112_unknown_edge_warning_carries_from_to():
+    from jeeflow.engine import unknown_edge_warning
+    s = unknown_edge_warning("node-a", "node-b")
+    assert "from=node-a" in s
+    assert "to=node-b" in s
+    assert "WARNING" in s
+
+
 @pytest.mark.asyncio
 async def test_facade_define_remove_ids_form_matrix():
     """矩阵③processDefine/remove —— Python 独有漏项（issues/95 §6：五语言有批量、

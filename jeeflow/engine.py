@@ -1308,8 +1308,25 @@ def _find_node(flow: FlowModel, id: str) -> Optional[FlowNode]:
 def _find_by_type(flow: FlowModel, typ: str) -> Optional[FlowNode]:
     return next((n for n in flow.nodes if n.type == typ), None)
 
+def unknown_edge_warning(from_id: str, to_id: str) -> str:
+    return (
+        "[jeeflow] WARNING 转移出边的目标节点不在模型里（该节点类型未建档，解析期已跳过），"
+        f"本次流转停在这条边: from={from_id}, to={to_id}"
+    )
+
+
 def _follow_edges(flow: FlowModel, source_id: str) -> list[FlowNode]:
-    return [_find_node(flow, e.targetNodeId) for e in flow.edges if e.sourceNodeId == source_id and _find_node(flow, e.targetNodeId)]
+    """沿出边走一跳；目标不在模型里的边停住并记一条 from/to 告警（audit8 R112），不崩。"""
+    result: list[FlowNode] = []
+    for e in flow.edges:
+        if e.sourceNodeId != source_id:
+            continue
+        n = _find_node(flow, e.targetNodeId)
+        if n is None:
+            logging.warning(unknown_edge_warning(source_id, e.targetNodeId))
+        else:
+            result.append(n)
+    return result
 
 def _sync_task_to_aggregate(inst: ProcessInstance, task: ProcessTask):
     """把外部任务对象的最新状态同步回聚合根任务副本

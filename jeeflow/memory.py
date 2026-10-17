@@ -71,6 +71,9 @@ class MemoryRepository(ProcessRepository):
     async def remove_define(self, define_id: int):
         self._defines.pop(define_id, None)
 
+    async def has_instances_by_define_id(self, define_id: int) -> bool:
+        return any(i.defineId == define_id for i in self._instances.values())
+
     async def find_instance_by_id(self, id):
         inst = self._instances.get(id)
         if not inst: return None

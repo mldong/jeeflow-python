@@ -391,6 +391,12 @@ class JdbcRepository(ProcessRepository):
             await conn.execute(self._sql("DELETE FROM wf_process_define WHERE id=?"),
                                (define_id,))
 
+    async def has_instances_by_define_id(self, define_id: int) -> bool:
+        async with self._conn() as conn:
+            row = await conn.fetchone(self._sql(
+                "SELECT COUNT(1) FROM wf_process_instance WHERE process_define_id=?"), (define_id,))
+        return bool(row and row[0])
+
     # ── ProcessInstance ────────────────────────────────────────────────────
 
     _INSTANCE_COLS = ("id, parent_id, process_define_id, state, parent_node_name,"

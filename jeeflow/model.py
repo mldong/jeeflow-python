@@ -89,6 +89,8 @@ class TaskState(IntEnum):
 # 20010009 WITHDRAW_INSTANCE_NOT_DOING —— 撤回的实例状态守卫（issues/134 案 A），
 # 落点见下方 ProcessInstance.withdraw。
 ERR_WITHDRAW_INSTANCE_NOT_DOING = "流程实例非进行中，无法撤回"
+# 20010005 EXIST_UN_FINISH_INSTANCE —— 删除定义时该 defineId 下存在任何实例（audit8 R110）
+ERR_EXIST_UN_FINISH_INSTANCE = "存在正在未完成的流程实例，不允许删除！"
 
 # ─── 字典枚举（v1.4.0，对齐 Java enums，值与 boot3 字典一致） ────────────────
 

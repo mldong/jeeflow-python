@@ -2104,6 +2104,30 @@ async def test_facade_define_remove_ids_form_matrix():
 
 
 @pytest.mark.asyncio
+async def test_r110_define_remove_any_instance_guard():
+    """audit8 R110：任何实例存在即拒；整批先校验，不半删。"""
+    eng, repo = setup()
+    facade = JeeflowFacade(eng, repo, MemoryExtRepository())
+    df = load_flow(repo, "01-simple.json")
+    await _start_and_execute(eng, repo, df.id, "applicant")
+
+    msg = "存在正在未完成的流程实例，不允许删除！"
+    r = await facade.flow("processDefine/remove", {"id": df.id})
+    assert r["code"] == 99999999 and r["msg"] == msg, r
+    assert await repo.find_define_by_id(df.id) is not None, "被拒时定义不得被删"
+
+    clean = load_flow(repo, "01-simple.json")
+    r = await facade.flow("processDefine/remove", {"ids": [clean.id, df.id]})
+    assert r["code"] == 99999999 and r["msg"] == msg, r
+    assert await repo.find_define_by_id(clean.id) is not None, "批量校验应先于写入：clean 不得半删"
+    assert await repo.find_define_by_id(df.id) is not None, "dirty 不得被删"
+
+    r = await facade.flow("processDefine/remove", {"id": clean.id})
+    assert r["code"] == 0, r
+    assert await repo.find_define_by_id(clean.id) is None, "无实例的定义应可删"
+
+
+@pytest.mark.asyncio
 async def test_facade_define_up_and_down_ids_form_matrix():
     """矩阵④processDefine/upAndDown（issues/54 E26 批量 + issues/95 收敛进 _id_list）。
     ⚠️ 关键坑：本 action 除 ids 外还要求 opType/state——不带就先撞 `opType/state 缺失或非法`，

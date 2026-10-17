@@ -23,7 +23,7 @@ from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_AC
                      KEY_NEXT_NODE_OPERATOR,
                      KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
-from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState
+from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState, ERR_EXIST_UN_FINISH_INSTANCE
 from .spi import (ProcessExtRepository, ProcessRepository, QueryCondition,
                   normalize_actors, normalize_actor_value)
 
@@ -454,7 +454,12 @@ class JeeflowFacade:
 
     async def _processDefine_remove(self, args: dict) -> dict:
         # issues/95：前端删除统一发 {ids}（此前 Python 唯一没做批量兼容的语言）
-        for define_id in self._id_list(args):
+        ids = self._id_list(args)
+        # audit8 R110：先对整批做存在性校验再删，避免"前面的删了、后面的被拒"的半删。
+        for define_id in ids:
+            if await self._repo.has_instances_by_define_id(define_id):
+                raise ValueError(ERR_EXIST_UN_FINISH_INSTANCE)
+        for define_id in ids:
             await self._repo.remove_define(define_id)
         return None
 

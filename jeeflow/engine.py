@@ -5,6 +5,7 @@ import contextvars
 import json, re, time, random
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
+from . import reapply as _rj
 from .model import (
     FlowModel, FlowNode, FlowEdge,
     TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK, TYPE_JOIN, TYPE_CUSTOM,
@@ -362,13 +363,19 @@ class EngineImpl(Engine):
         # audit8 R92（spec04）：回传本次动作产出的任务行（作用域见文件头 _NEW_TASKS 注释）
         created: list[ProcessTask] = []
         token = _NEW_TASKS.set(created)
+        _pre = await self.repo.find_task_by_id(task_id)
         try:
-            await self._in_tx(lambda: self._execute_process_task_impl(task_id, operator, args))
+            async with _rj.instance_lock(self, _pre.processInstanceId if _pre else 0):
+                await self._in_tx(lambda: self._execute_process_task_impl(task_id, operator, args))
         finally:
             _NEW_TASKS.reset(token)
         return created
 
     async def _execute_process_task_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+        args = _rj.strip_reserved(args)
+        _pre = await self.repo.find_task_by_id(task_id)
+        if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
+            return await _rj.execute_reapply(self, _pre, operator, args)
         # issues/127 / spec §11.7 办理时抄送（tf_ccActors）：**覆盖面只有本条腿**——钩子挂在这里，
         # 不挂在共用的 ``_prepare_execute_task`` 里（形状基准＝go engine_impl.go:102-105 传钩子、
         # :206/:228/:265 三个 jump 入口传 nil；java 基准 JeeflowEngineImpl 的 handleCcActors 唯一
@@ -491,6 +498,9 @@ class EngineImpl(Engine):
         return created
 
     async def _execute_and_jump_to_end_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+        _pre = await self.repo.find_task_by_id(task_id)
+        if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
+            raise ValueError("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
         # 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
         # spec §11.7 边界 2：jumpToEnd 档不带 cc 钩子（显式 None，同 go :206 传 nil）——
         # 这一档传 tf_ccActors 也零 cc 行、零码 4。
@@ -520,6 +530,10 @@ class EngineImpl(Engine):
 
     async def _execute_and_jump_task_impl(self, task_id: int, operator: str, args: dict[str, Any] = None,
                                           target_task_name: str = None) -> ProcessInstance:
+        # 带直返上下文的进行中申请待办只接受重新提交(5)：命名跳转/退回上一步都在改状态前拒绝
+        _pre = await self.repo.find_task_by_id(task_id)
+        if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
+            raise ValueError("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
         # 空 target＝血缘回退（spec §11.3 码 6 的"退回"族）；命名 target＝跳转（码 5 族）
         # spec §11.7 边界 2：ROLLBACK / JUMP 两档都不挂 cc 钩子（显式 None，同 go :228）
         task, inst, flow, vars_ = await self._prepare_execute_task(
@@ -550,19 +564,55 @@ class EngineImpl(Engine):
         # audit8 R92（spec04）：回传本次动作产出的任务行（作用域见文件头 _NEW_TASKS 注释）
         created: list[ProcessTask] = []
         token = _NEW_TASKS.set(created)
+        _pre = await self.repo.find_task_by_id(task_id)
         try:
-            await self._in_tx(lambda: self._execute_and_jump_to_first_task_node_impl(task_id, operator, args))
+            async with _rj.instance_lock(self, _pre.processInstanceId if _pre else 0):
+                await self._in_tx(lambda: self._execute_and_jump_to_first_task_node_impl(task_id, operator, args))
         finally:
             _NEW_TASKS.reset(token)
         return created
 
     async def _execute_and_jump_to_first_task_node_impl(self, task_id: int, operator: str,
                                                         args: dict[str, Any] = None) -> ProcessInstance:
+        args = _rj.strip_reserved(args)
+        # 校验放在任何状态变更之前：带直返上下文的申请待办不得再次退回
+        _pre = await self.repo.find_task_by_id(task_id)
+        if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
+            raise ValueError("带重提直返标记的申请待办不允许再次退回，只接受重新提交(submitType=5)")
+        # 依据来源节点配置判准入（RETURN_TO_SOURCE 直返）
+        _source_node = None
+        _direct = False
+        if _pre is not None and _pre.taskState == TaskState.DOING:
+            _inst0 = await self.repo.find_instance_by_id(_pre.processInstanceId)
+            _def = await self.repo.find_define_by_id(_inst0.defineId)
+            _flow0 = parse_flow_model(json.loads(_def.content))
+            _source_node = _find_node(_flow0, _pre.taskName)
+            if _source_node is not None:
+                _direct = _rj.parse_mode(_source_node) == _rj.RETURN_TO_SOURCE
         # 退发起人＝spec §11.3 码 6 的"退回"族（载荷 submitType=6 分档，不另开号）
         # spec §11.7 边界 2：退发起人档不挂 cc 钩子（显式 None，同 go :265）
-        _, inst, flow, vars_ = await self._prepare_execute_task(
+        task, inst, flow, vars_ = await self._prepare_execute_task(
             task_id, operator, args, reject_as=int(SubmitType.ROLLBACK_TO_OPERATOR),
             on_task_updated=None)
+        if _direct:
+            if _source_node.type != TYPE_TASK:
+                raise ValueError(f"节点[{_source_node.id}]不是普通审批任务，不支持重提直返")
+            _pt = str((_source_node.properties or {}).get("performType", "0")).strip().upper()
+            if _pt in ("1", "ALL", "COUNTERSIGN"):
+                raise ValueError(f"会签节点[{_source_node.id}]不支持退回修改直返")
+            if self._is_first_task_node(flow, _source_node):
+                raise ValueError(f"申请节点[{_source_node.id}]不能配置重提直返")
+            start_node = _find_by_type(flow, TYPE_START)
+            _apply_node = None
+            if start_node:
+                _apply_node = next((n for n in _follow_edges(flow, start_node.id) if n.type == TYPE_TASK), None)
+            if _apply_node is None:
+                raise ValueError("流程定义缺少申请节点，无法退回发起人")
+            _apply_node.properties["assignee"] = inst.operator
+            await _rj.create_task_at(self, flow, _apply_node, inst, inst.operator, vars_, task.id,
+                                     [], _rj.new_context(task.id, _source_node.id,
+                                                         _rj.scopes_of(task.variables)))
+            return await self.repo.find_instance_by_id(inst.id)
         # 找到第一个任务节点，强制参与者为发起人，重新执行
         start_node = _find_by_type(flow, TYPE_START)
         if start_node:
@@ -796,9 +846,13 @@ class EngineImpl(Engine):
         # 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
         # 任务完成的拦截器由 execute_process_task 显式触发，1.8.0 SYNC 同步演进）
         if node.type == TYPE_TASK:
+            _sink = _NEW_TASKS.get()
+            _before = len(_sink) if _sink is not None else 0
             await self._create_task(node, inst, operator, vars_,
                                     await self._surrogate_process_name(flow, inst),
                                     parent_id, self._is_first_task_node(flow, node))
+            if _sink is not None:
+                await _rj.attach_created(self, flow, inst, _sink[_before:], node.id, parent_id)
             return
         # 记录类节点（snaker:custom）：**不是**任务类，按节点类型分流（issues/141 G9 ·
         # spec 02 §6.1，owner 2026-09-29 裁定「自定义类型这种记录类的，不会有参与人，是正常行为」）
@@ -813,7 +867,7 @@ class EngineImpl(Engine):
             elif node.type == TYPE_FORK:
                 for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_, parent_id)
             elif node.type == TYPE_JOIN:
-                if not await self.repo.find_doing_tasks(inst.id):
+                if await _rj.merge_ready(self, flow, inst, node.id, parent_id):
                     for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_, parent_id)
             elif node.type == TYPE_END:
                 # 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish

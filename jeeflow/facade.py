@@ -24,6 +24,11 @@ from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_AC
                      KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
 from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState, ERR_EXIST_UN_FINISH_INSTANCE
+from .reapply import VAR_BRANCH_CTX, VAR_REAPPLY_CTX
+
+# 任务行 ext 的「引擎控制键」集合（issues/121 P1 判据体）：行级首节点标记 ＋ spec 04 的
+# 两枚直返保留键。任务变量只剩这些键 ⇒ ext 回退实例变量（issues/82-3 既有契约）。
+_ROW_CONTROL_KEYS = frozenset(('isFirstTaskNode', VAR_BRANCH_CTX, VAR_REAPPLY_CTX))
 from .spi import (ProcessExtRepository, ProcessRepository, QueryCondition,
                   normalize_actors, normalize_actor_value)
 
@@ -2035,9 +2040,17 @@ class JeeflowFacade:
                 instance_ext = {}
         # issues/121 P1：引擎建单必写的控制键不算「任务变量非空」，否则新建任务的 ext
         # 永远不再回退实例变量（issues/82-3 既有契约）。
+        # 「退回修改、重提直返」又添了两枚引擎内部键（spec 04 保留键 _branchCtx／_reapplyContext，
+        # 建单时无条件写入、空分支也写 []）：同样不算用户变量——否则每条任务行从此都不再回退，
+        # 且内部键从公开出口透出。但 _reapplyContext 是前端「重新提交后返回：X」的唯一取数口
+        # （jeeflow-ui helpers.ts 读 ext._reapplyContext）⇒ 回退后原样合回。
+        # 合回必须落在**副本**上：instanceExt 是同一响应里的另一个出口，不能被任务侧的键污染。
         ext = r.variables or {}
-        if not [k for k in ext if k != 'isFirstTaskNode']:
-            ext = instance_ext
+        if all(k in _ROW_CONTROL_KEYS for k in ext):
+            reapply_ctx = ext.get(VAR_REAPPLY_CTX)
+            ext = dict(instance_ext or {})
+            if reapply_ctx is not None:
+                ext[VAR_REAPPLY_CTX] = reapply_ctx
         return {"id": r.id, "processInstanceId": r.processInstanceId, "taskName": r.taskName,
                 "displayName": r.displayName, "taskType": r.taskType, "performType": r.performType,
                 "taskState": int(r.taskState) if r.taskState is not None else None,

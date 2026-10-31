@@ -1,4 +1,5 @@
 """内存仓储——测试用"""
+import json
 from copy import deepcopy
 from datetime import datetime
 from typing import Optional
@@ -319,6 +320,12 @@ class MemoryRepository(ProcessRepository):
         inst = self._instances.get(t.processInstanceId)
         if inst:
             row.instanceCreateTime = inst.createTime
+            # 与 repository/base.py 的 `pi.variable AS instance_variable` 投影对齐（spec 06 §4.5
+            # 条款 6「同栈两仓同答案」）：issues/82-3 那条「任务变量只剩控制键 ⇒ ext 回退实例
+            # 变量」的回退目标就是这一列。此前内存仓漏映射 ⇒ 门面级用例只能断言容器是 dict，
+            # 照不出回退有没有真发生（本轮 `_branchCtx` 写进每条任务变量后七栈齐漏，只有 php
+            # 的 PDO 仓有内容级断言才报红）。
+            row.instanceVariable = json.dumps(inst.variables or {}, ensure_ascii=False)
             defn = self._defines.get(inst.defineId)
             if defn:
                 row.processDefineName = defn.name
@@ -907,6 +914,12 @@ class MemoryExtRepository(ProcessExtRepository):
         inst = self._instances.get(t.processInstanceId)
         if inst:
             row.instanceCreateTime = inst.createTime
+            # 与 repository/base.py 的 `pi.variable AS instance_variable` 投影对齐（spec 06 §4.5
+            # 条款 6「同栈两仓同答案」）：issues/82-3 那条「任务变量只剩控制键 ⇒ ext 回退实例
+            # 变量」的回退目标就是这一列。此前内存仓漏映射 ⇒ 门面级用例只能断言容器是 dict，
+            # 照不出回退有没有真发生（本轮 `_branchCtx` 写进每条任务变量后七栈齐漏，只有 php
+            # 的 PDO 仓有内容级断言才报红）。
+            row.instanceVariable = json.dumps(inst.variables or {}, ensure_ascii=False)
             defn = self._defines.get(inst.defineId)
             if defn:
                 row.processDefineName = defn.name

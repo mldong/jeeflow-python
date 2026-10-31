@@ -1399,6 +1399,12 @@ def _merge_exec_into_instance(base: dict, exec_vars: dict) -> dict:
     for k, v in exec_vars.items():
         if k.startswith("u_"):
             continue
+        # 「退回修改、重提直返」的两枚保留键（spec 04）是**行级**引擎内部状态：`_branchCtx` 是
+        # 分支归属栈、`_reapplyContext` 只出现在申请待办上，实例层没有对应语义。若不挡，任务
+        # 办结时它们会随执行上下文写进实例变量并落库 ⇒ 每个出口（任务行 instanceExt／实例行 ext）
+        # 都透出内部键，且 issues/82-3 的回退目标本身被污染（go 侧同款挡法见 mergeExecIntoInstance）。
+        if k in (_rj.VAR_BRANCH_CTX, _rj.VAR_REAPPLY_CTX):
+            continue
         out[k] = v
     return out
 

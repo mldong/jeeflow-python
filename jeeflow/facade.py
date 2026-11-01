@@ -1080,14 +1080,12 @@ class JeeflowFacade:
             return
         visited.add(node_id)
         src = self._find_node(flow, node_id)
-        for e in flow.get("edges", []):
-            if e.get("sourceNodeId") != node_id:
-                continue
-            # 决策节点：输出边表达式求值过滤（对齐 boot3 recursionModel，issues/06）
-            if src and src.get("type") == "snaker:decision":
-                expr = (e.get("properties") or {}).get("expr")
-                if expr and not await self._eval_decision_expr(flow, src, expr, vars_, history_tasks):
-                    continue
+        outs = [e for e in flow.get("edges", []) if e.get("sourceNodeId") == node_id]
+        # issues/241：决策节点选边以任务行佐证为准（活跃目标 → 有任务行的目标），
+        # 一条佐证都没有才回落到按当前实例变量求值
+        if src and src.get("type") == "snaker:decision":
+            outs = await self._select_decision_edges(flow, src, outs, active, vars_, history_tasks)
+        for e in outs:
             eid = e.get("id")
             if eid and eid not in edges:
                 edges.append(eid)
@@ -1102,6 +1100,36 @@ class JeeflowFacade:
             await self._collect_path(flow, tid, active, history, edges, visited,
                                      vars_, history_tasks)
 
+    async def _select_decision_edges(self, flow: dict, decision: dict, outs: list,
+                                     active: list, vars_: dict, history_tasks: list) -> list:
+        """issues/241：决策节点选边——先按表达式求值（issues/06/153 旧口径），
+        **当表达式给出的非空结果与任务行佐证相矛盾时，以任务行为准**；求值失败/零命中时
+        保持既有降级面（issues/164/201 的口径不被本规则改写）。
+
+        直返单（reapplyMode=RETURN_TO_SOURCE）重提后实例变量已按新值落库，而来源节点之前的
+        条件分支按契约不重算；按当前变量重放会选出没走过的分支，走过的分支在任务表里有行
+        （活跃目标也算）——这是执行事实。
+        """
+        selected = []
+        for e in outs:
+            expr = (e.get("properties") or {}).get("expr")
+            if not expr or await self._eval_decision_expr(flow, decision, expr, vars_, history_tasks):
+                selected.append(e)
+        if not selected:
+            return selected
+        task_names = {t.taskName for t in (history_tasks or [])}
+        for e in selected:
+            tid = e.get("targetNodeId")
+            if tid in active or tid in task_names:
+                return selected  # 表达式与执行事实一致，维持原口径
+        active_hits = [e for e in outs if e.get("targetNodeId") in active]
+        if active_hits:
+            return active_hits
+        evidenced = [e for e in outs if e.get("targetNodeId") in task_names]
+        if evidenced:
+            return evidenced
+        return selected
+
     async def _eval_decision_expr(self, flow: dict, decision: dict, expr: str,
                                   vars_: dict, history_tasks: list) -> bool:
         """决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量）"""
@@ -1111,8 +1139,9 @@ class JeeflowFacade:
             if e.get("targetNodeId") == decision.get("id"):
                 for t in history_tasks or []:
                     if t.taskName == e.get("sourceNodeId") and t.variables:
+                        # issues/241：break 必须在命中之后（旧形状与 if 同级 ⇒ 只看第一条任务行）
                         args.update(t.variables)
-                    break
+                        break
                 break
         result = await self._engine.eval_expr(expr, args)
         if asyncio.iscoroutine(result):

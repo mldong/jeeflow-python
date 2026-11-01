@@ -34,11 +34,12 @@ class UserProv:
 
 class Expr(ExpressionEvaluator):
     async def eval(self, expr, vars):
-        amt = vars.get("amount")
+        # 共享夹具用裸名 amount，issues/241 夹具用表单字段 f_amount
+        amt = vars.get("f_amount") if "f_amount" in expr else vars.get("amount")
         if amt is not None:
-            if expr == "amount > 1000":
+            if expr in ("amount > 1000", "f_amount > 1000"):
                 return float(amt) > 1000
-            if expr == "amount <= 1000":
+            if expr in ("amount <= 1000", "f_amount <= 1000"):
                 return float(amt) <= 1000
         return False
 
@@ -329,4 +330,91 @@ def test_nested_fork_branch_ctx_persists_across_requests():
         assert (await doing(repo, inst.id, "taskC")) is None
         await execute(eng2, repo, await doing(repo, inst.id, "taskB"), "userB", 1)
         assert (await doing(repo, inst.id, "taskC")) is not None
+    asyncio.run(case())
+
+
+# ─── issues/241：highLight 重放腿不得按重提后的实例变量选边 ──────────────────
+
+I241_JOIN_FLOW = {
+    "name": "i241-return-highlight-join",
+    "displayName": "直返重提高亮（汇合后分支）",
+    "type": "approval",
+    "nodes": [
+        {"id": "start", "type": "snaker:start"},
+        {"id": "apply", "type": "snaker:task",
+         "properties": {"assignee": "applicant", "taskType": 0, "performType": 0}},
+        {"id": "fork1", "type": "snaker:fork", "properties": {}},
+        {"id": "taskA", "type": "snaker:task",
+         "properties": {"assignee": "userA", "taskType": 0, "performType": 0}},
+        {"id": "taskB", "type": "snaker:task",
+         "properties": {"assignee": "userB", "taskType": 0, "performType": 0}},
+        {"id": "join1", "type": "snaker:join", "properties": {}},
+        {"id": "decision1", "type": "snaker:decision", "properties": {"expr": "f_amount > 1000"}},
+        {"id": "taskHigh", "type": "snaker:task",
+         "properties": {"assignee": "director", "taskType": 0, "performType": 0,
+                        "reapplyMode": "RETURN_TO_SOURCE"}},
+        {"id": "taskLow", "type": "snaker:task",
+         "properties": {"assignee": "manager", "taskType": 0, "performType": 0}},
+        {"id": "end", "type": "snaker:end"},
+    ],
+    "edges": [
+        {"id": "e0", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {}},
+        {"id": "e1", "sourceNodeId": "apply", "targetNodeId": "fork1", "properties": {}},
+        {"id": "e2", "sourceNodeId": "fork1", "targetNodeId": "taskA", "properties": {}},
+        {"id": "e3", "sourceNodeId": "fork1", "targetNodeId": "taskB", "properties": {}},
+        {"id": "e4", "sourceNodeId": "taskA", "targetNodeId": "join1", "properties": {}},
+        {"id": "e5", "sourceNodeId": "taskB", "targetNodeId": "join1", "properties": {}},
+        {"id": "e6", "sourceNodeId": "join1", "targetNodeId": "decision1", "properties": {}},
+        {"id": "e7", "sourceNodeId": "decision1", "targetNodeId": "taskHigh",
+         "properties": {"expr": "f_amount > 1000"}},
+        {"id": "e8", "sourceNodeId": "decision1", "targetNodeId": "taskLow",
+         "properties": {"expr": "f_amount <= 1000"}},
+        {"id": "e9", "sourceNodeId": "taskHigh", "targetNodeId": "end", "properties": {}},
+        {"id": "e10", "sourceNodeId": "taskLow", "targetNodeId": "end", "properties": {}},
+    ],
+}
+
+
+def register_content(repo, raw):
+    d = ProcessDefine(name=raw["name"], displayName=raw["displayName"], type=raw["type"],
+                      state=1, content=json.dumps(raw, ensure_ascii=False))
+    repo.add_define(d)
+    return d
+
+
+def test_high_light_not_light_unvisited_branch_after_reapply():
+    """issues/241：直返重提后实例变量已改（6666 → 666），重放腿仍须按任务行佐证走高额分支。
+
+    决策节点的入边来源刻意放成 join（网关不产任务行）——任务行快照实例变量的栈
+    在「任务行前置」夹具上会被旧的最老行合并偶然救活，join 入边让那条通道失效。
+    """
+    async def case():
+        from jeeflow.facade import JeeflowFacade
+        eng, repo = setup()
+        d = register_content(repo, I241_JOIN_FLOW)
+        inst = await start(eng, repo, d.id, args={"f_amount": 6666})
+        for name, actor in (("taskA", "userA"), ("taskB", "userB")):
+            t = await doing(repo, inst.id, name)
+            assert t is not None, f"夹具自证：并行分支 {name} 应就绪"
+            await execute(eng, repo, t, actor, 1)
+        high = await doing(repo, inst.id, "taskHigh")
+        assert high is not None, "夹具自证：汇合后 6666 应走 taskHigh"
+        await ret(eng, repo, high, "director")
+        app = await doing(repo, inst.id, "apply")
+        assert app is not None, "退回后应有申请待办"
+        await act(repo, app, "zhangsan")
+        await eng.execute_process_task(app.id, "zhangsan", {"submitType": 5, "f_amount": 666})
+        assert await doing(repo, inst.id, "taskHigh") is not None, "重提必须回原来源节点"
+
+        facade = JeeflowFacade(eng, repo)
+        r = await facade.flow("processInstance/highLight", {"id": inst.id})
+        assert r.get("code") == 0, r
+        data = r["data"]
+        edges = data.get("historyEdgeNames") or []
+        nodes = data.get("historyNodeNames") or []
+        assert "e7" in edges, f"汇合后的实际分支 e7 必须点亮（实际 {edges}）"
+        assert "e8" not in edges, f"未走分支 e8 不得点亮（实际 {edges}）"
+        assert "e10" not in edges, f"未走分支 e10 不得点亮（实际 {edges}）"
+        assert "taskLow" not in nodes, f"未走节点 taskLow 不得进历史（实际 {nodes}）"
+        assert "end" not in nodes, f"未走节点 end 不得进历史（实际 {nodes}）"
     asyncio.run(case())

@@ -72,6 +72,14 @@ KEY_CC_ACTORS = "tf_ccActors"
 # 节点 properties 的 `val` 指定别的键名时用那个；`val` 缺省才回落到本键。
 KEY_CUSTOM_RETURN_VAL = "custom_return_val"
 
+# ─── 退回上一步（血缘腿）两道守卫的对外文案（issues/121 立、issues/243 甲案搬前置）──────
+# 逐字不变、不含引擎内部码（内部码只进注释/文档，门面出口统一 99999999，见 model.py 同节口径）：
+#   20010007 ← ERR_ROLLBACK_NO_LINEAGE（parent 为空或 0，含 P1 之前落的老行）
+#   20010008 ← ERR_ROLLBACK_GUARD（上一步是 fork/join/subprocess/会签，canRejected 不过）
+# 单点定义：判据实现只有一份 ``_check_rejectable``，引擎前置位与复活腿共用这两句。
+ERR_ROLLBACK_NO_LINEAGE = "上一步任务ID为空，无法驳回至上一步处理"
+ERR_ROLLBACK_GUARD = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+
 # ─── 事件分档（spec 11-events §11.3 码 5/6 互斥判据）──────────────────────────────
 
 #: 归入 TASK_REJECT（码 6）的 submitType 档：拒绝 / 退上一步 / 退发起人 / 会签软拒绝。
@@ -630,6 +638,12 @@ class EngineImpl(Engine):
         _pre = await self.repo.find_task_by_id(task_id)
         if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
             raise ValueError("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
+        # issues/243 甲案：空 target＝血缘回退 ⇒ 那两道守卫（20010007／20010008）必须排在
+        # _prepare_execute_task **之前**——该序言内含 complete_task + update_task，会把当前行办结；
+        # 本栈内存仓储没有事务回滚 ⇒ 守卫后置时"报错那一次"结束后待办凭空消失、又没有复活行
+        # （真库外层有事务整笔回滚，照不出这一档）。与后加签写入口四判据同一规矩：判据前置＝零写入。
+        if not target_task_name:
+            await self._check_rollback_possible(_pre)
         # 空 target＝血缘回退（spec §11.3 码 6 的"退回"族）；命名 target＝跳转（码 5 族）
         # spec §11.7 边界 2：ROLLBACK / JUMP 两档都不挂 cc 钩子（显式 None，同 go :228）
         task, inst, flow, vars_ = await self._prepare_execute_task(
@@ -789,21 +803,61 @@ class EngineImpl(Engine):
         await self.repo.update_instance(inst)
         return task, inst, flow, vars_
 
+    async def _check_rollback_possible(self, current: Optional[ProcessTask]) -> None:
+        """退回上一步（``target_task_name`` 空 ⇒ 血缘腿）的**写前置**守卫（issues/243 甲案）。
+
+        只做一件事：把 :meth:`_check_rejectable` 的两道判据（20010007／20010008）提到任何状态变更
+        之前。**不**在这里报"任务不存在／不在进行中／无权办理"，也不在这里发明第二套文案——那几档
+        留给 :meth:`_prepare_execute_task` 里 ``_load_and_check`` 的既有固定错（它们同样排在
+        complete_task 之前，本来就零写入）；取不到实例或定义时一律放行，由序言去报它的原形状错。
+        本方法**纯读**（只 find_task/find_instance/find_define + 解析模型），不写任务行、不写实例、
+        不 fire 事件、不建历史行。
+        """
+        if current is None or current.taskState != TaskState.DOING:
+            return
+        inst = await self.repo.find_instance_by_id(current.processInstanceId)
+        if inst is None:
+            return
+        define = await self.repo.find_define_by_id(inst.defineId)
+        if define is None:
+            return
+        await self._check_rejectable(parse_flow_model(json.loads(define.content)), current)
+
+    async def _check_rejectable(self, flow: FlowModel, task: ProcessTask) -> ProcessTask:
+        """退回上一步的两道守卫（规范 04 · 退回上一步）：**只读判据，不碰任何状态**。
+
+        issues/243：这道守卫必须由引擎排在 :meth:`_prepare_execute_task`（内部 ``complete_task``
+        会把当前行置为办结）**之前**——内存仓储无回滚，判据后置时"报错"那一次调用结束后
+        当前待办已经消失且没有复活行，用户看到的是"点了退回、报错了、待办也没了"。
+        与后加签写入口四判据同一规矩：判据一律排在任何状态变更之前，报错即零写入。
+
+        :return: 血缘前驱那条历史行（``currentTask.parentTaskId`` 指向的行）
+        :raises ValueError: 20010007 无血缘（parent 为空或 0，含 P1 之前落的老行）；
+                            20010008 ``_can_rejected`` 守卫不过（上一步是 fork/join/subprocess/会签）
+        """
+        parent_id = getattr(task, "parentTaskId", None)
+        if not parent_id:
+            raise ValueError(ERR_ROLLBACK_NO_LINEAGE)
+        his = await self.repo.find_task_by_id(parent_id)
+        if his is None:
+            raise ValueError(ERR_ROLLBACK_NO_LINEAGE)
+        prev = _find_node(flow, his.taskName)
+        if prev is None or not _can_rejected(flow, task.taskName, prev.id):
+            raise ValueError(ERR_ROLLBACK_GUARD)
+        return his
+
     async def _rollback_to_parent(self, flow: FlowModel, inst: ProcessInstance,
                                    task: ProcessTask, operator: str) -> ProcessTask:
         """退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parentTaskId，
-        复活那条历史行；不按模型入边拓扑推。对外 msg 用固定中文文案、不含引擎内部码（出口统一 99999999）。"""
-        NO_LINEAGE = "上一步任务ID为空，无法驳回至上一步处理"
-        GUARD = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
-        parent_id = getattr(task, "parentTaskId", None)
-        if not parent_id:
-            raise ValueError(NO_LINEAGE)
-        his = await self.repo.find_task_by_id(parent_id)
-        if his is None:
-            raise ValueError(NO_LINEAGE)
+        复活那条历史行；不按模型入边拓扑推。对外 msg 用固定中文文案、不含引擎内部码（出口统一 99999999）。
+
+        判据在 :meth:`_check_rejectable`（issues/243：引擎把那道守卫排在任何状态变更之前，
+        本栈守卫不住在聚合根里、与复活腿同在引擎文件，但**只有一份实现**——本方法复用它，
+        过了守卫之后只负责复活）。"""
+        his = await self._check_rejectable(flow, task)
+        # 守卫已过 ⇒ 这里的取节点必不为 None（取不到时 _check_rejectable 已经报 20010008 了）；
+        # 下面复活腿用到的 cur_node（写点④的表达式来源）同理。
         prev = _find_node(flow, his.taskName)
-        if prev is None or not _can_rejected(flow, task.taskName, prev.id):
-            raise ValueError(GUARD)
         # 首任务节点那条由发起人提交 ⇒ 参与者取该行 u_userId；其余取该行办结人。
         # 老行没这个键 ⇒ 按 False 处理（宁可派给该行 actorId，也不用带"仅进行中"判定的现算值）。
         is_first = bool((his.variables or {}).get("isFirstTaskNode"))
@@ -811,7 +865,7 @@ class EngineImpl(Engine):
         if is_first:
             actor = (his.variables or {}).get("u_userId") or inst.operator
         if not actor:
-            raise ValueError(NO_LINEAGE)
+            raise ValueError(ERR_ROLLBACK_NO_LINEAGE)
         now = datetime.now()
         form = (prev.properties or {}).get("form", "")
         nt = inst.create_task(self._next_id(), prev.id, (prev.text or {}).get("value", ""),

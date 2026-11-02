@@ -4830,13 +4830,22 @@ async def test_i121_p2_rollback_lineage_and_negatives():
     apply = (await repo.find_doing_tasks(inst.id))[0]
     assert apply.taskName == "apply"
     assert apply.parentTaskId == 0, "前置条件：发起那条 parent 应为 0"
+    rows = len((await repo.find_instance_by_id(inst.id)).tasks)
     try:
         await eng.execute_and_jump_task(apply.id, "applicant", None, "")
         assert False, "无血缘必须报错，不得静默不建单"
     except ValueError as e:
         assert "上一步任务ID为空，无法驳回至上一步处理" in str(e) and "2001000" not in str(e), f"msg 应为固定文案且不含内部码：{e}"
 
-    # 老行形状：parent=None
+    # issues/243 甲案：血缘守卫排在 _prepare_execute_task（内含 complete_task + update_task）之前
+    # ⇒ 报错那一次**零写入**：当前待办还在办理人手里、实例下任务行一条不多（修前这一格是红的）。
+    still = await repo.find_task_by_id(apply.id)
+    assert still is not None and still.taskState == TaskState.DOING, \
+        f"报错后当前行必须仍是 DOING（守卫排在办结之前），实得 {still and still.taskState}"
+    assert len((await repo.find_instance_by_id(inst.id)).tasks) == rows, \
+        "报错不建单：实例下任务行总数不变"
+
+    # 老行形状：parent=None（复用上面那条即可——上一段零写入，它还是待办）
     old = apply
     old.parentTaskId = None
     await repo.update_task(old)
@@ -4845,6 +4854,10 @@ async def test_i121_p2_rollback_lineage_and_negatives():
         assert False, "parent=None 必须报 20010007"
     except ValueError as e:
         assert "上一步任务ID为空，无法驳回至上一步处理" in str(e) and "2001000" not in str(e), f"实得：{e}"
+    assert len((await repo.find_instance_by_id(inst.id)).tasks) == rows, \
+        "NULL 血缘那一档同样零写入"
+    assert (await repo.find_task_by_id(apply.id)).taskState == TaskState.DOING, \
+        "NULL 血缘那一档报错后当前行同样必须仍是 DOING"
 
     # ② fork 分支行退到 fork 之前的节点
     eng2, repo2 = setup()
@@ -4856,11 +4869,18 @@ async def test_i121_p2_rollback_lineage_and_negatives():
     branch = [t for t in await repo2.find_doing_tasks(inst2.id) if t.taskName == "taskA"][0]
     assert branch.parentTaskId, "前置条件：分支行的 parent 应已由 P1 写入"
     assert branch.actorIds, "前置条件：分支行应有参与者，否则会被权限校验先挡下"
+    rows2 = len((await repo2.find_instance_by_id(inst2.id)).tasks)
     try:
         await eng2.execute_and_jump_task(branch.id, branch.actorIds[0], None, "")
         assert False, "血缘前驱跨不过 fork 时必须报 20010008"
     except ValueError as e:
         assert "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务" in str(e) and "2001000" not in str(e), f"实得：{e}"
+    # issues/243 甲案：canRejected 那一档同样零写入（守卫排在 complete_task 之前）——
+    # 报错后 branch 那条并行待办仍在办理人手里，且实例下没有凭空多出的行。
+    assert (await repo2.find_task_by_id(branch.id)).taskState == TaskState.DOING, \
+        "报错后当前行必须仍是 DOING（零写入）"
+    assert len((await repo2.find_instance_by_id(inst2.id)).tasks) == rows2, \
+        "报错不建单：实例下任务行总数不变"
 
 
 # ─── issues/126 案 A · 任务行 expire_time 由**建单路径**按节点到期表达式真算 ───────

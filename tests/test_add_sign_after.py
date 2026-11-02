@@ -463,11 +463,12 @@ async def test17_rollback_on_chain_rejected():
     """后加签链上「退回上一步」(3) 被禁：当前行与血缘 parent 同节点 ⇒ 既有 canRejected 守卫不过。
 
     判据与 go/node/rust/c#/moon 五栈同一条（基准＝jeeflow-java `AddSignAfterTest` 那一格）：
-    不走新错误码、不新增守卫，靠 `engine._rollback_to_parent` 里 `_can_rejected` 那句逐字文案拦住。
-    ⚠️ 行读数按本栈真实形状写：**守卫排在办结之后**（issues/243，java 参考实现同形——
-    `execute_and_jump_task` 先 `_prepare_execute_task`（内含 `inst.complete_task`）再
-    `_rollback_to_parent` 判守卫；内存仓储无 `with_tx` ⇒ 无回滚），所以当前行 b 已是完成态、
-    但绝不复活第三条同节点行；位序不在本轮改动范围，改判据来"好看"才是错的。
+    不走新错误码、不新增守卫，靠 `engine._check_rejectable` 里 `_can_rejected` 那句逐字文案拦住。
+    ⚠️ **报错那一次零写入**（issues/243 甲案，2026-11-03 落地）：那道血缘守卫由引擎排在
+    `_prepare_execute_task`（内含 `inst.complete_task` + `update_task`）**之前**
+    （`_check_rollback_possible`），所以内存仓储（无 `with_tx` 回滚）里报错后当前行仍是 DOING、
+    待办还在办理人手里。修前的形状是"点了退回、报错了、待办也没了"；真库（MySQL/PG）外层有事务，
+    两种位序都整笔回滚，观察不到差别——这一档只有内存仓储照得出来，故本格同时钉文案与零写入。
     """
     eng, repo, inst = await start_to_review(ADD_SIGN_ON)
     iid = inst.id
@@ -489,6 +490,12 @@ async def test17_rollback_on_chain_rejected():
     assert await doing(repo, iid, "final") is None, "不得流出下游节点待办"
     assert await rows(repo, iid, "final") == 0, "下游节点不得被建出行"
     assert await rows(repo, iid, "review") == 2, "review 只有 a/b 两行，不复活第三条"
-    assert await doing_count(repo, iid, "review") == 0, "报错那次当前行已办结、一条复活待办都不建"
+    # issues/243 甲案：守卫排在办结之前 ⇒ 报错那一次零写入（修前这一格是红的：b 已被静默办结）
+    assert await doing_count(repo, iid, "review") == 1, "报错零写入：当前行必须仍是待办（守卫排在办结之前）"
+    still_doing = await doing(repo, iid, "review")
+    assert still_doing is not None and still_doing.id == b.id, \
+        f"待办必须还是报错那一条 b，不是新建的行：{still_doing and (still_doing.id, still_doing.taskState)}"
+    assert first_actor(still_doing) == "userB", f"待办还在办理人手里：{first_actor(still_doing)}"
     assert int((await repo.find_instance_by_id(iid)).state) == int(InstanceState.DOING), \
         "实例不因这次被禁的退回而进终态"
+    assert int(still_doing.taskState) == int(TaskState.DOING), "当前行状态不得被这次失败的调用改写"

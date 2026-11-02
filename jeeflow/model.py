@@ -61,6 +61,13 @@ TYPE_CUSTOM   = "snaker:custom"
 KNOWN_NODE_TYPES = frozenset({TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK,
                               TYPE_JOIN, TYPE_CUSTOM})
 
+# ─── 控制类参数前缀（规范 04「流程变量约定」末注的判据本体用得到它）──────────────
+#
+# ``tf_*`` 键（审批意见、附件、抄送人、下一节点处理人、后加签指定人……）只属于
+# **一次提交**与**那一条任务行**：既不得进实例变量（跨请求复活），也不得随血缘复活血
+# （``engine._lineage_vars`` 按同一前缀剔）。单点定义在这里，``add_sign`` 与 ``engine`` 都取这一枚。
+TF_KEY_PREFIX = "tf_"
+
 # ─── Domain Types ──────────────────────────────────────────────────────────────
 
 class InstanceState(IntEnum):
@@ -161,9 +168,21 @@ class ProcessInstance:
     # ── 聚合根行为（对标 Java domain/ProcessInstance）──
 
     def complete_task(self, task: "ProcessTask", operator: str, vars_: dict, now) -> None:
-        """完成任务（子实体状态转换 + 实例变量合并）"""
+        """完成任务（子实体状态转换 + 实例变量合并）。
+
+        **实例变量只收数据类键，``tf_*`` 控制键一律排除**（规范 04「流程变量约定」末注 ·
+        根因条款，jeeflow-java ``ProcessInstance.completeTask`` 同批修法）：
+        ``vars_`` 是「实例变量 ← 任务行变量 ← 本次提交参数」的合并结果，整包落到实例上
+        会让上一轮的控制键**跨请求复活**——``tf_addSignOperators`` 使后续办结凭空多建一条
+        本节点待办，``tf_nextNodeOperator`` 同病（直返腿当年为此在 ``reapply.execute_reapply``
+        显式剥键，那是单点绕行、不是根因），``tf_approvalComment`` 则把某个人的审批意见
+        污染成全流程可读的变量。
+        ⚠️ 任务行留痕不受影响：紧随其后的 ``task.finish(...)`` 仍收**整包** ``vars_``，
+        审计要的 ``tf_*`` 全在那一条已完成行上（规范 04「聚合根方法清单」的同一枚判据两面）。
+        """
         task.finish(operator, vars_, now)
-        self.variables = vars_
+        self.variables = {k: v for k, v in (vars_ or {}).items()
+                          if not (k or "").startswith(TF_KEY_PREFIX)}
         self.updateTime = now
         self.updateUser = operator
 
@@ -441,10 +460,16 @@ _KNOWN_EDGE = {"id", "sourceNodeId", "targetNodeId", "properties", "text"}
 
 
 def parse_flow_model(raw: dict) -> FlowModel:
-    """从 JSON dict 解析 FlowModel，过滤未知字段"""
+    """从 JSON dict 解析 FlowModel，过滤未知字段。
+
+    末尾那一刀是**解析期硬校验**（规范 02 §4.3）：后加签两开关的非法值、会签节点配
+    ``allowAddSign``、首任务节点配 ``allowAddSign`` 都在这一跳抛配置错误，不做运行时降级
+    ——静默跑下去会让配置者以为开关生效，实际两档推进闸各裁各的（java 那边同判据在
+    ``ModelParser.parse`` 末尾，本栈的解析单点就是本函数，位置等价）。
+    """
     nodes = [_parse_node(n) for n in raw.get("nodes", [])]
     edges = [_parse_edge(e) for e in raw.get("edges", [])]
-    return FlowModel(
+    model = FlowModel(
         name=raw.get("name", ""),
         displayName=raw.get("displayName", ""),
         type=raw.get("type", ""),
@@ -455,6 +480,11 @@ def parse_flow_model(raw: dict) -> FlowModel:
         nodes=nodes,
         edges=edges,
     )
+    # 延迟 import：add_sign 顶层要 import 本模块（TYPE_TASK / TF_KEY_PREFIX），
+    # 顶层互指会成环；解析校验只在运行期发生，一帧延迟不影响判据强度。
+    from .add_sign import validate_definition
+    validate_definition(nodes, edges)
+    return model
 
 
 def _parse_node(raw: dict) -> FlowNode:

@@ -5,6 +5,7 @@ import contextvars
 import json, re, time, random
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
+from . import add_sign as _as
 from . import reapply as _rj
 from .model import (
     FlowModel, FlowNode, FlowEdge,
@@ -478,11 +479,104 @@ class EngineImpl(Engine):
                     await self.repo.update_task(t)
                     _sync_task_to_aggregate(inst, t)
 
+            # ── 后加签（可重复）推进闸（规范 04 · 后加签）──
+            # 三档顺序照 java `TaskModel.exec`：**会签档优先**（上面那几支已经裁完，且解析期
+            # 硬校验保证会签节点根本配不上 allowAddSign，这里只是不把两档叠起来跑）；
+            # 节点开了开关才由加签腿裁决 merged；merged=false ⇒ 令牌停留本节点，不放行出边。
+            if _as.node_allows(cur_node) and not ct and not _as.is_countersign_node(cur_node):
+                if not await self._exec_add_sign_gate(flow, cur_node, task, inst, operator, args, now):
+                    return await self.repo.find_instance_by_id(inst.id)
+
             for node in _follow_edges(flow, cur_node.id):
                 # 统一走 _execute_node：结束节点也经节点执行链（拦截器/事件完整触发），
                 # _execute_node 内部 TYPE_END 分支完成聚合根 finish + 事件发布
                 await self._execute_node(flow, inst, node, operator, vars_, task.id)
         return await self.repo.find_instance_by_id(inst.id)
+
+    async def _exec_add_sign_gate(self, flow: FlowModel, cur_node: FlowNode, task: ProcessTask,
+                                  inst: ProcessInstance, operator: str, args: dict,
+                                  now) -> bool:
+        """后加签的推进闸（形状基准＝java ``AddSignHandler.handle``），返回 ``merged``。
+
+        **merged 判据三条，顺序不可反**（规范 04 · 后加签）：
+
+        1. 本次给了加签人 → 同节点建单、``merged=false``（不流转）；
+        2. 没给但本节点还有未完成待办（多选时同圈的兄弟待办）→ ``merged=false``；
+        3. 两者皆否 → ``merged=true``，由调用方放行出边。
+
+        停止条件即本判据本身，**不设第二判据源**：被加签人觉得够了、直接同意且不点人，
+        令牌就流出本节点。四判据类报错不在这里——``_prepare_execute_task`` 已在改动任何状态
+        之前拦下，进到这里的提交都已判定合法。
+
+        建单七条逐条照 java：``parent``＝刚办结那条（血缘串成链）、``taskType``/``form`` 继承
+        节点、``performType=NORMAL``（加签任务是普通任务）、参与者＝本次点名的一人一行（多选
+        同圈建多行）、轮次记**任务变量** ``addSignRound_{节点名}``（不复用会签簿记 ``loopCounter``——
+        后者退回复活时会被 ``_lineage_vars`` 剔掉）、
+        ``expire_time`` 走既有建单腿那把尺子、拦截器/码 3 事件/委托一律走既有腿不新造时序。
+        """
+        node = cur_node.id
+        # 只认**本次请求**点名的加签人：args 是当次提交参数，不是合并后的执行变量
+        # （那里混着实例变量与任务行变量，上一轮的 tf_addSignOperators 会复活——根因已由
+        # ProcessInstance.complete_task 的 tf_ 排除修掉，本行是第二道，不替代根因）
+        operators = _as.operators(args)
+        if not operators:
+            # 停止条件即本判据本身：没点人且本节点再无未完成待办 ⇒ 放行出边
+            return not _as.has_doing_on_node(inst, node)
+
+        round_no = _as.round_of(task, node) + 1
+        first_task_node = self._is_first_task_node(flow, cur_node)
+        form = (cur_node.properties or {}).get("form", "")
+        expire_expr = (cur_node.properties or {}).get("expireTime")
+        process_name = await self._surrogate_process_name(flow, inst)
+        for actor in operators:
+            # 一人一行（多选 ⇒ 同圈多行）：performType 走默认 0＝普通任务，不是会签
+            nt = inst.create_task(self._next_id(), node, (cur_node.text or {}).get("value", ""),
+                                  actor, operator, form, now, task.id, first_task_node)
+            nt.variables[_as.VAR_ADD_SIGN_ROUND + "_" + node] = round_no
+            # 分支归属与每一次普通建单同一条腿：并行范围内的加签任务必须继承父任务归属，
+            # 否则汇合判据读不到这一支（缺省按父任务血缘＋模型静态范围推导）
+            nt.variables[_rj.VAR_BRANCH_CTX] = _rj.build_scopes(
+                flow, node, task.variables, task.id, nt.id)
+            # 到期时间同尺（issues/126 先例）：走既有建单腿的写点，变量源＝实例变量，
+            # 与写点①②③同档；不新增写点、不另造尺子
+            _apply_expire_time(nt, expire_expr, inst.variables)
+            await self._apply_surrogate(nt, process_name)
+            await self.repo.save_task(nt)
+            _append_new_task(nt)
+            # PROCESS_TASK_START（码 3）：任务行落库**之后** fire（建单拦截器/事件/通知走既有腿）
+            await self._fire_task_start(inst, nt, node, operator)
+
+        # 账本落在**已完成的那条行**变量上，只追加不覆盖；⚠️ 必须再落一次库——
+        # 本栈两仓存的是快照（java 那边是共享引用，改了就看得见），不补这一刀账本就丢
+        _as.append_history(task, operator, operators, round_no)
+        await self.repo.update_task(task)
+        _sync_task_to_aggregate(inst, task)
+        return False
+
+    async def _abandon_add_sign_doing(self, flow: FlowModel, inst: ProcessInstance,
+                                      node_name: str, operator: str) -> int:
+        """废弃本节点未完成的加签任务（拒绝 2 / 退回发起人 6 两条腿调用，不留孤儿待办）。
+
+        形状基准＝java ``AddSignSupport.abandonDoingOnNode``：**只对开了** ``allowAddSign``
+        的节点动手——会签节点的兄弟任务由既有会签腿管（上面 ``if ct:`` 那支），不在此扩面。
+        与 java 的一处实现差异：本栈聚合根里的任务是仓储对象的**副本**，只改聚合会漏库，
+        故按既有会签废弃腿的同一条姿势逐条「仓储取行 → abandon → update_task → 同步回聚合」，
+        ``update_user`` 记真实废弃人（java ``ProcessTask.abandon(operator)`` 同语义）。
+
+        :return: 实际废弃的行数
+        """
+        node = _find_node(flow, node_name) if flow is not None else None
+        if not _as.node_allows(node):
+            return 0
+        now = datetime.now()
+        abandoned = 0
+        for t in await self.repo.find_doing_tasks(inst.id, [node_name]):
+            t.abandon(now)
+            t.updateUser = operator
+            await self.repo.update_task(t)
+            _sync_task_to_aggregate(inst, t)
+            abandoned += 1
+        return abandoned
 
     # ─── Reject ───────────────────────────────────────────────────────────────
 
@@ -504,8 +598,10 @@ class EngineImpl(Engine):
         # 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
         # spec §11.7 边界 2：jumpToEnd 档不带 cc 钩子（显式 None，同 go :206 传 nil）——
         # 这一档传 tf_ccActors 也零 cc 行、零码 4。
-        _, inst, _, _ = await self._prepare_execute_task(
+        _t, inst, _flow, _vars = await self._prepare_execute_task(
             task_id, operator, args, reject_as=int(SubmitType.REJECT), on_task_updated=None)
+        # 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签语义边界表）
+        await self._abandon_add_sign_doing(_flow, inst, _t.taskName, operator)
         inst.reject(datetime.now())
         await self.repo.update_instance(inst)
         # 实例进入终态＝PROCESS_INSTANCE_END（码 2），拒绝/办结合一号（spec §11.6：
@@ -594,6 +690,9 @@ class EngineImpl(Engine):
         task, inst, flow, vars_ = await self._prepare_execute_task(
             task_id, operator, args, reject_as=int(SubmitType.ROLLBACK_TO_OPERATOR),
             on_task_updated=None)
+        # 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签语义边界表；
+        # 与拒绝档同一判据——只对开了 allowAddSign 的节点动手，会签兄弟任务由既有会签腿管）
+        await self._abandon_add_sign_doing(flow, inst, task.taskName, operator)
         if _direct:
             if _source_node.type != TYPE_TASK:
                 raise ValueError(f"节点[{_source_node.id}]不是普通审批任务，不支持重提直返")
@@ -650,6 +749,10 @@ class EngineImpl(Engine):
         # 定义行 name 记入回落缓存（同 start 路径，条款 1.1 解析收敛在 _surrogate_process_name 单点）
         self._cache_define_name(inst.defineId, def_.name)
         args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
+        # 后加签写入口校验（规范 04 · 后加签）：四判据**必须排在 complete_task 之前**——
+        # 内存仓储无回滚，先办结再判错就留下一条已完成却无人能改回的任务行（"报错且零写入"
+        # 是这条链的硬要求）。java 基准同判据落在 JeeflowEngineImpl.prepareExecution 的同一位置。
+        _as.validate_submission(_find_node(flow, task.taskName), task.taskName, task, args, operator)
         # issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
         # 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
         base_vars = inst.variables
@@ -1394,10 +1497,23 @@ def _merge_exec_into_instance(base: dict, exec_vars: dict) -> dict:
     """实例变量写回合并（issues/97 对齐 Java）：以 base（start 注入的发起人 u_*）为底，
     并入执行上下文中**非 u_*** 键（f_ 表单字段 / submitType 等流转数据）。
     add_user_info 生成的操作人 u_* 只属于当次执行上下文与任务行 ext，不整体写回实例——
-    实例 u_realName 语义是「发起人」（与 autoGenTitle 一致），不随审批节点漂移。"""
+    实例 u_realName 语义是「发起人」（与 autoGenTitle 一致），不随审批节点漂移。
+
+    ⚠️ **``tf_*`` 控制键一律排除**（规范 04「流程变量约定」末注 · 根因条款，与
+    ``ProcessInstance.complete_task`` 同一判据的两道闸）：整包合到实例上会让上一轮的控制键
+    **跨请求复活**——``tf_addSignOperators`` 使后续办结凭空多建一条本节点待办、
+    ``tf_nextNodeOperator`` 同病（直返腿为此在 ``reapply.execute_reapply`` 里显式剥键，那是
+    单点绕行、留着当第二道，不改它）、``tf_approvalComment`` 更是把某个人的审批意见污染成
+    全流程可读的变量。任务行留痕不受影响：``task.finish`` 仍收整包参数（两面都要保住）。
+    只挡**并入侧**，不动 ``base`` 里已有的键——与 java ``completeTask`` 的
+    「遍历 args、``tf_`` 前缀 continue」逐字同档（发起参数在 ``ProcessInstance.create`` 里
+    整包落实例，那一跳 java 也没裁）。"""
     out = dict(base)
     for k, v in exec_vars.items():
         if k.startswith("u_"):
+            continue
+        # 控制类键只活在当次提交与那一条任务行（判据与理由见本函数 docstring）
+        if k.startswith(_as.TF_KEY_PREFIX):
             continue
         # isFirstTaskNode 同是**行级**建单标记（建单不变量②）：随共享执行池进 exec_vars，
         # 不挡就逐节点漂移写进实例变量，把"最近办结那行"的标记透成实例级——issues/240

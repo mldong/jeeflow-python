@@ -10,6 +10,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -1294,6 +1295,168 @@ async def main():
 
         # ⑱ 收尾：本段自带的定义与实例一律按 define id 级联清掉（不碰别人的数据）
         await _purge137()
+
+        # ── ⑲ 后加签（可重复）真库腿：轮次号与账本必须扛住仓储往返（方案 §10「重启」那一格）─────
+        # T0 那 16 格跑在内存仓上，证不了三件只有真库能证的事：
+        #   ① 加签链的**轮次键** addSignRound_{节点} 与**追加式账本** tf_addSignHistory
+        #      随 wf_process_task.variable 走一趟 JSON 往返还在、值还是那个数；
+        #   ② 控制键没漏进实例行（wf_process_instance.variable 里一个 tf_ 都没有——根因条款的真库侧），
+        #      否则下一轮办结会复活上一轮的 tf_addSignOperators、凭空多建一条本节点待办；
+        #   ③ 加签腿建单走的既有到期写点（expire_time 同尺）真进了 DATETIME 列。
+        # 夹具自带定义行（id 段与既有各段错开，先清再灌，收尾按 define id 级联清）。
+        from jeeflow import add_sign as _A19
+        from jeeflow.repository import JdbcRepository as _Repo19
+
+        def _flow19(name: str) -> str:
+            """start → apply(applicant) → review(leader，开 allowAddSign，节点配 expireTime "2h") → end。
+
+            ⚠️ 必须带申请节点：``review`` 若直接挂在 start 后面就是**首任务节点**，
+            解析期硬校验（规范 02 §4.3）当场拒配 allowAddSign——那一条判据本轮已在 T0 钉过，
+            这里要的是"能跑的真库腿"。
+            """
+            return json.dumps({
+                "name": name, "displayName": "后加签真库", "type": "approval",
+                "nodes": [
+                    {"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+                    {"id": "apply", "type": "snaker:task",
+                     "properties": {"assignee": "applicant", "taskType": 0, "performType": 0,
+                                    "form": "form-apply"},
+                     "text": {"value": "发起申请"}},
+                    {"id": "review", "type": "snaker:task",
+                     "properties": {"assignee": "leader", "taskType": 0, "performType": 0,
+                                    "form": "form-review", "expireTime": "2h",
+                                    "allowAddSign": True, "addSignMaxRounds": 0},
+                     "text": {"value": "审批（可后加签）"}},
+                    {"id": "end", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}],
+                "edges": [
+                    {"id": "e1", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {}},
+                    {"id": "e2", "sourceNodeId": "apply", "targetNodeId": "review", "properties": {}},
+                    {"id": "e3", "sourceNodeId": "review", "targetNodeId": "end", "properties": {}}]},
+                ensure_ascii=False)
+
+        _ids19 = [DEFINE_ID + 70, DEFINE_ID + 71]
+
+        async def _seed19(did: int, content: str):
+            from datetime import datetime as _dt19
+            _n19 = _dt19.now()
+            await _exec("INSERT INTO wf_process_define (id, name, display_name, type, state, content,"
+                        " version, create_time, create_user, update_time, update_user)"
+                        " VALUES (?,?,?,?,1,?,1,?,?,?,?)",
+                        [did, f"py-addsign19-{did}", "后加签真库", "approval", content,
+                         _n19, "py-test", _n19, "py-test"])
+
+        async def _purge19():
+            for _did in _ids19:
+                await _exec("DELETE FROM wf_process_task_actor WHERE process_task_id IN"
+                            " (SELECT id FROM wf_process_task WHERE process_instance_id IN"
+                            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?))", [_did])
+                await _exec("DELETE FROM wf_process_task WHERE process_instance_id IN"
+                            " (SELECT id FROM wf_process_instance WHERE process_define_id = ?)", [_did])
+                await _exec("DELETE FROM wf_process_instance WHERE process_define_id = ?", [_did])
+                await _exec("DELETE FROM wf_process_define WHERE id = ?", [_did])
+
+        async def _task_ext(task_id):
+            rows = await raw_rows(adapter, "SELECT variable FROM wf_process_task WHERE id = ?", [task_id])
+            if not rows or rows[0][0] in (None, ""):
+                return {}
+            raw = rows[0][0]
+            return json.loads(raw) if isinstance(raw, str) else (raw or {})
+
+        async def _inst_ext(instance_id):
+            rows = await raw_rows(adapter, "SELECT variable FROM wf_process_instance WHERE id = ?",
+                                  [instance_id])
+            if not rows or rows[0][0] in (None, ""):
+                return {}
+            raw = rows[0][0]
+            return json.loads(raw) if isinstance(raw, str) else (raw or {})
+
+        async def _review_rows(iid):
+            return [t for t in await repo19.find_history_tasks(iid) if t.taskName == "review"]
+
+        await _purge19()
+        await _seed19(_ids19[0], _flow19(f"py-addsign19-{_ids19[0]}"))
+        # 独立仓储对象＝真往返（不复用发起那一腿的内存聚合）；**ID 发生器必须与主引擎共用**——
+        # 本栈 TestIDGen 的 base 由构造时刻的毫秒算出，同秒再 new 一个就会与第一个撞主键 1062
+        _gen19 = eng.id_gen
+        repo19 = _Repo19(adapter, _gen19)
+        eng19 = EngineImpl(repo19, TestUserProv(), _gen19)
+
+        i19 = await eng19.start_process_instance_by_id(_ids19[0], "zhangsan",
+                                                      {"BUSINESS_NO": f"BIZ-{DB}-19"})
+        a19 = [t for t in await repo19.find_doing_tasks(i19.id) if t.taskName == "apply"][0]
+        await eng19.execute_process_task(a19.id, "zhangsan", {"submitType": 0})
+        r1 = [t for t in await repo19.find_doing_tasks(i19.id) if t.taskName == "review"][0]
+
+        # ⑲.1 一轮多选（逗号串两形）⇒ 同圈两行，且**只有已完成那条**带账本
+        await eng19.execute_process_task(r1.id, "leader",
+                                         {"submitType": 1, _A19.KEY_ADD_SIGN_OPERATORS: "member1,member2"})
+        led19 = (await _task_ext(r1.id)).get(_A19.KEY_ADD_SIGN_HISTORY) or []
+        check("⑲ 真库往返后账本仍在：已完成行 1 条、五键齐全",
+              len(led19) == 1 and led19[0].get("round") == 1
+              and led19[0].get("fromActor") == "leader"
+              and led19[0].get("toActors") == ["member1", "member2"]
+              and led19[0].get("operator") == "leader"
+              and re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", str(led19[0].get("time"))),
+              json.dumps(led19, ensure_ascii=False))
+        sib19 = [t for t in await repo19.find_doing_tasks(i19.id) if t.taskName == "review"]
+        # 逐行 ext 先取齐再断言：`await` 落在生成器表达式里会成 async generator（all() 不 await 它），
+        # 既不改判据也不报错——先把协程materialize成字典是这一段的唯一安全姿势
+        sib19_ext = {t.id: await _task_ext(t.id) for t in sib19}
+        _round_key = f"{_A19.VAR_ADD_SIGN_ROUND}_review"
+        check("⑲ 同圈建两行、血缘 parent＝刚办结那条、轮次键真落库",
+              len(sib19) == 2
+              and all(t.parentTaskId == r1.id for t in sib19)
+              and all(sib19_ext[t.id].get(_round_key) == 1 for t in sib19),
+              str([(t.id, sib19_ext[t.id].get(_round_key)) for t in sib19]))
+        _exp19 = await raw_rows(adapter,
+                                "SELECT expire_time FROM wf_process_task WHERE id = ?", [sib19[0].id])
+        check("⑲ 加签腿走既有建单到期写点（expire_time 真进 DATETIME 列，非 NULL）",
+              bool(_exp19) and _exp19[0][0] is not None, repr(_exp19[0][0] if _exp19 else None))
+
+        # ⑲.2 根因条款的真库侧：实例行 variable 里一个 tf_ 键都不许有
+        _iext19 = await _inst_ext(i19.id)
+        _tf19 = [k for k in _iext19 if str(k).startswith(_A19.TF_KEY_PREFIX)]
+        check("⑲ 实例行 variable 零 tf_ 控制键（跨请求复活的病根已在真库侧堵住）", not _tf19, str(_tf19))
+
+        # ⑲.3 兄弟未办结 ⇒ 不放行；加给自己 ⇒ 报错且零写入（真库侧同判据）
+        b19 = sib19[0]
+        _err19 = ""
+        try:
+            await eng19.execute_process_task(b19.id, "member1",
+                                             {"submitType": 1, _A19.KEY_ADD_SIGN_OPERATORS: "member1"})
+        except Exception as _e19:
+            _err19 = f"{type(_e19).__name__}: {_e19}"
+        check("⑲ 加给自己在真库侧同样报错（逐字文案与 java 同尺）",
+              _err19 == f"ValueError: {_A19.MSG_SELF}", _err19)
+        check("⑲ 报错那次零写入（行还是 DOING、行数没涨）",
+              (await repo19.find_task_by_id(b19.id)).is_doing()
+              and len(await _review_rows(i19.id)) == 3,
+              str(len(await _review_rows(i19.id))))
+        await eng19.execute_process_task(b19.id, "member1",
+                                         {"submitType": 1, _A19.KEY_ADD_SIGN_OPERATORS: "member3"})
+        _doing19 = [t for t in await repo19.find_doing_tasks(i19.id)]
+        check("⑲ 续办不流转：兄弟 member2 还在 ⇒ 令牌停在本节点（待办只剩这两条）",
+              len(_doing19) == 2 and all(t.taskName == "review" for t in _doing19),
+              str([t.taskName for t in _doing19]))
+
+        # ⑲.4 第二轮的轮次号递增且落库；同圈兄弟全办结且没人再点人 ⇒ 流出本节点、实例办结
+        c19 = [t for t in await repo19.find_doing_tasks(i19.id) if t.taskName == "review"
+               and "member3" in (t.actorIds or [])][0]
+        check("⑲ 第二轮轮次键＝2 且真落库（链上可重复加签的簿记没丢）",
+              (await _task_ext(c19.id)).get(f"{_A19.VAR_ADD_SIGN_ROUND}_review") == 2,
+              json.dumps(await _task_ext(c19.id), ensure_ascii=False))
+        for t in [t for t in await repo19.find_doing_tasks(i19.id) if t.taskName == "review"]:
+            await eng19.execute_process_task(t.id, (t.actorIds or ["leader"])[0], {"submitType": 1})
+        _fin19 = await repo19.find_instance_by_id(i19.id)
+        check("⑲ 同圈兄弟全部办结且没再点人 ⇒ 实例办结（真库 state）",
+              int(_fin19.state) == int(InstanceState.DONE), str(_fin19.state))
+        check("⑲ 本节点共四行（leader + member1 + member2 + member3）、无残留待办",
+              len(await _review_rows(i19.id)) == 4
+              and not [t for t in await repo19.find_doing_tasks(i19.id)],
+              str(len(await _review_rows(i19.id))))
+
+        # ⑲ 收尾：本段定义与实例一律按 define id 级联清掉（不碰别人的数据）
+        await _purge19()
 
         # 清理本轮委托台账行（按显式 id，不碰别人的数据）
         conn = await adapter.acquire()

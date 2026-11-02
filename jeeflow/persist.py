@@ -457,7 +457,8 @@ class PersistPostInterceptor(FlowInterceptor):
         # 结束/网关等非任务节点只定稿状态，避免全量覆盖任务节点的只读/隐藏限制
         is_task = node.type in (TYPE_TASK, TYPE_CUSTOM)
         field_perm = self._resolve_field_permission(node) if is_task else None
-        data = self._extract_fields(instance, field_perm, not exists or is_task, not exists or is_task)
+        data = self._extract_fields(instance, field_perm, not exists or is_task,
+                                    not exists or is_task, node)
 
         # 状态字段：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列。
         # 任务节点写 DOING(10)——任务推进状态；结束节点写实例最终状态（FINISHED/REJECT）
@@ -500,13 +501,25 @@ class PersistPostInterceptor(FlowInterceptor):
         return True
 
     def _extract_fields(self, instance: ProcessInstance, field_perm: Optional[dict],
-                        include_task_fields: bool, include_form_fields: bool) -> dict[str, Any]:
+                        include_task_fields: bool, include_form_fields: bool,
+                        node=None) -> dict[str, Any]:
         """提取字段：f_ 去前缀（SYNC 下按字段权限过滤——只读/隐藏不更新；
         include_form_fields=False 时不带出，用于非任务节点定稿避免覆盖只读限制）；
-        tf_ 去前缀冗余（有列则写，列过滤由 writer 做）。"""
+        tf_ 去前缀冗余（有列则写，列过滤由 writer 做）。
+
+        ⚠️ **tf_ 那一半的取数源改过**（后加签轮的根因条款，规范 04「流程变量约定」末注）：
+        ``tf_*`` 控制键不再进实例变量（跨请求复活的病根，``ProcessInstance.complete_task``
+        与 ``engine._merge_exec_into_instance`` 两道闸都挡），于是这里改读
+        **该节点最近办结那条任务行的变量**——那本就是控制类留痕的唯一真源（契约原文：
+        「控制键只落该次提交的任务行变量」）。实例变量留作兜底：发起参数是整包落实例的
+        （``ProcessInstance.create`` 抄 args，java 同档），那里带来的 ``tf_`` 仍旧可用。
+        两侧同键时**行侧赢**：它是本次提交的新鲜值，实例侧那份是发起时的旧值。
+        """
         prefix = self.field_prefix or "f_"
         task_prefix = self.task_field_prefix or "tf_"
         data: dict[str, Any] = {}
+        task_vars = (self._node_task_vars(instance, node)
+                     if include_task_fields and node is not None else {})
         for k, v in instance.variables.items():
             if include_form_fields and k.startswith(prefix) and len(k) > len(prefix):
                 name = k[len(prefix):]
@@ -514,8 +527,32 @@ class PersistPostInterceptor(FlowInterceptor):
                     continue
                 data[name] = v
             elif include_task_fields and k.startswith(task_prefix) and len(k) > len(task_prefix):
+                if k in task_vars:
+                    continue  # 行侧有更新鲜的那一份，下面统一覆盖
                 data[k[len(task_prefix):]] = v
+        if include_task_fields:
+            for k, v in task_vars.items():
+                if k.startswith(task_prefix) and len(k) > len(task_prefix):
+                    data[k[len(task_prefix):]] = v
         return data
+
+    @staticmethod
+    def _node_task_vars(instance: ProcessInstance, node) -> dict[str, Any]:
+        """``node`` 上**最近办结那条任务行**的变量；本节点没有已办结行 ⇒ 空表。
+
+        取"最近"而不是"任一条"：会签/多选加签一个节点有多行，业务表的审批意见列只能承载
+        最后一次提交的那份读数（与改前"实例变量＝本次执行上下文"的读数档位一致）。
+        """
+        if instance is None or node is None:
+            return {}
+        rows = [t for t in (getattr(instance, "tasks", None) or [])
+                if t.taskName == node.id and not t.is_doing()]
+        if not rows:
+            return {}
+        timed = [t for t in rows if getattr(t, "finishTime", None) is not None]
+        picked = (max(timed, key=lambda t: t.finishTime) if timed
+                  else max(rows, key=lambda t: t.id or 0))
+        return picked.variables or {}
 
     def _resolve_field_permission(self, node) -> Optional[dict]:
         """任务节点字段权限（node.properties.field 的 PERMISSION_x；缺省 None=全部可编辑）"""

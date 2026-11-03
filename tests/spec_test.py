@@ -1757,10 +1757,24 @@ async def test_facade_execute_submit_type_behavior():
     jn = await _start_multi_task_at(facade, repo, "task2")
     t2n = await _doing_task_id(repo, jn, "task2")
     await repo.add_task_actor(t2n, ["manager"])
+    rows_jn = len((await repo.find_instance_by_id(jn)).tasks)
     jr = await facade.flow("processTask/execute",
                            {"processTaskId": t2n, "operator": "manager", "submitType": 4, "taskName": "no-such-node"})
     assert jr["code"] == 99999999, jr
     assert "无法找到节点模型" in str(jr["msg"]), jr["msg"]
+    # issues/243 §8-2：命名跳转的节点存在性判据已上提到 _prepare_execute_task（内含 complete_task +
+    # update_task）**之前** ⇒ 报错那一次零写入。修前这一格是红的：t2n 被静默办结、办理人的待办就此
+    # 消失（真库外层有动作级事务整笔回滚，两种位序都观察不到差别 ⇒ 这一档只有内存仓储照得出来，
+    # 与 243 甲案血缘守卫同一规矩）。
+    assert await _doing_task_id(repo, jn, "task2") == t2n, \
+        "报错后原任务必须还是那条待办（零写入：既没被办结，也没有新建的行）"
+    still_jn = await repo.find_task_by_id(t2n)
+    assert still_jn is not None and still_jn.taskState == TaskState.DOING, \
+        f"失败的 JUMP 不得改写当前行状态，实得 {still_jn and still_jn.taskState}"
+    assert (await repo.find_instance_by_id(jn)).state == InstanceState.DOING, \
+        "失败的 JUMP 不得改实例状态"
+    assert len((await repo.find_instance_by_id(jn)).tasks) == rows_jn, \
+        "报错不建单：实例下任务行总数不变"
 
     # ── submitType=5 RE_APPLY：task1 重新提交（前端 detail 抽屉场景，含 f_ 表单 + tf_nextNodeOperator）
     ra = await _start_multi_task_at(facade, repo, "task1")

@@ -200,8 +200,19 @@ async def test_i230_jump_family_rows_and_explicit_error():
     df3 = load_flow(repo3, "02-multi-task.json")
     inst3 = await eng3.start_process_instance_by_id(df3.id, "alice", {})
     apply3 = await pick(repo3, inst3.id, "apply")
+    rows3 = len((await repo3.find_instance_by_id(inst3.id)).tasks)
     with pytest.raises(Exception, match=r"根据节点名称\[nope\]无法找到节点模型"):
         await eng3.execute_and_jump_task(apply3.id, "alice", {}, "nope")
+    # issues/243 §8-2：引擎直调那一档同样零写入——判据排在 _prepare_execute_task（内含
+    # complete_task + update_task）之前 ⇒ 当前行仍是报错那一条 DOING 待办、实例不进终态、不建单。
+    doing3 = await repo3.find_doing_tasks(inst3.id)
+    assert [t.id for t in doing3] == [apply3.id], \
+        "报错零写入：待办必须还是 apply3 那一条，不是新建的行也不该消失：%r" % [
+            (t.id, t.taskName, t.taskState) for t in doing3]
+    assert int((await repo3.find_instance_by_id(inst3.id)).state) == int(InstanceState.DOING), \
+        "失败的 JUMP 不得把实例推进到终态"
+    assert len((await repo3.find_instance_by_id(inst3.id)).tasks) == rows3, \
+        "报错不建单：实例下任务行总数不变"
 
 
 @pytest.mark.asyncio

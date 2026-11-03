@@ -80,6 +80,11 @@ KEY_CUSTOM_RETURN_VAL = "custom_return_val"
 ERR_ROLLBACK_NO_LINEAGE = "上一步任务ID为空，无法驳回至上一步处理"
 ERR_ROLLBACK_GUARD = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
 
+# ─── 命名跳转（submitType=4，target_task_name 非空那一支）的对外文案（issues/79 立、243 §8-2 搬前置）─
+# 逐字不变（渲染后仍是 ``根据节点名称[X]无法找到节点模型``，X＝传入的目标节点名）、不含引擎内部码；
+# 单点定义：``_check_jump_target_exists``（办结之前的前置守卫）与跳转腿（过了守卫之后的兜底）共用这一句。
+ERR_JUMP_NODE_NOT_FOUND = "根据节点名称[{0}]无法找到节点模型"
+
 # ─── 事件分档（spec 11-events §11.3 码 5/6 互斥判据）──────────────────────────────
 
 #: 归入 TASK_REJECT（码 6）的 submitType 档：拒绝 / 退上一步 / 退发起人 / 会签软拒绝。
@@ -644,6 +649,9 @@ class EngineImpl(Engine):
         # （真库外层有事务整笔回滚，照不出这一档）。与后加签写入口四判据同一规矩：判据前置＝零写入。
         if not target_task_name:
             await self._check_rollback_possible(_pre)
+        else:
+            # issues/243 §8-2：命名跳转的「找不到节点模型」与血缘守卫同族同规矩 ⇒ 同一位序前置。
+            await self._check_jump_target_exists(_pre, target_task_name)
         # 空 target＝血缘回退（spec §11.3 码 6 的"退回"族）；命名 target＝跳转（码 5 族）
         # spec §11.7 边界 2：ROLLBACK / JUMP 两档都不挂 cc 钩子（显式 None，同 go :228）
         task, inst, flow, vars_ = await self._prepare_execute_task(
@@ -657,9 +665,12 @@ class EngineImpl(Engine):
             await self._rollback_to_parent(flow, inst, task, operator)
         else:
             # issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
+            # issues/243 §8-2 起这句判据已由 ``_check_jump_target_exists`` 排在办结之前报掉。本行按
+            # 参考实现（jeeflow-java 35f0aca）原样留着作兜底：两处读的是同一份 define.content，守卫
+            # 放行后这里拿得到节点；万一仍为 None，抛的也还是同一句文案（不新增第二种错、不动码位）。
             target = _find_node(flow, target_task_name)
             if target is None:
-                raise ValueError(f"根据节点名称[{target_task_name}]无法找到节点模型")
+                raise ValueError(ERR_JUMP_NODE_NOT_FOUND.format(target_task_name))
             # 对齐 Java isFirstTaskName：跳首任务节点（start 直接后继）assignee 强制为发起人
             if target.type == TYPE_TASK and self._is_first_task_node(flow, target):
                 target.properties["assignee"] = inst.operator
@@ -822,6 +833,32 @@ class EngineImpl(Engine):
         if define is None:
             return
         await self._check_rejectable(parse_flow_model(json.loads(define.content)), current)
+
+    async def _check_jump_target_exists(self, current: Optional[ProcessTask],
+                                        target_task_name: str) -> None:
+        """命名跳转（``target_task_name`` 非空那一支）的节点存在性**写前置**守卫（issues/243 §8-2）。
+
+        与 :meth:`_check_rollback_possible` 同族同规矩：从前「根据节点名称[X]无法找到节点模型」这句是
+        排在 :meth:`_prepare_execute_task`（内部 ``complete_task`` + ``update_task`` 把当前行办结）**之后**
+        才抛的 ⇒ 本栈内存仓储无回滚，节点名写错一次就把办理人的待办凭空弄丢。真库外层有动作级事务整笔
+        回滚，两种位序都观察不到差别 ⇒ 这一档同样只有内存仓储照得出来。
+
+        本方法**纯读**（只 find_instance/find_define + 解析模型），不写任务行、不写实例、不 fire 事件、
+        不建历史行。取不到任务／不在进行中／取不到实例或定义 ⇒ 一律放行，由序言里 ``_load_and_check``
+        的既有固定错去报（那几档本就在办结之前）；这里不报"任务不存在／无权办理"，也不发明第二种文案——
+        抛的还是跳转腿原来那一句（单点常量 :data:`ERR_JUMP_NODE_NOT_FOUND`）。
+        与跳转腿各解析一次模型：罕见腿宁可多读一次仓储，也不把判据挪到写之后、更不把解析结果塞进共享状态。
+        """
+        if current is None or current.taskState != TaskState.DOING:
+            return
+        inst = await self.repo.find_instance_by_id(current.processInstanceId)
+        if inst is None:
+            return
+        define = await self.repo.find_define_by_id(inst.defineId)
+        if define is None:
+            return
+        if _find_node(parse_flow_model(json.loads(define.content)), target_task_name) is None:
+            raise ValueError(ERR_JUMP_NODE_NOT_FOUND.format(target_task_name))
 
     async def _check_rejectable(self, flow: FlowModel, task: ProcessTask) -> ProcessTask:
         """退回上一步的两道守卫（规范 04 · 退回上一步）：**只读判据，不碰任何状态**。

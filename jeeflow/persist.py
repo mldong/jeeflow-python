@@ -190,6 +190,19 @@ class JdbcDynamicTableWriter(DynamicTableWriter):
         cols = self._table_columns(table_name)
         return [c for c in columns if self._find_table_column(cols, c) is not None]
 
+    def table_exists(self, table_name: str) -> bool:
+        """业务表是否存在（纯读探测，缺失返回 False 而不是抛）。
+
+        ``_table_columns`` 只在"查不到任何列"时抛 ``ValueError``（表不存在／当前账号看不见）；
+        连接失败、权限拒绝等其它异常照常上抛——它们不是"缺表"，不该被这条静默面吞掉。
+        """
+        _check_table_name(table_name)
+        try:
+            self._table_columns(table_name)
+        except ValueError:
+            return False
+        return True
+
     def _build_insert(self, table_name: str, data: dict[str, Any]) -> tuple[str, list[Any]]:
         """组装 INSERT（列过滤 + 主键生成 + 方言占位符）——同步/异步两路共用。"""
         _check_table_name(table_name)
@@ -418,10 +431,25 @@ class PersistPostInterceptor(FlowInterceptor):
         table_name, persist_mode = await self._resolve_define(instance)
         if not table_name:
             return  # 未配置：静默跳过
+        if not self._table_ready(table_name):
+            # issues/245 拍板（2026-11-03 owner：静默就好、不做部署期校验）：定义指向的业务表不存在时
+            # **静默跳过** —— 不写、不报错、不阻断流程，与 java 参考实现同档
+            # （`JdbcDynamicTableWriter.insert` 列集为空 ⇒ `return null`）。
+            # 边界：只吞"表不存在"这一档；表在但写入失败（约束/类型/连接）仍按各栈原样上抛
+            # （issues/169 立的"不得静默丢写错"不因此放宽）。
+            return
         if str(persist_mode).upper() == PERSIST_MODE_SYNC:
             await self._handle_sync(node, instance, table_name)
             return
         await self._handle_archive(node, instance, table_name)
+
+    def _table_ready(self, table_name: str) -> bool:
+        """业务表是否可写（纯读探测）。自定义 writer 不提供 ``table_exists`` ⇒ 直接放行，
+        写腿自己的错照旧上抛（不为未知实现新增静默面）。"""
+        probe = getattr(self.writer, "table_exists", None)
+        if probe is None:
+            return True
+        return bool(probe(table_name))
 
     # ── ARCHIVE（现状：结束同意归档） ──
 

@@ -54,12 +54,13 @@ def setup_db():
     return conn, JdbcDynamicTableWriter(conn)
 
 
-def load_flow(repo: MemoryRepository, with_rel_table: bool = True) -> ProcessDefine:
+def load_flow(repo: MemoryRepository, with_rel_table: bool = True,
+              rel_table: str = "biz_leave") -> ProcessDefine:
     with open(os.path.join(FLOW_DIR, "01-simple.json"), "r", encoding="utf-8") as f:
         content = f.read()
     if with_rel_table:
         content = content.replace('"type": "approval"',
-                                  '"type": "approval", "relTableName": "biz_leave"', 1)
+                                  '"type": "approval", "relTableName": "%s"' % rel_table, 1)
     d = ProcessDefine(name="simple", displayName="01-simple.json", type="approval",
                       state=1, version=1, content=content)
     repo.add_define(d)
@@ -140,13 +141,19 @@ async def test_no_writer_skip():
 # ─── ④ 未配置 relTableName → 缺省回落流程 name，表不存在 → 显性报错（配置错误快速失败） ─
 
 @pytest.mark.asyncio
-async def test_no_table_name_rejects():
+async def test_no_table_name_falls_back_and_skips_silently():
+    """改判（issues/245，owner 2026-11-03「静默就好了，不用做那么严格的校验」）：
+    定义没配 relTableName ⇒ 回落流程名（此处 = 库里不存在的 `simple`）⇒ **静默跳过**：
+    不写、不报错、流程照常走完。旧断言钉的是"回落名查不到表 ⇒ 抛 ValueError"，已按拍板改判。
+    边界未松：表存在但写入失败仍上抛（由同文件其它 persist 负向格守着）。"""
     conn, writer = setup_db()
     repo = MemoryRepository()
     eng = setup_engine(repo, writer)
     df = load_flow(repo, False)
-    with pytest.raises(ValueError):
-        await _run_flow(eng, repo, df.id, True)
+    inst = await _run_flow(eng, repo, df.id, True)
+    got = await repo.find_instance_by_id(inst.id)
+    assert got.state == InstanceState.DONE, f"缺表不得阻断流程：实例状态实得 {got.state}"
+    assert writer.table_exists("simple") is False
     conn.close()
 
 
@@ -663,3 +670,21 @@ async def test_facade_listByType_and_topLevelJson():
     assert r["code"] == 0, r
     item_b = next(x for x in r["data"]["approval"] if x["name"] == "simple")
     assert item_b["processDefineState"] == 0, f"禁用定义 processDefineState 应为 0: {item_b}"
+
+
+@pytest.mark.asyncio
+async def test_i245_missing_business_table_skips_silently():
+    """issues/245 拍板（owner 2026-11-03「静默就好了，不用做那么严格的校验」）：
+    定义指向的业务表不存在 ⇒ **静默跳过**：不写、不报错、流程照常走完（与 java 同档）。
+
+    边界自证：只吞"表不存在"；表在但写入失败的档仍上抛（issues/169），不因本条放宽。"""
+    conn, writer = setup_db()
+    repo = MemoryRepository()
+    d = load_flow(repo, with_rel_table=True, rel_table="no_such_biz")
+    eng = setup_engine(repo, writer)
+
+    assert writer.table_exists("no_such_biz") is False
+    inst = await _run_flow(eng, repo, d.id)          # 改前：end 节点 persist 抛 ValueError
+
+    got = await repo.find_instance_by_id(inst.id)
+    assert got.state == InstanceState.DONE, f"缺表不得阻断流程：实例状态实得 {got.state}"

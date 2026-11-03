@@ -1624,7 +1624,15 @@ def _merge_exec_into_instance(base: dict, exec_vars: dict) -> dict:
 
 def _get_cs_state(vars_: dict, node_id: str):
     actors = vars_.get(f"operatorList_{node_id}")
-    lc = int(vars_.get(f"loopCounter_{node_id}", 0))
+    raw = vars_.get(f"loopCounter_{node_id}", 0)
+    try:
+        lc = int(raw)
+    except (TypeError, ValueError):
+        # issues/244-③：簿记被外部写坏（"abc"／list／dict）时不炸办理，按 0 处理——
+        # 与 go（坏值归 0）、node（parseInt 折 NaN 后判假）、java（getInt 默认值）同档。
+        # 同函数上方对 submitType 早有 try（cs_veto 那段），这处此前漏了：
+        # 改前 int("abc") 的 ValueError 落在 complete_task/update_task 之后（报错即脏态）。
+        lc = 0
     return actors, lc
 
 def _is_truthy(v) -> bool:

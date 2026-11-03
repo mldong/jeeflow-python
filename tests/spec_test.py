@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jeeflow import EngineImpl, MemoryRepository, EventType, ProcessEvent, FlowInterceptor, EngineExtensions
-from jeeflow.engine import KEY_AUTO_GEN_TITLE, KEY_CC_ACTORS
+from jeeflow.engine import KEY_AUTO_GEN_TITLE, KEY_CC_ACTORS, _get_cs_state
 from jeeflow.facade import JeeflowFacade
 from jeeflow.memory import MemoryExtRepository
 from jeeflow.repository.ext import JdbcProcessExtRepository
@@ -4685,6 +4685,39 @@ async def test_surrogate_applies_on_sequential_countersign_advance():
         f"条款 1.3：代理人不得进投票名册: {second[0].variables.get('operatorList_cs')}"
     assert second[0].variables.get("nrOfInstances_cs") == 2, \
         f"条款 1.3：票数不得因代理人改变: {second[0].variables.get('nrOfInstances_cs')}"
+
+
+# ─── issues/244-③：串行会签簿记被写坏时不得炸办理 ─────────────────────────────
+
+def test_i244_get_cs_state_falls_back_on_bad_loop_counter():
+    """坏簿记的三档取值：非数字串／非标量 ⇒ 按 0；正常数字照旧。"""
+    assert _get_cs_state({"loopCounter_n1": "abc"}, "n1") == (None, 0)
+    assert _get_cs_state({"loopCounter_n1": ["x"]}, "n1") == (None, 0)
+    assert _get_cs_state({"loopCounter_n1": {"x": 1}}, "n1") == (None, 0)
+    assert _get_cs_state({"loopCounter_n1": 2}, "n1") == (None, 2)
+    assert _get_cs_state({}, "n1") == (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_i244_bad_loop_counter_does_not_abort_countersign_advance():
+    """串行会签推进时 loopCounter 被外部写坏 ⇒ 不抛 ValueError（改前 ValueError 落在办结之后）、
+    按 0 处理继续推进——与 go 归 0／node 折 NaN／java 默认值同档。"""
+    content = _flow_json([("cs", "bad-zhang,bad-wang", "SEQUENTIAL")], name="i244bad")
+    eng, repo, _ext, def_id = _surr_harness("i244bad", content)
+
+    inst = await eng.start_process_instance_by_id(def_id, "boss1")
+    step1 = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "cs"][0]
+    step1.variables["loopCounter_cs"] = "abc"          # 模拟历史/外部污染
+    await repo.save_task(step1)
+
+    await eng.execute_process_task(step1.id, "bad-zhang")   # 改前：ValueError: invalid literal for int()
+
+    doing = [t for t in await repo.find_doing_tasks(inst.id) if t.taskName == "cs"]
+    assert len(doing) == 1, f"坏簿记按 0 处理后应推进出 1 条待办，实得 {len(doing)}"
+    assert str(doing[0].variables.get("loopCounter_cs")) == "1", \
+        f"推进位应按 0+1 落库: {doing[0].variables.get('loopCounter_cs')}"
+    assert await repo.find_task_actors(doing[0].id) == ["bad-wang"], \
+        f"下一位应为名册第 2 人: {await repo.find_task_actors(doing[0].id)}"
 
 
 # ─── 条款 1.4 判别力：打乱 id 序的夹具，内存仓侧（SQL 仓侧见 jdbc_test ⑯）───────

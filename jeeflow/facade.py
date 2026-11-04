@@ -19,11 +19,14 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+from . import collect as _collect
+from . import add_sign as _add_sign
 from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_ACTORS_START,
                      KEY_NEXT_NODE_OPERATOR,
                      KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
-from .model import ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate, TaskState, InstanceState, ERR_EXIST_UN_FINISH_INSTANCE
+from .model import (FlowNode, ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate,
+                    TaskState, InstanceState, ERR_EXIST_UN_FINISH_INSTANCE, parse_flow_model)
 from .reapply import VAR_BRANCH_CTX, VAR_REAPPLY_CTX
 
 # 任务行 ext 的「引擎控制键」集合（issues/121 P1 判据体）：行级首节点标记 ＋ spec 04 的
@@ -569,6 +572,12 @@ class JeeflowFacade:
         submit_type = self._to_int(args.get("submitType")) or SUBMIT_AGREE
         flow_args = {k: v for k, v in args.items() if k not in ("processTaskId", "operator")}
         flow_args["submitType"] = submit_type
+        # ── 动态会签分流与闸门（issues/247）——判据全部排在任何状态变更之前 ──
+        collect = await self._try_dynamic_countersign(task_id, operator, flow_args)
+        if collect is not None:
+            # 征询模式带 tf_addSignOperators：只建成员行、不办结主办行（响应带 marker 供前端提示）
+            return collect
+        await self._gate_dynamic_countersign(task_id, flow_args)
         # boot3 execute 分发（spec §11.2）
         # audit8 R92：执行族四法现回传「本次动作产出的任务行」，而本动作一直不用返回值
         # （下面直接 ``return None``）⇒ 去掉 `inst =` 这条名不副实的绑定，HTTP 出口形状不动。
@@ -596,6 +605,162 @@ class JeeflowFacade:
         # 此前本栈在 engine.* **返回之后**、无事务包裹地在门面建 cc 行 ⇒ 直连引擎 API 的调用方
         # 传 tf_ccActors 不建行，且与 go/node/java 三栈形状不一致（本轮搬掉）。
         return None
+
+    # ── 已办撤回 / 动态会签（issues/246 ＋ 247）────────────────────────────────
+
+    async def _processTask_recall(self, args: dict) -> dict:
+        """已办撤回（issues/246，spec 06 §processTask/recall）：办理人撤回自己已办结的那一手，
+        同实例内复活重办。判据与落库全在引擎（``EngineImpl.recall_task``），
+        门面只做参数归一（operator 硬必填、主键档缺失响亮报错，绝不拿 ''/0 当 id 落库）
+        与信封包装。位序照 java taskRecall：operator 空判在前、主键缺失判在后。
+        """
+        operator = str(args.get("operator") or "").strip()
+        if not operator:
+            raise ValueError("operator 必填")
+        task_id = self._to_int(args.get("processTaskId"))
+        if not task_id:
+            raise ValueError("processTaskId 缺失")
+        resurrected = await self._engine.recall_task(task_id, operator)
+        return {"processTaskId": resurrected.id, "taskState": int(resurrected.taskState)}
+
+    async def _processTask_revokeDynamicCountersign(self, args: dict) -> dict:
+        """撤回动态会签（issues/247，spec 06 §processTask/revokeDynamicCountersign）：
+        废弃主办行下全部未答成员行，账本追加撤回条目；已交意见行原样保留；闸门自然恢复
+        （判据＝还有无 DOING 成员行）；轮次不消耗。独立 action，不进 execute 参数空间
+        （撤回不是办结动作）。位序照 java taskRevokeCountersign：operator 空判在前、
+        主键缺失判在后。参与人判断**按名册**（不能用只认 DOING 的 isAllowed——本栈
+        ``ProcessTask.is_allowed`` 只判名册、java 的还判 DOING；主办已办结时要放行，
+        故显式名册判断＋特权例外，待答判据随后兜底）。
+        """
+        operator = str(args.get("operator") or "").strip()
+        if not operator:
+            raise ValueError("operator 必填")
+        task_id = self._to_int(args.get("processTaskId"))
+        if not task_id:
+            raise ValueError("processTaskId 缺失")
+        reason = str(args.get("reason") or "")
+        host = await self._repo.find_task_by_id(task_id)
+        if host is None:
+            raise ValueError("任务不存在")
+        op_lower = operator.lower()
+        privileged = op_lower == KEY_AUTO_ID or op_lower == KEY_ADMIN_ID
+        if not privileged and operator not in (host.actorIds or []):
+            raise ValueError(_collect.MSG_NO_PERMISSION_REVOKE)
+        inst = await self._repo.find_instance_by_id(host.processInstanceId)
+        if inst is None:
+            raise ValueError("流程实例不存在")
+        def_ = await self._repo.find_define_by_id(inst.defineId)
+        if def_ is None:
+            raise ValueError("流程定义不存在")
+        flow = parse_flow_model(json.loads(def_.content))
+        node = next((n for n in flow.nodes if n.id == host.taskName), None)
+        if not _collect.node_enabled(node):
+            raise ValueError(_collect.MSG_NO_PENDING.format(host.taskName))
+        tasks = await self._repo.find_history_tasks(inst.id)
+        pending = _collect.pending_members(tasks, host)
+        if not pending:
+            raise ValueError(_collect.MSG_NO_PENDING.format(host.taskName))
+        now = datetime.now()
+        revoked_actors: list = []
+        for m in pending:
+            m.abandon(now)
+            m.updateUser = operator  # java abandon(operator) 同尺：update_user 回写真实撤回人
+            revoked_actors.append(m.actorIds[0] if m.actorIds else None)
+            await self._repo.update_task(m)
+        _collect.append_revoke_history(host, operator, revoked_actors,
+                                       _collect.last_round(host), reason)
+        await self._repo.update_task(host)
+        return {"revoked": len(revoked_actors), "actors": revoked_actors}
+
+    async def _try_dynamic_countersign(self, task_id: int, operator: str,
+                                       flow_args: dict) -> Optional[dict]:
+        """动态会签发起分流（issues/247，spec 04 · 动态会签）：征询节点带
+        ``tf_addSignOperators`` 的提交＝只建成员行、**不办结主办行**；返回响应 marker
+        （``data.dynamicCountersign``），非征询提交返回 ``None`` 走普通流转。
+        判据全排前（互斥/参与人/加给自己/重复/上限），报错即零写入。
+        逐字照 java ``JeeflowFacade.tryDynamicCountersign``（go 腿 facade/collect.go 同构）。"""
+        host = await self._repo.find_task_by_id(task_id)
+        if host is None or not host.is_doing():
+            return None
+        ops = _add_sign.operators(flow_args)
+        if not ops:
+            return None
+        inst = await self._repo.find_instance_by_id(host.processInstanceId)
+        if inst is None:
+            return None
+        def_ = await self._repo.find_define_by_id(inst.defineId)
+        if def_ is None:
+            return None
+        flow = parse_flow_model(json.loads(def_.content))
+        node = next((n for n in flow.nodes if n.id == host.taskName), None)
+        if not _collect.node_enabled(node):
+            return None
+        tasks = await self._repo.find_history_tasks(inst.id)
+        # 成员行不能冒充主办发起（拉人只限主办行）——放行给闸门腿报它的逐字文案
+        if _collect.is_member_row(tasks, host):
+            return None
+        # 互斥（与 tf_nextNodeOperator 同传＝死参数，报错不静默）
+        next_op = flow_args.get(KEY_NEXT_NODE_OPERATOR)
+        if next_op is not None and str(next_op).strip() != "":
+            raise ValueError(_add_sign.MSG_MUTEX)
+        # 操作人是主办参与人（host 已 DOING；java host.isAllowed＝DOING＋名册＋auto/admin 特权，
+        # 文案取 WfErrEnum.NOT_ALLOWED_EXECUTE 逐字，与 go 腿同判）
+        op_lower = (operator or "").lower()
+        if op_lower != KEY_AUTO_ID and op_lower != KEY_ADMIN_ID \
+                and operator not in (host.actorIds or []):
+            raise ValueError("当前参与者不能执行该流程任务")
+        round_no = _collect.last_round(host) + 1
+        max_rounds = _add_sign.node_max_rounds(node)
+        if max_rounds > 0 and round_no > max_rounds:
+            raise ValueError(_add_sign.MSG_MAX_ROUNDS.format(node.id, max_rounds))
+        reason = flow_args.get(_collect.KEY_ADD_SIGN_REASON)
+        reason = "" if reason is None else str(reason)
+        existing = _collect.member_rows(tasks, host)
+        for op in ops:
+            if op == operator:
+                raise ValueError(_add_sign.MSG_SELF)
+            for m in existing:
+                if m.is_doing() and op in (m.actorIds or []):
+                    raise ValueError(_collect.MSG_DUPLICATE.format(op, node.id))
+        # ── 判据全过：建成员行（同节点同名、parent＝主办行、轮次/原因/分支归属三戳）＋
+        # 落库逐行 fire 码 3；主办行盖轮次戳＋追加账本后 update_task（未办结＝征询挂起）──
+        await self._engine.create_collect_member_rows(flow, inst, node, host,
+                                                      operator, ops, round_no, reason)
+        _collect.append_collect_history(host, operator, ops, round_no, reason)
+        host.variables[_add_sign.VAR_ADD_SIGN_ROUND + "_" + node.id] = round_no
+        await self._repo.update_task(host)
+        total, submitted = _collect.member_counts(
+            await self._repo.find_history_tasks(inst.id), host)
+        return {"dynamicCountersign": {"round": round_no, "total": total,
+                                       "submitted": submitted}}
+
+    async def _gate_dynamic_countersign(self, task_id: int, flow_args: dict) -> None:
+        """动态会签闸门（issues/247）：征询节点上——主办行未收齐成员意见 ⇒ 逐字文案报错
+        （**挡全部 submitType，含驳回**；唯一出口＝processTask/revokeDynamicCountersign）；
+        成员行携带拉人参数 ⇒ 报错（拉人只限主办行）。非征询节点原样放行。
+        """
+        task = await self._repo.find_task_by_id(task_id)
+        if task is None or not task.is_doing():
+            return
+        inst = await self._repo.find_instance_by_id(task.processInstanceId)
+        if inst is None:
+            return
+        def_ = await self._repo.find_define_by_id(inst.defineId)
+        if def_ is None:
+            return
+        flow = parse_flow_model(json.loads(def_.content))
+        node = next((n for n in flow.nodes if n.id == task.taskName), None)
+        if not _collect.node_enabled(node):
+            return
+        tasks = await self._repo.find_history_tasks(inst.id)
+        if _collect.is_member_row(tasks, task):
+            if _add_sign.operators(flow_args):
+                raise ValueError(_collect.MSG_MEMBER_PULL)
+            return
+        # 收齐判据＝还有无 DOING 成员行（宽口径计数跳过撤回清场的 99 行）
+        if _collect.pending_members(tasks, task):
+            total, submitted = _collect.member_counts(tasks, task)
+            raise ValueError(_collect.MSG_PENDING.format(task.taskName, submitted, total))
 
     # ── 流程设计（需扩展仓储） ───────────────────────────────────────────────
 
@@ -1278,6 +1443,16 @@ class JeeflowFacade:
                                                "form": props.get("form"),
                                                "ext": props.get("field")}
                             break
+                    # 动态会签投影（issues/247，spec 06 §2.7）：征询主办行 ext.dynamicCountersign
+                    # ＝{active, round, total, submitted, actors}，从成员行现算（跳过 99 废弃行）、
+                    # 不落新存储——前端据此置灰执行按钮。解析失败按本栈既有 try/except 档静默
+                    # （java 同位 try-catch-ignored，detail 不因定义脏值炸掉）。
+                    flow_model = parse_flow_model(json.loads(def_.content))
+                    node = next((nm for nm in flow_model.nodes if nm.id == task.taskName), None)
+                    if node is not None and _collect.node_enabled(node):
+                        projection = _collect.build_projection(inst.tasks or [], task)
+                        if projection is not None:
+                            t_ext["dynamicCountersign"] = projection
                 except Exception:
                     pass
         return vo

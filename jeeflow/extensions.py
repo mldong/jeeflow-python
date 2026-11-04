@@ -18,18 +18,20 @@ class EventType(IntEnum):
 
     码 5..9 是本轮新增（spec §11.2 原则 2「码粗、载荷细」：号段只随**事实类别**增长，
     拒绝/跳转/退发起人共用 ``TASK_REJECT`` 靠载荷 ``submitType`` 分）。
-    **一个号一旦发出去不许改语义、不许复用**；10+ 预留（超时催办等，本轮不发）。
+    **一个号一旦发出去不许改语义、不许复用**；码 10（``TASK_RECALL``，issues/246
+    已办撤回）随 246 腿启用，11+ 预留（超时催办等，本轮不发）。
     """
 
     PROCESS_INSTANCE_START = 1   # 实例发起成功（sourceId＝instanceId）
     PROCESS_INSTANCE_END = 2     # 实例进入终态（办结/拒绝共用，靠载荷 state 分）
-    PROCESS_TASK_START = 3       # 新待办生成（含会签逐人、回退复活行）
+    PROCESS_TASK_START = 3       # 新待办生成（含会签逐人、回退复活行、已办撤回复活行）
     CC_CREATE = 4                # 新增一条抄送记录（逐抄送人 fire 一次）
     TASK_COMPLETE = 5            # 任务被办掉（同意/跳转/会签办理）
     TASK_REJECT = 6              # 任务被退回/拒绝（含退发起人、软拒绝、跳转回退）
     TASK_TRANSFER = 7            # 转办发生
     TASK_WITHDRAW = 8            # 撤回发生（实例进入 30）
     INSTANCE_TERMINATED = 9      # 实例被终止（40）
+    TASK_RECALL = 10             # 已办任务撤回发生（issues/246；撤回不是办结/拒绝，不补发 5/6）
 
     # ── 旧名兼容别名（issues/132 C 套迁移；同码即同物，别名成员与规范名指向同一个枚举成员）──
     # 旧 PROCESS_START→1 / PROCESS_FINISH·PROCESS_REJECT→2（spec §11.6：办结与拒绝合并成
@@ -40,8 +42,9 @@ class EventType(IntEnum):
     TASK_CREATE = 3
 
 
-#: 走 task 维度（sourceId＝taskId）的码（spec §11.3「sourceId 指向」列）
-_TASK_SCOPED_CODES = frozenset({3, 5, 6, 7})
+#: 走 task 维度（sourceId＝taskId）的码（spec §11.3「sourceId 指向」列；
+#: 10 ＝ 已办撤回，sourceId＝被撤回的旧行）
+_TASK_SCOPED_CODES = frozenset({3, 5, 6, 7, 10})
 
 
 @dataclass
@@ -118,6 +121,11 @@ class ProcessEvent:
         elif code == 9:
             d["operator"] = self.operator
             d["reason"] = self.reason
+        elif code == 10:
+            # 码 10（issues/246）：载荷 instanceId/taskId/operator，taskId＝被撤回的旧行；
+            # 只发 10 不补发 5/6（撤回不是办结也不是拒绝）
+            d["taskId"] = self.taskId
+            d["operator"] = self.operator
         if code in (3, 5, 6, 7) and self.taskName:
             d["taskName"] = self.taskName
         return d

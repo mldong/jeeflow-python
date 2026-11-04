@@ -69,12 +69,16 @@ _TIME_LAYOUT = "%Y-%m-%d %H:%M:%S"
 
 # ─── 节点属性解析（缺省不静默：非法值报配置错误）──────────────────────────────
 
-def parse_allow(value: Any, node_name: str) -> bool:
-    """解析 ``allowAddSign``：缺省 false；非布尔报配置错误，不得静默当缺省。
+def parse_allow(value: Any, node_name: str, key_name: Optional[str] = None) -> bool:
+    """解析布尔开关：缺省 false；非布尔报配置错误，不得静默当缺省。
 
     档位与 java 逐字同：``None``／空串／纯空白 ⇒ False；布尔原样；串 ``"true"``/``"FALSE"``
     （大小写不敏感，trim 后比）⇒ 真/假；**其余一律抛**——``1``/``"yes"`` 这类"看着像真"的值
     静默落回缺省，就是配置者以为开关开了、实际没有的那类排障地狱。
+
+    ``key_name``：报错文案里的属性键名（java ``AddSignSupport.parseAllow`` 的第三参同位）。
+    缺省回落 ``allowAddSign``（本开关自己的键）——issues/246/247 的 ``allowRecall``/
+    ``dynamicCountersign`` 走同一枚解析器，传各自的键名即可，文案键位逐字不串。
     """
     if value is None:
         return False
@@ -87,7 +91,7 @@ def parse_allow(value: Any, node_name: str) -> bool:
         return True
     if v.lower() == "false":
         return False
-    raise ValueError(MSG_ALLOW_ILLEGAL.format(node_name, PROP_ALLOW_ADD_SIGN, v))
+    raise ValueError(MSG_ALLOW_ILLEGAL.format(node_name, key_name or PROP_ALLOW_ADD_SIGN, v))
 
 
 def parse_max_rounds(value: Any, node_name: str) -> int:

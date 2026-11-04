@@ -462,10 +462,12 @@ _KNOWN_EDGE = {"id", "sourceNodeId", "targetNodeId", "properties", "text"}
 def parse_flow_model(raw: dict) -> FlowModel:
     """从 JSON dict 解析 FlowModel，过滤未知字段。
 
-    末尾那一刀是**解析期硬校验**（规范 02 §4.3）：后加签两开关的非法值、会签节点配
-    ``allowAddSign``、首任务节点配 ``allowAddSign`` 都在这一跳抛配置错误，不做运行时降级
-    ——静默跑下去会让配置者以为开关生效，实际两档推进闸各裁各的（java 那边同判据在
-    ``ModelParser.parse`` 末尾，本栈的解析单点就是本函数，位置等价）。
+    末尾那几刀是**解析期硬校验**：后加签（§4.3 两开关＋两条禁配）、已办撤回（§4.4
+    ``allowRecall`` 一开关＋两条禁配，issues/246）、动态会签（§4.4 ``dynamicCountersign``
+    一开关＋三条禁配，issues/247）都在这一跳抛配置错误，不做运行时降级——静默跑下去
+    会让配置者以为开关生效，实际各档推进闸各裁各的（java 那边同判据在 ``ModelParser.parse``
+    末尾按「后加签 → 已办撤回 → 动态会签」顺序三批连跑，本栈的解析单点就是本函数，
+    位置等价、批次顺序逐字同）。
     """
     nodes = [_parse_node(n) for n in raw.get("nodes", [])]
     edges = [_parse_edge(e) for e in raw.get("edges", [])]
@@ -480,10 +482,14 @@ def parse_flow_model(raw: dict) -> FlowModel:
         nodes=nodes,
         edges=edges,
     )
-    # 延迟 import：add_sign 顶层要 import 本模块（TYPE_TASK / TF_KEY_PREFIX），
+    # 延迟 import：add_sign/recall/collect 顶层要 import 本模块（TYPE_TASK / TYPE_START），
     # 顶层互指会成环；解析校验只在运行期发生，一帧延迟不影响判据强度。
     from .add_sign import validate_definition
     validate_definition(nodes, edges)
+    from .recall import validate_definition as _validate_recall_definition
+    _validate_recall_definition(nodes, edges)
+    from .collect import validate_definition as _validate_collect_definition
+    _validate_collect_definition(nodes, edges)
     return model
 
 

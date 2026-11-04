@@ -2313,13 +2313,14 @@ def _is_subsequence(want: list, got: list) -> bool:
 @pytest.mark.asyncio
 async def test_event_codes_are_a_set_integers():
     """spec §11.3/§11.6：本栈从 C 套字符串名整型化到 A 套 1..9（1/2/3 不变，4 号位由 Java
-    死码 PROCESS_TASK_END 让位给 CC_CREATE，5..9 本轮新增）。旧名以**同码别名**保留兼容。"""
+    死码 PROCESS_TASK_END 让位给 CC_CREATE，5..9 本轮新增）。旧名以**同码别名**保留兼容。
+    issues/246：码 10 TASK_RECALL（已办撤回）随 246 腿启用（spec 11 码表现读）。"""
     assert {e.name: int(e) for e in EventType} == {
         "PROCESS_INSTANCE_START": 1, "PROCESS_INSTANCE_END": 2, "PROCESS_TASK_START": 3,
         "CC_CREATE": 4, "TASK_COMPLETE": 5, "TASK_REJECT": 6, "TASK_TRANSFER": 7,
-        "TASK_WITHDRAW": 8, "INSTANCE_TERMINATED": 9,
+        "TASK_WITHDRAW": 8, "INSTANCE_TERMINATED": 9, "TASK_RECALL": 10,
     }
-    assert [int(e) for e in EventType] == [1, 2, 3, 4, 5, 6, 7, 8, 9]  # 别名不进成员表
+    assert [int(e) for e in EventType] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # 别名不进成员表
     # 旧名兼容别名＝同一个成员（集成层旧代码 EventType.TASK_CREATE 仍可用）
     assert EventType.PROCESS_START is EventType.PROCESS_INSTANCE_START
     assert EventType.TASK_CREATE is EventType.PROCESS_TASK_START

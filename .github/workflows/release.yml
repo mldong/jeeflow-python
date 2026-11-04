@@ -43,9 +43,17 @@ jobs:
             echo "等待 PyPI 分发（当前 $code，剩余 $(( (deadline - $(date +%s)) / 60 ))min）"
             sleep 30
           done
-          pip install --disable-pip-version-check --no-cache-dir --pre "jeeflow==${v}" \
-            --index-url https://pypi.org/simple/ 2>/dev/null \
-            || { sleep 30; pip install --disable-pip-version-check --no-cache-dir --pre "jeeflow==${v}" \
-                 --index-url https://pypi.org/simple/; }   # JSON 已 200 仍可能差一轮索引同步，重试一次
+          # JSON API 已 200 ≠ simple 索引已分发（v1.8.57 实弹：31s 单次重试不够，发布成功却被这条腿报红）。
+          # 与上面的 curl 环同设计：轮询到时限为止，超时才红。
+          deadline2=$(( $(date +%s) + 900 ))   # 15 min
+          until pip install --disable-pip-version-check --no-cache-dir --pre "jeeflow==${v}" \
+                  --index-url https://pypi.org/simple/ >/dev/null 2>&1; do
+            if [ "$(date +%s)" -ge "$deadline2" ]; then
+              echo "::error::JSON 已 200 但 pip 15min 仍装不到 jeeflow==${v}（simple 索引未分发），别当已发版"
+              exit 1
+            fi
+            echo "等待 PyPI simple 索引分发（剩余 $(( (deadline2 - $(date +%s)) / 60 ))min）"
+            sleep 30
+          done
           python -c "import jeeflow, importlib.metadata as m; print('✅ import 成功，版本', m.version('jeeflow'))"
 

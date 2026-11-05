@@ -8,6 +8,9 @@ from .spi import (ProcessRepository, UserProvider, IDGenerator, ExpressionEvalua
                   normalize_actors, normalize_cc_actors, normalize_actor_value, require_present_id,
                   actor_delete_forms)
 from .default_evaluator import DefaultExpressionEvaluator, evaluate_builtin
+from .action_permission import (ActionPermissionProvider, DefaultActionPermissionProvider,
+                                set_action_permission_provider, get_action_permission_provider,
+                                permission_codes, action_permission_provider_meta)
 from .builtin import (register_builtin_assignments, OperatorAssignmentHandler, FormFieldAssigneeHandler,
                       DeptLeaderAssignmentHandler, DeptMainLeaderAssignmentHandler,
                       ApplicantDeptLeaderAssignmentHandler, ApplicantDeptMainLeaderAssignmentHandler,

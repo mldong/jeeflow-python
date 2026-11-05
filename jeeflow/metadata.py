@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .action_permission import action_permission_provider_meta
+
 # ─── 枚举字典 ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -99,16 +101,28 @@ BUILTIN_ASSIGNMENT_METAS: list[HandlerMeta] = [
 ]
 
 
+# issues/29（hub issues/248 跨语言续腿）：action 权限码映射 SPI 进内置清单
+# （类型名/类名串取自 ``action_permission_provider_meta``，与 java HandlerRegistry
+# ／go ／c# ／rust 的登记逐字一致；集成方可覆盖注册）
+_ACTION_PERM_TYPE, _ACTION_PERM_CLASS = action_permission_provider_meta()
+BUILTIN_ACTION_PERMISSION_METAS: list[HandlerMeta] = [
+    HandlerMeta(type=_ACTION_PERM_TYPE, className=_ACTION_PERM_CLASS,
+                displayName="action 权限码默认映射（boot3 注解语义归纳）", order=0),
+]
+
+
 class HandlerRegistry:
     """处理器注册中心（可选能力：不注册不影响引擎加载行为）
 
     构造即内置 7 个通用 AssignmentHandler 元数据（v1.6.0 issues/16，
-    注册名与 Java 类全限定名一致，四语言通用）。
+    注册名与 Java 类全限定名一致，四语言通用）＋ 1 条 ActionPermissionProvider
+    内置默认件元数据（issues/29）。
     """
 
     def __init__(self):
         self._handlers: dict[str, list[HandlerMeta]] = {}
         self.register_all(BUILTIN_ASSIGNMENT_METAS)
+        self.register_all(BUILTIN_ACTION_PERMISSION_METAS)
 
     def register(self, meta: HandlerMeta) -> None:
         self._handlers.setdefault(meta.type, []).append(meta)

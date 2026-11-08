@@ -320,6 +320,10 @@ class MemoryRepository(ProcessRepository):
         inst = self._instances.get(t.processInstanceId)
         if inst:
             row.instanceCreateTime = inst.createTime
+            # issues/250：与 repository/base.py 的 `pi.state AS instance_state` 投影对齐
+            # （spec 06 §4.5 条款 6「同栈两仓同答案」）。取**读这一刻**的实例态，不是建单快照：
+            # 实例办结后已办行的 taskState 仍是 20，前端要靠这一格把撤回按钮置灰。
+            row.instanceState = int(inst.state)
             # 与 repository/base.py 的 `pi.variable AS instance_variable` 投影对齐（spec 06 §4.5
             # 条款 6「同栈两仓同答案」）：issues/82-3 那条「任务变量只剩控制键 ⇒ ext 回退实例
             # 变量」的回退目标就是这一列。此前内存仓漏映射 ⇒ 门面级用例只能断言容器是 dict，
@@ -914,6 +918,10 @@ class MemoryExtRepository(ProcessExtRepository):
         inst = self._instances.get(t.processInstanceId)
         if inst:
             row.instanceCreateTime = inst.createTime
+            # issues/250：与 repository/base.py 的 `pi.state AS instance_state` 投影对齐
+            # （spec 06 §4.5 条款 6「同栈两仓同答案」）。取**读这一刻**的实例态，不是建单快照：
+            # 实例办结后已办行的 taskState 仍是 20，前端要靠这一格把撤回按钮置灰。
+            row.instanceState = int(inst.state)
             # 与 repository/base.py 的 `pi.variable AS instance_variable` 投影对齐（spec 06 §4.5
             # 条款 6「同栈两仓同答案」）：issues/82-3 那条「任务变量只剩控制键 ⇒ ext 回退实例
             # 变量」的回退目标就是这一列。此前内存仓漏映射 ⇒ 门面级用例只能断言容器是 dict，

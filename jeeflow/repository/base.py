@@ -777,7 +777,10 @@ class JdbcRepository(ProcessRepository):
         cols = ("DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type,"
                 " t.perform_type, t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key,"
                 " t.task_parent_id, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,"
-                " pd.name, pd.display_name, pd.version, pi.variable, pi.create_time")
+                " pd.name, pd.display_name, pd.version, pi.variable, pi.create_time,"
+                # issues/250：实例态随行投出（pi 关联本来就在，不新增 JOIN）。待办/已办共用
+                # 这一条 dataSql ⇒ 两张列表都带；countSql 不动（投影不影响计数）。
+                " pi.state AS instance_state")
         async with self._conn() as conn:
             row = await conn.fetchone(self._sql("SELECT COUNT(DISTINCT t.id)" + where),
                                       (filter_val, *cond_args))
@@ -941,7 +944,10 @@ class JdbcRepository(ProcessRepository):
             variables=variables, createTime=r[13], createUser=_user_str(r[14]),
             updateTime=r[15], updateUser=_user_str(r[16]),
             processDefineName=r[17], processDefineDisplayName=r[18],
-            defineVersion=r[19] or 0, instanceVariable=r[20] or "", instanceCreateTime=r[21])
+            defineVersion=r[19] or 0, instanceVariable=r[20] or "", instanceCreateTime=r[21],
+            # issues/250：pi.state AS instance_state（第 23 列）。NULL（孤儿任务行）归 0，
+            # 与 java `rs.getInt("instance_state")` 同形；正常行就是实例态原值。
+            instanceState=int(r[22] or 0))
 
 
 def _user_str(v):

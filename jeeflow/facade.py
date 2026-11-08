@@ -2266,6 +2266,9 @@ class JeeflowFacade:
                 "processDefineName": r.processDefineName,
                 "processDefineDisplayName": r.processDefineDisplayName,
                 "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
+                # issues/250：所属流程实例的 state（camelCase 出口，待办/已办共用这一处）。
+                # 前端拿它把「实例已结束的已办行」撤回按钮置灰；引擎侧不据此改任何撤回判据。
+                "instanceState": int(r.instanceState) if r.instanceState is not None else None,
                 "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion,
                 "taskFormData": self._form_data_of(ext, "tf_")}  # issues/15
 

@@ -577,6 +577,11 @@ class TaskRow:
     defineVersion: int = 0
     instanceVariable: str = ""
     instanceCreateTime: Any = None
+    # issues/250：所属流程实例的 state（10 进行中 / 20 已完成 / 30 撤回 / 40 终止 / 45 拒绝 /
+    # 50 挂起 / 99 废弃）。前端据此把「实例已结束的已办行」撤回按钮置灰——任务行自身的
+    # taskState 照不出这一格（实例办结后已办行仍是 20）。来源＝列表查询既有的 pi 关联，
+    # SQL 别名 instance_state；不新增关联、不参与任何撤回判据。
+    instanceState: Optional[int] = None
 
 
 # ─── 统计查询 DTO（v1.8.25，issues/103） ─────────────────────────────────────

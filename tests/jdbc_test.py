@@ -1458,6 +1458,82 @@ async def main():
         # ⑲ 收尾：本段定义与实例一律按 define id 级联清掉（不碰别人的数据）
         await _purge19()
 
+        # ── ⑳ issues/250：任务行必须投出「所属流程实例的状态」instanceState（**真 SQL 腿**）─────
+        # 承重理由：java 侧实测把 dataSql 的 `pi.state AS instance_state` 与 mapTaskRow 那一读摘掉后，
+        # 内存仓那 66 格**全绿**、只有真库腿报红（issues/249 同形教训）⇒ 内存仓断言证不了 SQL 投影。
+        # 三格合起来挡「恒 10 / 恒 20 / 恒 None / 拿 taskState 冒充」：① 实例进行中 ⇒ 待办行 10；
+        # ①b 两态分离格（申请行已办结 20 而实例仍 10）⇒ 已办行 instanceState 仍是 10；
+        # ② 末节点办结使实例变 20 之后 ⇒ 已办行 taskState 仍 20、instanceState 必须 20
+        # （前端据此把撤回按钮置灰）。
+        # 断言形状纪律：实例态直查 wf_process_instance.state 取证；列表行按 processInstanceId／taskId
+        # 认领（leader 的待办/已办里还有前面各段留下的单，不认领会读到别人的行）。本段实例挂 DEFINE_ID，
+        # 随收尾 cleanup 级联清掉，不新增 id 段。
+        inst250 = await eng.start_process_instance_by_id(DEFINE_ID, "zhangsan",
+                                                       {"BUSINESS_NO": f"BIZ-{DB}-250"})
+        _apply250, task250 = await _to_task1(inst250.id, tag="⑳")
+        _st250 = int((await _one("SELECT state FROM wf_process_instance WHERE id=?", [inst250.id]))[0])
+        check("⑳ 前置：真库实例进行中（state=10）", _st250 == 10, str(_st250))
+
+        todo250, _ = await repo.page_todo_tasks(1, 100, "leader")
+        mine250 = [t for t in todo250 if t.processInstanceId == inst250.id]
+        check("⑳ 正向对照：leader 待办里有本单（否则下面几格恒真空）", len(mine250) == 1,
+              str([t.id for t in todo250]))
+        check("⑳ 实例进行中 ⇒ SQL 待办行 instanceState=10（pi.state AS instance_state 真投出来了）",
+              len(mine250) == 1 and mine250[0].instanceState is not None
+              and int(mine250[0].instanceState) == 10,
+              str(mine250[0].instanceState if mine250 else None))
+        r = await facade_bc.flow("processTask/todoList", {"operator": "leader", "pageSize": 100})
+        d250 = [x for x in ((r.get("data") or {}).get("rows") or [])
+                if int(x["processInstanceId"]) == inst250.id]
+        check("⑳ 门面 todoList 出口投出 camelCase 键 instanceState=10（整数，不是串/不是 None）",
+              r["code"] == 0 and len(d250) == 1 and isinstance(d250[0].get("instanceState"), int)
+              and d250[0]["instanceState"] == 10,
+              str(d250[0].get("instanceState") if d250 else r))
+
+        # ⑳.3 第三格（挡「拿 taskState 冒充 instanceState」）：上面两格里任务态与实例态恰好重合
+        # （待办 10/10、办结后 20/20），冒充假绿能全过。此刻申请节点已办结(20) 而实例仍在进行中(10)
+        # ⇒ zhangsan 的已办行必须 taskState=20 且 instanceState=10，两态在这一格**分离**。
+        applydone250, _ = await repo.page_done_tasks(1, 100, "zhangsan")
+        amine250 = [t for t in applydone250 if t.processInstanceId == inst250.id and t.id == _apply250.id]
+        check("⑳ 两态分离格：实例仍进行中 ⇒ 已办申请行 taskState=20 而 instanceState=10"
+              "（挡「instanceState 拿 taskState 冒充」与「恒 20」）",
+              len(amine250) == 1 and int(amine250[0].taskState) == 20
+              and amine250[0].instanceState is not None and int(amine250[0].instanceState) == 10,
+              str((int(amine250[0].taskState), amine250[0].instanceState) if amine250 else None))
+        r = await facade_bc.flow("processTask/doneList", {"operator": "zhangsan", "pageSize": 100})
+        a250 = [x for x in ((r.get("data") or {}).get("rows") or [])
+                if int(x["processInstanceId"]) == inst250.id and int(x["id"]) == _apply250.id]
+        check("⑳ 门面 doneList 出口同一格：taskState=20 / instanceState=10（实例未结束，撤回不该置灰）",
+              r["code"] == 0 and len(a250) == 1 and a250[0].get("taskState") == 20
+              and a250[0].get("instanceState") == 10,
+              str({k: a250[0].get(k) for k in ("taskState", "instanceState")} if a250 else r))
+
+        # 末节点办结 ⇒ 实例 20。这一格任务态与实例态重合（都 20），故必须有上面那格 10 做对照，
+        # 否则「恒 20」与「拿 taskState 冒充 instanceState」两种假绿都照不出来。
+        r = await facade_bc.flow("processTask/execute", {"processTaskId": task250.id,
+                                                       "operator": "leader", "submitType": 1})
+        check("⑳ 末节点办结成功", r["code"] == 0, str(r))
+        _st250 = int((await _one("SELECT state FROM wf_process_instance WHERE id=?", [inst250.id]))[0])
+        check("⑳ 前置：真库实例已完成（state=20）", _st250 == 20, str(_st250))
+        done250, _ = await repo.page_done_tasks(1, 100, "leader")
+        dmine250 = [t for t in done250 if t.processInstanceId == inst250.id and t.id == task250.id]
+        check("⑳ 正向对照：leader 已办里有本单末节点行", len(dmine250) == 1,
+              str([(t.id, t.taskName) for t in done250]))
+        check("⑳ 前置：已办行自身 taskState 仍是 20（任务态照不出实例态这一格）",
+              len(dmine250) == 1 and int(dmine250[0].taskState) == 20,
+              str(int(dmine250[0].taskState) if dmine250 else None))
+        check("⑳ 实例已结束 ⇒ SQL 已办行 instanceState=20（不是恒 10、不是 None）",
+              len(dmine250) == 1 and dmine250[0].instanceState is not None
+              and int(dmine250[0].instanceState) == 20,
+              str(dmine250[0].instanceState if dmine250 else None))
+        r = await facade_bc.flow("processTask/doneList", {"operator": "leader", "pageSize": 100})
+        f250 = [x for x in ((r.get("data") or {}).get("rows") or [])
+                if int(x["processInstanceId"]) == inst250.id and int(x["id"]) == task250.id]
+        check("⑳ 门面 doneList 出口 taskState=20 且 instanceState=20（前端置灰的取数口）",
+              r["code"] == 0 and len(f250) == 1 and f250[0].get("taskState") == 20
+              and f250[0].get("instanceState") == 20,
+              str({k: f250[0].get(k) for k in ("taskState", "instanceState")} if f250 else r))
+
         # 清理本轮委托台账行（按显式 id，不碰别人的数据）
         conn = await adapter.acquire()
         try:

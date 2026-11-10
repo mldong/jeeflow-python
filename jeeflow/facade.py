@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from . import collect as _collect
+from . import recall as _rc
 from . import add_sign as _add_sign
 from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_ACTORS_START,
                      KEY_NEXT_NODE_OPERATOR,
@@ -2255,22 +2256,33 @@ class JeeflowFacade:
             ext = dict(instance_ext or {})
             if reapply_ctx is not None:
                 ext[VAR_REAPPLY_CTX] = reapply_ctx
-        return {"id": r.id, "processInstanceId": r.processInstanceId, "taskName": r.taskName,
-                "displayName": r.displayName, "taskType": r.taskType, "performType": r.performType,
-                "taskState": int(r.taskState) if r.taskState is not None else None,
-                "operator": r.operator, "finishTime": self._fmt_time(r.finishTime),
-                "expireTime": self._fmt_time(r.expireTime), "formKey": r.formKey,
-                "taskParentId": r.taskParentId,
-                "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
-                "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
-                "processDefineName": r.processDefineName,
-                "processDefineDisplayName": r.processDefineDisplayName,
-                "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
-                # issues/250：所属流程实例的 state（camelCase 出口，待办/已办共用这一处）。
-                # 前端拿它把「实例已结束的已办行」撤回按钮置灰；引擎侧不据此改任何撤回判据。
-                "instanceState": int(r.instanceState) if r.instanceState is not None else None,
-                "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion,
-                "taskFormData": self._form_data_of(ext, "tf_")}  # issues/15
+        # issues/251：办理时快照的节点开关投成顶层标准字段，供前端已办行置灰预判——
+        # 从原行变量取（ext 回退替换不影响）；只投已办行（无键＝存量行＝前端退回可点；
+        # 本栈建单只写 isFirstTaskNode，待办行无键，DOING 守卫为防御性同形）
+        row_allow_recall = None
+        if r.taskState is not None and int(r.taskState) != 10:
+            snap = (r.variables or {}).get(_rc.KEY_ALLOW_RECALL)
+            if snap is not None:
+                row_allow_recall = bool(snap)
+        row = {"id": r.id, "processInstanceId": r.processInstanceId, "taskName": r.taskName,
+               "displayName": r.displayName, "taskType": r.taskType, "performType": r.performType,
+               "taskState": int(r.taskState) if r.taskState is not None else None,
+               "operator": r.operator, "finishTime": self._fmt_time(r.finishTime),
+               "expireTime": self._fmt_time(r.expireTime), "formKey": r.formKey,
+               "taskParentId": r.taskParentId,
+               "createTime": self._fmt_time(r.createTime), "createUser": r.createUser,
+               "updateTime": self._fmt_time(r.updateTime), "updateUser": r.updateUser,
+               "processDefineName": r.processDefineName,
+               "processDefineDisplayName": r.processDefineDisplayName,
+               "instanceCreateTime": self._fmt_time(r.instanceCreateTime),
+               # issues/250：所属流程实例的 state（camelCase 出口，待办/已办共用这一处）。
+               # 前端拿它把「实例已结束的已办行」撤回按钮置灰；引擎侧不据此改任何撤回判据。
+               "instanceState": int(r.instanceState) if r.instanceState is not None else None,
+               "ext": ext, "instanceExt": instance_ext, "version": r.defineVersion,
+               "taskFormData": self._form_data_of(ext, "tf_")}  # issues/15
+        if row_allow_recall is not None:
+            row["allowRecall"] = row_allow_recall
+        return row
 
 
 def _stats_round4(v: float) -> float:

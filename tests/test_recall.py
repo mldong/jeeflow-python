@@ -458,3 +458,52 @@ async def test11_facade_recall_action_envelope():
     assert resp2["code"] == 99999999 and resp2["msg"] == "operator 必填", resp2
     resp3 = await facade.flow("processTask/recall", {"operator": "userA"})
     assert resp3["code"] == 99999999 and resp3["msg"] == "processTaskId 缺失", resp3
+
+
+# ═══ issues/251：办理时快照 tf_allowRecall ═══
+
+@pytest.mark.asyncio
+async def test251_stamp_allow_recall_snapshot():
+    """办理时盖键：快照两态 / 待办无键（建单不灌，与 jeeflow 同形）/ 发起腿禁配 /
+    不传播（complete_task 实例合并剥 tf_）/ 出口行内搬运投顶层。"""
+    eng, repo, inst = await start_to_review({"assignee": "userA", "allowRecall": True})
+    # 待办 review 行无快照键
+    review = await doing(repo, inst.id, "review")
+    assert review is not None
+    assert RC.KEY_ALLOW_RECALL not in (review.variables or {}), "待办行不应带快照键"
+
+    # 同名隔离：办理 args 塞业务裸键 allowRecall，与快照共存
+    await eng.execute_process_task(review.id, "userA",
+                                   {"submitType": AGREE, "allowRecall": "custom"})
+    # 快照两态：review 行 true（ext 里业务键 custom 保留）
+    review_row = (await repo.find_history_tasks(inst.id))[0] if False else None
+    for t in await repo.find_history_tasks(inst.id):
+        if t.taskName == "review":
+            review_row = t
+    assert review_row is not None
+    assert review_row.variables.get(RC.KEY_ALLOW_RECALL) is True
+    assert review_row.variables.get("allowRecall") == "custom", "业务同名键与快照互不干扰"
+
+    # final（未配置节点）→ false
+    final = await doing(repo, inst.id, "final")
+    await eng.execute_process_task(final.id, "userF", {"submitType": AGREE})
+    final_row = await any_row(repo, inst.id, "final")
+    assert final_row.variables.get(RC.KEY_ALLOW_RECALL) is False
+
+    # apply 行（发起腿办结，禁配档）
+    apply_row = await any_row(repo, inst.id, "apply")
+    assert apply_row.variables.get(RC.KEY_ALLOW_RECALL) is False
+
+    # 不传播：实例变量无 tf_allowRecall
+    fresh = await repo.find_instance_by_id(inst.id)
+    assert RC.KEY_ALLOW_RECALL not in (fresh.variables or {})
+
+    # 出口行内搬运：_task_row_to_dict 已办行投顶层、待办行/无键不投
+    facade = JeeflowFacade(eng, repo)
+    done_resp = await facade.flow("processTask/doneList",
+                                  {"operator": "userA", "pageNum": 1, "pageSize": 10})
+    assert done_resp["code"] == 0, done_resp
+    rows_ = done_resp["data"]["rows"]
+    review_done = next(r for r in rows_ if r["taskName"] == "review")
+    assert review_done.get("allowRecall") is True
+    assert review_done["ext"].get("allowRecall") == "custom", "ext 业务键原样"

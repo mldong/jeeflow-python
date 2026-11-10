@@ -923,6 +923,11 @@ class EngineImpl(Engine):
         # 内存仓储无回滚，先办结再判错就留下一条已完成却无人能改回的任务行（"报错且零写入"
         # 是这条链的硬要求）。java 基准同判据落在 JeeflowEngineImpl.prepareExecution 的同一位置。
         _as.validate_submission(_find_node(flow, task.taskName), task.taskName, task, args, operator)
+        # issues/251：办理时把本节点的 allowRecall 开关快照进行变量（tf_allowRecall）——
+        # _prepare_execute_task 是全部办结路径的公共序言，一处盖键全路径覆盖。tf_ 键被
+        # complete_task 的实例合并排除（不传播）；撤回校验仍以现读定义为权威，快照仅供
+        # 前端预判；出口只投已办行。
+        _rc.stamp_allow_recall(args, _find_node(flow, task.taskName))
         # issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
         # 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
         base_vars = inst.variables

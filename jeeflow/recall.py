@@ -174,3 +174,24 @@ def recall_history_of(task: Any) -> list[dict[str, Any]]:
         return []
     v = (getattr(task, "variables", None) or {}).get(KEY_RECALL_HISTORY)
     return v if isinstance(v, list) else []
+
+
+# ─── 办理时快照（issues/251）─────────────────────────────────────────────────
+
+KEY_ALLOW_RECALL = "tf_allowRecall"
+"""已办撤回节点开关快照：办理时由引擎从节点属性盖到本行变量，值＝办理时刻的
+``allowRecall`` 定义值；查询出口搬运成行顶层 ``allowRecall`` 供前端预判置灰（只投
+已办行）。撤回校验仍以现读定义为权威，快照仅供预判（漂移为设计内）。"""
+
+
+def stamp_allow_recall(args: dict | None, node: Any) -> None:
+    """办理时把当前节点的 ``allowRecall`` 开关快照进行变量（issues/251）。
+
+    已办行置灰的"节点开关"预判从行上读，查询出口只搬运不解析定义。``tf_`` 前缀键
+    被 ``complete_task`` 的实例合并排除（规范 04 立法），不传播；本栈建单只写
+    ``isFirstTaskNode``，待办行无键（与 jeeflow/go 同形）。撤回校验仍以现读定义
+    为权威，快照仅供前端预判（漂移为设计内）。非任务节点与 ``None`` args 静默跳过。
+    """
+    if not args or node is None or getattr(node, "type", "") != TYPE_TASK:
+        return
+    args[KEY_ALLOW_RECALL] = node_enabled(node)

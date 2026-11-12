@@ -77,7 +77,8 @@ def test_new_actions_ride_execute_code():
 
 def test_table_shape_matches_java():
     # 刻意写死数字：不是"会漂的读数"，而是跨栈契约的形状锚——加一条要八栈同批改
-    assert len(OR_RULES) == 7, f"OR 规则条数应为 7（对齐 java），现读 {len(OR_RULES)}"
+    # issues/253 动态协办 processTask/aidant 复用 execute 码进 OR 表 ⇒ 7→8（本轮同批 +1）
+    assert len(OR_RULES) == 8, f"OR 规则条数应为 8（对齐 java），现读 {len(OR_RULES)}"
     assert len(NO_PERM_ACTIONS) == 11, f"放行清单条数应为 11（含统计三条），现读 {len(NO_PERM_ACTIONS)}"
 
 

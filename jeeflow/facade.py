@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from . import collect as _collect
+from . import aidant as _aidant
 from . import recall as _rc
 from . import add_sign as _add_sign
 from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_ACTORS_START,
@@ -231,6 +232,20 @@ def foreign_detail_of(exc: BaseException) -> bool:
     tb = exc.__traceback__
     frames = tuple(f.filename for f in reversed(traceback.extract_tb(tb))) if tb is not None else ()
     return is_foreign_detail(type(exc), str(exc), cause, frames)
+
+
+def _parse_wait_completion(value) -> bool:
+    """``waitCompletion`` 入参解析（issues/253，规范 06「选填 bool，缺省 false」）。
+
+    布尔与 "true"/"false" 字符串两形都认（前端 JSON 与表单串两种来源）；其余值按缺省 False
+    处理——契约只定义了 bool 档，**不为非法值新造文案**（跨栈统一文案表协办六行之外不加第七行）。
+    形状基准＝java ``JeeflowFacade.parseWaitCompletion``。
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() == "true"
 
 
 class JeeflowFacade:
@@ -623,6 +638,33 @@ class JeeflowFacade:
             raise ValueError("processTaskId 缺失")
         resurrected = await self._engine.recall_task(task_id, operator)
         return {"processTaskId": resurrected.id, "taskState": int(resurrected.taskState)}
+
+    async def _processTask_aidant(self, args: dict) -> None:
+        """动态协办（issues/253，规范 06 §processTask/aidant）：主办把"这活"交给别人干——
+        按人派生 ``task_type=1`` 协办子行，主办行原样保留 DOING，节点推进仍由主办行办结触发。
+
+        门面只做参数归一与信封包装，判据/建单/账本全在引擎（``EngineImpl.aidant_task``，
+        与 recall 同分工）。``operator`` 硬必填（不接受缺省，与 transfer/withdraw 同口径）；
+        ``actorIds`` 逗号串与数组两形共用 §2.11 那枚归一单点（``spi.normalize_actors``），
+        空 ⇒ 逐字「actorIds 必填」。``waitCompletion`` 选填 bool，缺省 False＝不等。
+
+        成功 ``data → None``（规范 06）；失败 msg 见跨栈统一文案表协办六行。
+        权限码复用 ``wf:processTask:execute``（OR 规则，照 246/247 B 案惯例）。
+        位序照 java taskAidant：operator 空判在前、主键缺失判在后、actorIds 空判第三。
+        """
+        operator = str(args.get("operator") or "").strip()
+        if not operator:
+            raise ValueError("operator 必填")
+        task_id = self._to_int(args.get("processTaskId"))
+        if not task_id:
+            raise ValueError("processTaskId 缺失")
+        actor_ids = normalize_actors(args.get("actorIds"))
+        if not actor_ids:
+            raise ValueError(_aidant.MSG_NO_ACTORS)
+        reason = str(args.get("reason") or "")
+        wait_completion = _parse_wait_completion(args.get("waitCompletion"))
+        await self._engine.aidant_task(task_id, actor_ids, reason, wait_completion, operator)
+        return None
 
     async def _processTask_revokeDynamicCountersign(self, args: dict) -> dict:
         """撤回动态会签（issues/247，spec 06 §processTask/revokeDynamicCountersign）：
@@ -1454,6 +1496,12 @@ class JeeflowFacade:
                         projection = _collect.build_projection(inst.tasks or [], task)
                         if projection is not None:
                             t_ext["dynamicCountersign"] = projection
+                    # 动态协办投影（issues/253，规范 06 §2.7）：主办行 ext.aidant 从
+                    # task_parent_id＋task_type=1 现算，不落新存储。**无节点开关**——协办档
+                    # 只由运行期派生，任何任务节点都可能有（故不套征询那层开关判据）。
+                    aidant_projection = _aidant.build_projection(inst.tasks or [], task)
+                    if aidant_projection is not None:
+                        t_ext["aidant"] = aidant_projection
                 except Exception:
                     pass
         return vo

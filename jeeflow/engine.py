@@ -9,6 +9,7 @@ from . import add_sign as _as
 from . import reapply as _rj
 from . import recall as _rc
 from . import collect as _cl
+from . import aidant as _ad
 from .model import (
     FlowModel, FlowNode, FlowEdge,
     TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK, TYPE_JOIN, TYPE_CUSTOM,
@@ -390,6 +391,9 @@ class EngineImpl(Engine):
     async def _execute_process_task_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         args = _rj.strip_reserved(args)
         _pre = await self.repo.find_task_by_id(task_id)
+        # issues/253 推进闸：协办行（task_type=1）办结不产生执行对象、不跑输出变迁
+        if _pre is not None and _pre.taskState == TaskState.DOING and _ad.is_aidant_row(_pre):
+            return await self._complete_aidant_without_drive(task_id, operator, args)
         if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
             return await _rj.execute_reapply(self, _pre, operator, args)
         # issues/127 / spec §11.7 办理时抄送（tf_ccActors）：**覆盖面只有本条腿**——钩子挂在这里，
@@ -429,6 +433,8 @@ class EngineImpl(Engine):
                 cs_veto = False
             if ct == "SEQUENTIAL" and not cs_veto:
                 doing = await self.repo.find_doing_tasks(inst.id)
+                # issues/253：协办行（task_type=1）不是表决票，不算"本节点还有未完成待办"
+                doing = _ad.filter_out_aidant(doing)
                 if not doing:
                     actors, lc = _get_cs_state(vars_, cur_node.id)
                     if actors and lc + 1 < len(actors):
@@ -464,7 +470,10 @@ class EngineImpl(Engine):
                     # 计数口径对齐 java buildCountersignVars：total＝该节点全部成员行、
                     # activate＝DOING、completed＝已完成（读 inst.tasks：_prepare_execute_task
                     # 里 complete_task＋_sync_task_to_aggregate 已把本单同步进聚合，计数是新鲜的）。
-                    members = [t for t in inst.tasks if t.taskName == cur_node.id]
+                    # issues/253：会签合并判据显式排除协办行（task_type=1）——snaker 按同节点
+                    # 同名行全算会把协办行误当表决票挡住合并（规范 04「不计入会签合并计数」）。
+                    members = [t for t in inst.tasks
+                               if t.taskName == cur_node.id and not _ad.is_aidant_row(t)]
                     gate_vars = {
                         "nrOfInstances": len(members),
                         "nrOfActivateInstances": sum(1 for t in members if t.taskState == TaskState.DOING),
@@ -481,13 +490,17 @@ class EngineImpl(Engine):
                     # merged ⇒ 落穿到下面的 abandon＋跟进边（与"全部完成"走同一出口）
                 else:
                     doing = await self.repo.find_doing_tasks(inst.id)
-                    if doing: return await self.repo.find_instance_by_id(inst.id)
+                    # issues/253：协办行不是表决票（同上，合并判据显式排除 task_type=1）
+                    if _ad.filter_out_aidant(doing): return await self.repo.find_instance_by_id(inst.id)
 
             # issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
             # 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
             # SEQUENTIAL 逐人创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余成员
             # （刚完成者已 DONE 不会误伤）。逐条持久化并回写聚合副本（E25：防 update_instance 级联回写旧状态）
             if ct:
+                # issues/253：协办行先走自己的清场腿（废弃＋往主办行账本记废弃），再清剩余会签行——
+                # 顺序不能反，先被下面循环置 99 的协办行就记不上账了（java CountersignHandler 同序）。
+                await self._abandon_aidant_on_node(inst, cur_node.id, operator)
                 remaining = await self.repo.find_doing_tasks(inst.id, [cur_node.id])
                 for t in remaining:
                     t.abandon(now)
@@ -508,6 +521,11 @@ class EngineImpl(Engine):
                 if not await self._exec_add_sign_gate(flow, cur_node, task, inst, operator, args, now):
                     return await self.repo.find_instance_by_id(inst.id)
 
+            # issues/253：真要离开本节点（普通档放行出边／加签 merged／征询 merged）⇒ 未办结
+            # 协办行随废弃腿清场、账本记废弃，不留孤儿待办（java TaskModel.abandonAidantOnLeave
+            # 的对应调用位）。上面各"留在本节点"的早返回分支不调；会签档已在 if ct: 里清过，
+            # 本腿幂等（已废弃行不再命中）不会重复记账。
+            await self._abandon_aidant_on_node(inst, cur_node.id, operator)
             for node in _follow_edges(flow, cur_node.id):
                 # 统一走 _execute_node：结束节点也经节点执行链（拦截器/事件完整触发），
                 # _execute_node 内部 TYPE_END 分支完成聚合根 finish + 事件发布
@@ -736,6 +754,158 @@ class EngineImpl(Engine):
                                             target.taskName, operator))
         return nt
 
+    # ─── 动态协办（issues/253）─────────────────────────────────────────────────
+
+    async def aidant_task(self, task_id: int, actor_ids: list, reason: str,
+                          wait_completion: bool, operator: str) -> list[ProcessTask]:
+        """动态协办（issues/253，规范 04 · 动态协办）：主办把"这活"交给别人干——按人派生
+        ``task_type=1`` 协办子行，**主办行原样保留 DOING**，节点推进仍由主办行办结触发。
+
+        判据全部排在任何状态变更之前（报错即零写入——与后加签/征询/撤回同一规矩）：
+        任务存在 → 禁递归（协办行不能再派生）→ 主办行 DOING → actorIds 非空 → 名册鉴权
+        （auto/admin 例外）→ 逐人去重（该人已有本主办行下未办结协办行）。
+        落库顺序：协办行既有建单腿（委托并入 → save_task → 码 3）→ 主办行盖 wait 开关＋账本
+        update_task。建单形状照征询成员行腿，另落 task_type=1／performType=NORMAL。
+        """
+        _pre = await self.repo.find_task_by_id(task_id)
+        # 同实例串行化（与 execute/recall 同口径）：「判协办行 DOING → 建协办行」在同一临界区
+        async with _rj.instance_lock(self, _pre.processInstanceId if _pre else 0):
+            created: list[ProcessTask] = []
+            token = _NEW_TASKS.set(created)
+            try:
+                return await self._in_tx(lambda: self._aidant_task_impl(
+                    task_id, actor_ids, reason, wait_completion, operator))
+            finally:
+                _NEW_TASKS.reset(token)
+
+    async def _aidant_task_impl(self, task_id: int, actor_ids: list, reason: str,
+                                wait_completion: bool, operator: str) -> list[ProcessTask]:
+        host = await self.repo.find_task_by_id(task_id)
+        if host is None:
+            raise ValueError(_ad.MSG_TASK_NOT_FOUND)
+        # 禁递归：协办行携带派生参数 ⇒ 报错（规范 04 派生规则 4）
+        if _ad.is_aidant_row(host):
+            raise ValueError(_ad.MSG_NO_RECURSION)
+        if not host.is_doing():
+            raise ValueError(_ad.MSG_NOT_DOING)
+        actors = normalize_actors(actor_ids)
+        if not actors:
+            raise ValueError(_ad.MSG_NO_ACTORS)
+        op_lower = (operator or "").lower()
+        privileged = op_lower == KEY_AUTO_ID or op_lower == KEY_ADMIN_ID
+        # 以参与者表为判据（聚合副本可能滞后于加签/转办的增量写入，与 transfer 同源）
+        roster = await self.repo.find_task_actors(task_id)
+        if not privileged and operator not in (roster or []):
+            raise ValueError(_ad.MSG_NO_PERMISSION)
+        inst = await self.repo.find_instance_by_id(host.processInstanceId)
+        if inst is None:
+            raise ValueError("流程实例不存在")
+        # issues/249 同一课：账本必须盖在聚合内的同一对象上——find_task_by_id 在 SQL 仓是独立
+        # 副本，后续 update_instance 的级联会拿聚合里没账本的旧副本抹掉它。这里重指到聚合内那份。
+        for t in (inst.tasks or []):
+            if t.id == task_id:
+                host = t
+                break
+        def_ = await self.repo.find_define_by_id(inst.defineId)
+        if def_ is None:
+            raise ValueError("流程定义不存在")
+        # parse_flow_model 内含解析期硬校验（节点级 taskType=1 禁配等），与 java ModelParser 同位
+        flow = parse_flow_model(json.loads(def_.content))
+        node = _find_node(flow, host.taskName)
+        if node is None or node.type != TYPE_TASK:
+            raise ValueError(_ad.MSG_NOT_DOING)
+        # 去重：该人已有本主办行下**未办结**协办行 ⇒ 报错（规范 04 派生规则 5）
+        existing = _ad.aidant_rows(inst.tasks or [], host)
+        for actor in actors:
+            for t in existing:
+                if t.is_doing() and actor in (t.actorIds or []):
+                    raise ValueError(_ad.MSG_DUPLICATE)
+        # ── 判据全过，以下才允许写 ──
+        now = datetime.now()
+        round_no = _ad.last_round(host) + 1
+        first_task_node = self._is_first_task_node(flow, node)
+        form = (node.properties or {}).get("form", "")
+        expire_expr = (node.properties or {}).get("expireTime")
+        process_name = await self._surrogate_process_name(flow, inst)
+        created: list[ProcessTask] = []
+        for actor in actors:
+            nt = inst.create_task(self._next_id(), node.id, (node.text or {}).get("value", ""),
+                                  actor, operator, form, now, host.id, first_task_node)
+            nt.taskType = _ad.TASK_TYPE_SECONDARY
+            nt.performType = int(PerformType.NORMAL)
+            if reason:
+                nt.variables[_ad.KEY_AIDANT_REASON] = reason
+            _apply_expire_time(nt, expire_expr, inst.variables)
+            # 分支归属与每一次普通建单同一条腿（照征询成员行）：并行范围内的协办行继承父任务归属
+            nt.variables[_rj.VAR_BRANCH_CTX] = _rj.build_scopes(
+                flow, node.id, host.variables, host.id, nt.id)
+            # 既有建单腿：委托并入（不摘原人）→ save_task 落库 → 产出列表 → 码 3
+            await self._apply_surrogate(nt, process_name)
+            await self.repo.save_task(nt)
+            _append_new_task(nt)
+            await self._fire_task_start(inst, nt, node.id, operator)
+            created.append(nt)
+        # 等待闸开关＋账本落主办行（主办不办结，变量合并序保证账本活到办结后）
+        host.variables[_ad.KEY_AIDANT_WAIT] = bool(wait_completion)
+        _ad.append_aidant_history(host, operator, actors, round_no, reason or "")
+        # ⚠️ 严禁覆写任务 actor_id/operator 列（转办那条 ⚠️ 同尺）：进行中任务该列恒无值是家族
+        # 不变量，派生协办不改主办行的办理人归属，审计由 update_user＋账本 operator 承载。
+        host.updateUser = operator
+        host.updateTime = now
+        await self.repo.update_task(host)
+        _sync_task_to_aggregate(inst, host)
+        return created
+
+    async def _complete_aidant_without_drive(self, task_id: int, operator: str,
+                                             args: dict[str, Any] = None) -> ProcessInstance:
+        """协办行办结的**推进闸**（issues/253，规范 04「推进闸与等待闸」；参照 snaker
+        ``SnakerEngineImpl.execute`` 的「协办任务完成不产生执行对象」）：只完成任务行
+        （``_prepare_execute_task`` 内含 complete_task／update_task／fire 码 5 或 6），
+        **不跑节点执行、不跑输出变迁**，本次动作产出列表为空（无 save_task ⇒ sink 空）。
+
+        四入口同闸：execute_process_task／execute_and_jump_task／execute_and_jump_to_end／
+        execute_and_jump_to_first_task_node——协办行任何 submitType 都不得驱动流程。
+        不挂 cc 钩子（java completeAidantWithoutDrive 同样不经 handleCcActors）。
+        """
+        _t, inst, _flow, _vars = await self._prepare_execute_task(
+            task_id, operator, args, on_task_updated=None)
+        return inst
+
+    async def _abandon_aidant_on_node(self, inst: ProcessInstance, node_name: str,
+                                      operator: str) -> int:
+        """离开节点时清场未办结协办行（规范 04：waitCompletion=False 时主办可随时推进，
+        未办结协办行随废弃腿清场、账本记废弃，不留孤儿待办）。
+
+        只对协办行（task_type=1）动手，且**不要求节点开任何开关**——协办无节点开关，普通节点上
+        的协办行同样要清（这是与 ``_abandon_add_sign_doing`` 的关键差别，后者有双开关守卫）。
+        按 parent 分组，废弃事实追加到各自主办行的账本上。幂等：已废弃(99)/已办结(20) 的行
+        不再命中，重复调用不重复记账。返回实际废弃的行数。
+        """
+        if inst is None or not node_name:
+            return 0
+        # parent → 该主办行下待清场的协办行（dict 保插入序＝行序，照 java LinkedHashMap）
+        by_host: dict[int, list] = {}
+        for t in (inst.tasks or []):
+            if t.taskName == node_name and t.is_doing() and _ad.is_aidant_row(t):
+                by_host.setdefault(t.parentTaskId or 0, []).append(t)
+        now = datetime.now()
+        abandoned = 0
+        for parent_id, rows in by_host.items():
+            actors: list = []
+            for t in rows:
+                t.abandon(now)
+                t.updateUser = operator  # java abandon(operator) 同尺：update_user 回写真实清场人
+                await self.repo.update_task(t)
+                _sync_task_to_aggregate(inst, t)
+                actors.append(t.actorIds[0] if t.actorIds else None)
+                abandoned += 1
+            host = next((t for t in (inst.tasks or []) if t.id == parent_id), None)
+            if host is not None:
+                _ad.append_abandon_history(host, operator, actors, _ad.last_round(host))
+                await self.repo.update_task(host)
+                _sync_task_to_aggregate(inst, host)
+        return abandoned
+
     # ─── Reject ───────────────────────────────────────────────────────────────
 
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]:
@@ -751,6 +921,9 @@ class EngineImpl(Engine):
 
     async def _execute_and_jump_to_end_impl(self, task_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
         _pre = await self.repo.find_task_by_id(task_id)
+        # issues/253 推进闸：协办行拒绝同样不驱动流程（任何 submitType 都只办结自己那一行）
+        if _pre is not None and _pre.taskState == TaskState.DOING and _ad.is_aidant_row(_pre):
+            return await self._complete_aidant_without_drive(task_id, operator, args)
         if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
             raise ValueError("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
         # 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
@@ -759,6 +932,8 @@ class EngineImpl(Engine):
         _t, inst, _flow, _vars = await self._prepare_execute_task(
             task_id, operator, args, reject_as=int(SubmitType.REJECT), on_task_updated=None)
         # 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签语义边界表）
+        # issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签/征询的既有废弃腿
+        await self._abandon_aidant_on_node(inst, _t.taskName, operator)
         await self._abandon_add_sign_doing(_flow, inst, _t.taskName, operator)
         inst.reject(datetime.now())
         await self.repo.update_instance(inst)
@@ -786,6 +961,10 @@ class EngineImpl(Engine):
                                           target_task_name: str = None) -> ProcessInstance:
         # 带直返上下文的进行中申请待办只接受重新提交(5)：命名跳转/退回上一步都在改状态前拒绝
         _pre = await self.repo.find_task_by_id(task_id)
+        # issues/253 推进闸：四入口同闸（照 snaker，别只堵 execute 一路）——协办行跳转/退回
+        # 同样不驱动流程，且必须排在血缘/目标守卫之前，免得协办行被守卫的文案误拦。
+        if _pre is not None and _pre.taskState == TaskState.DOING and _ad.is_aidant_row(_pre):
+            return await self._complete_aidant_without_drive(task_id, operator, args)
         if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
             raise ValueError("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
         # issues/243 甲案：空 target＝血缘回退 ⇒ 那两道守卫（20010007／20010008）必须排在
@@ -803,6 +982,8 @@ class EngineImpl(Engine):
             task_id, operator, args,
             reject_as=None if target_task_name else int(SubmitType.ROLLBACK),
             on_task_updated=None)
+        # issues/253：跳转/退回离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃）
+        await self._abandon_aidant_on_node(inst, task.taskName, operator)
         if not target_task_name:
             # issues/121 P2：ROLLBACK 走血缘版——复活 parentTaskId 指的那条历史行，
             # 参与者＝该行办结人（首任务节点行取该行 u_userId）。无血缘/守卫不过显式报错，
@@ -843,6 +1024,9 @@ class EngineImpl(Engine):
         args = _rj.strip_reserved(args)
         # 校验放在任何状态变更之前：带直返上下文的申请待办不得再次退回
         _pre = await self.repo.find_task_by_id(task_id)
+        # issues/253 推进闸：协办行退回发起人同样不驱动流程
+        if _pre is not None and _pre.taskState == TaskState.DOING and _ad.is_aidant_row(_pre):
+            return await self._complete_aidant_without_drive(task_id, operator, args)
         if _pre is not None and _pre.taskState == TaskState.DOING and _rj.reapply_of(_pre.variables):
             raise ValueError("带重提直返标记的申请待办不允许再次退回，只接受重新提交(submitType=5)")
         # 依据来源节点配置判准入（RETURN_TO_SOURCE 直返）
@@ -862,6 +1046,8 @@ class EngineImpl(Engine):
             on_task_updated=None)
         # 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签语义边界表；
         # 与拒绝档同一判据——只对开了 allowAddSign 的节点动手，会签兄弟任务由既有会签腿管）
+        # issues/253：退回发起人离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃）
+        await self._abandon_aidant_on_node(inst, task.taskName, operator)
         await self._abandon_add_sign_doing(flow, inst, task.taskName, operator)
         if _direct:
             if _source_node.type != TYPE_TASK:
@@ -928,6 +1114,10 @@ class EngineImpl(Engine):
         # complete_task 的实例合并排除（不传播）；撤回校验仍以现读定义为权威，快照仅供
         # 前端预判；出口只投已办行。
         _rc.stamp_allow_recall(args, _find_node(flow, task.taskName))
+        # issues/253 等待闸：waitCompletion=True 的主办行办结前判"不存在 DOING 协办行"，
+        # 未齐 ⇒ 逐字文案报错、零写入。同样必须排在 complete_task 之前（内存仓储无回滚）。
+        # 协办行自身不受本闸约束（它办结本来就不驱动流程）；缺省 False 原样放行。
+        _ad.gate_wait(inst.tasks or [], task)
         # issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
         # 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
         base_vars = inst.variables

@@ -287,10 +287,18 @@ def history_of(task: Any) -> list[dict[str, Any]]:
 
 
 def has_doing_on_node(inst: Any, node_name: str) -> bool:
-    """本节点是否还有未完成任务（刚办结那条此刻已是 DONE，不计入——由调用方保证已同步进聚合）。"""
+    """本节点是否还有未完成任务（刚办结那条此刻已是 DONE，不计入——由调用方保证已同步进聚合）。
+
+    issues/253：协办行（task_type=1）不算"兄弟待办"——它不驱动流程、不是接力链的一环，
+    算进来会让 waitCompletion=False 的主办在加签/征询节点上被协办行挡住推进（规范 04
+    「缺省 false 主办可随时推进」）。协办行的等待由 ``aidant.gate_wait`` 单独裁决。
+    """
     if inst is None or not node_name:
         return False
-    return any(node_name == t.taskName and t.is_doing() for t in (getattr(inst, "tasks", None) or []))
+    # 延迟 import：aidant 顶层不依赖本模块，但保持与 collect 同款"跨模块符号只在函数体内取用"
+    from . import aidant as _ad
+    return any(node_name == t.taskName and t.is_doing() and not _ad.is_aidant_row(t)
+               for t in (getattr(inst, "tasks", None) or []))
 
 
 def node_allows(node: Any) -> bool:

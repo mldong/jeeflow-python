@@ -57,6 +57,9 @@ OR_RULES: dict[str, list[str]] = {
     # issues/246／247 两枚新 action（B 案）：复用 execute，见模块 docstring
     "processTask/recall": ["wf:processTask:execute"],
     "processTask/revokeDynamicCountersign": ["wf:processTask:execute"],
+    # issues/253 动态协办：照 246/247 B 案惯例复用"办理"这枚码，不建按钮种子行——
+    # 派生协办的主体按引擎判据本来就必然是主办行名册内的人（＝有办理权的人）。
+    "processTask/aidant": ["wf:processTask:execute"],
 }
 
 # 放行清单（对齐 java NO_PERM_ACTIONS，11 条；统计三条＝issues/103 收口）

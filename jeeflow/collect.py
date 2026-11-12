@@ -82,19 +82,31 @@ def node_enabled(node: Any) -> bool:
 
 
 def member_rows(tasks: list, host: Any) -> list:
-    """成员行＝parent 指向主办行**且同节点同名**的行（成员不能再拉人 ⇒ 无更深层级）。"""
+    """成员行＝parent 指向主办行**且同节点同名**的行（成员不能再拉人 ⇒ 无更深层级）。
+
+    issues/253：协办行（task_type=1）也满足 parent＋同名，但它属另一族——征询收齐闸只数
+    征询成员行（task_type=0），两闸各数各的（规范 04「与征询允许同节点并存」）。
+    """
     out: list = []
     if host is None:
         return out
+    from . import aidant as _ad
     for t in tasks:
-        if host.id and t.parentTaskId == host.id and t.taskName == host.taskName:
+        if (host.id and t.parentTaskId == host.id and t.taskName == host.taskName
+                and not _ad.is_aidant_row(t)):
             out.append(t)
     return out
 
 
 def is_member_row(tasks: list, row: Any) -> bool:
-    """成员行判定：parent 指向**同节点同名**行（成员行禁带拉人参数的判据）。"""
+    """成员行判定：parent 指向**同节点同名**行（成员行禁带拉人参数的判据）。
+
+    issues/253：协办行（task_type=1）不是征询成员行——两族靠 task_type 分辨。
+    """
     if row is None or not row.parentTaskId:
+        return False
+    from . import aidant as _ad
+    if _ad.is_aidant_row(row):
         return False
     for t in tasks:
         if t.id == row.parentTaskId and t.taskName == row.taskName:

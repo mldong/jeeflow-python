@@ -458,16 +458,46 @@ _KNOWN_MODEL = {"name", "displayName", "type", "nodes", "edges"}
 _KNOWN_NODE = {"id", "type", "x", "y", "properties", "text"}
 _KNOWN_EDGE = {"id", "sourceNodeId", "targetNodeId", "properties", "text"}
 
+MSG_TASK_TYPE_SECONDARY_FORBID = "节点[{0}]不允许配置协办任务类型（taskType=1）"
+
+
+def _is_secondary_task_type(raw: Any) -> bool:
+    """节点级 taskType 协办档判定（规范 02 §4.4，issues/252）：本栈建单恒落 taskType=0、
+    没有 java 那枚 codeOf 容错表，判定照 ``add_sign.is_countersign_node`` 同尺
+    （str＋strip＋upper／int 折算，大小写不敏感）：1／"1"／"协办"／"SECONDARY" ⇒ 协办；
+    其余值不算协办——维持既有静默回落主办（issues/245 口径，不扩成 fail-fast）。"""
+    if raw is None:
+        return False
+    s = str(raw).strip().upper()
+    if s in ("SECONDARY", "协办"):
+        return True
+    try:
+        return int(str(raw).strip()) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _validate_task_type(nodes: list) -> None:
+    """节点级协办解析期禁配（issues/252）：只对 snaker:task 档动手——java 同判据在 TaskParser，
+    custom 记录节点不读 taskType、不受影响。协办档只由运行期 processTask/aidant 派生
+    （issues/253）；snaker 原义下协办节点办结不驱动且跳转同闸，节点级配了就是"流程悬挂"陷阱。"""
+    for n in nodes or []:
+        if getattr(n, "type", "") != TYPE_TASK:
+            continue
+        if _is_secondary_task_type((n.properties or {}).get("taskType")):
+            raise ValueError(MSG_TASK_TYPE_SECONDARY_FORBID.format(n.id))
+
 
 def parse_flow_model(raw: dict) -> FlowModel:
     """从 JSON dict 解析 FlowModel，过滤未知字段。
 
-    末尾那几刀是**解析期硬校验**：后加签（§4.3 两开关＋两条禁配）、已办撤回（§4.4
-    ``allowRecall`` 一开关＋两条禁配，issues/246）、动态会签（§4.4 ``dynamicCountersign``
-    一开关＋三条禁配，issues/247）都在这一跳抛配置错误，不做运行时降级——静默跑下去
-    会让配置者以为开关生效，实际各档推进闸各裁各的（java 那边同判据在 ``ModelParser.parse``
-    末尾按「后加签 → 已办撤回 → 动态会签」顺序三批连跑，本栈的解析单点就是本函数，
-    位置等价、批次顺序逐字同）。
+    末尾那几刀是**解析期硬校验**：节点级协办禁配（``taskType=1``，issues/252，排在三段
+    validate 之前——java 同判据在 TaskParser 读 taskType 处、先于尾部拓扑校验）、后加签
+    （§4.3 两开关＋两条禁配）、已办撤回（§4.4 ``allowRecall`` 一开关＋两条禁配，issues/246）、
+    动态会签（§4.4 ``dynamicCountersign`` 一开关＋三条禁配，issues/247）都在这一跳抛配置错误，
+    不做运行时降级——静默跑下去会让配置者以为开关生效，实际各档推进闸各裁各的（java 那边
+    同判据在 ``ModelParser.parse`` 末尾按「后加签 → 已办撤回 → 动态会签」顺序三批连跑，
+    本栈的解析单点就是本函数，位置等价、批次顺序逐字同）。
     """
     nodes = [_parse_node(n) for n in raw.get("nodes", [])]
     edges = [_parse_edge(e) for e in raw.get("edges", [])]
@@ -482,6 +512,9 @@ def parse_flow_model(raw: dict) -> FlowModel:
         nodes=nodes,
         edges=edges,
     )
+    # 节点级协办禁配（规范 02 §4.4，issues/252）：java 同判据在 TaskParser 读 taskType 处
+    # （先于尾部拓扑校验），本栈解析单点即本函数，排在三段 validate 之前保持同序。
+    _validate_task_type(nodes)
     # 延迟 import：add_sign/recall/collect 顶层要 import 本模块（TYPE_TASK / TYPE_START），
     # 顶层互指会成环；解析校验只在运行期发生，一帧延迟不影响判据强度。
     from .add_sign import validate_definition

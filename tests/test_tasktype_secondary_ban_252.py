@@ -170,3 +170,73 @@ async def test04_custom_history_row_unchanged():
 def test05_pinned_message():
     """格 5：消息常量逐字自证（防常量被改后测试仍绿）。"""
     assert MSG_TASK_TYPE_SECONDARY_FORBID == "节点[{0}]不允许配置协办任务类型（taskType=1）"
+
+# ─── 格 6：deploy／redeploy／发布三条腿同样过禁配（issues/253 实施轮 T2 缺口②）──────
+#
+# 病灶：禁配原先只挂运行期 parse_flow_model，门面 _deploy 走 _parse_define_content
+# 纯 JSON 解析 ⇒ taskType=1/协办/SECONDARY 能 code=0 落 define 行（禁配形同虚设）。
+# 本格钉「解析期报错 + 零写入」，并带回归：0/Major/缺省/未知值 Aidant 与 custom 记录节点仍部署成功。
+
+def _facade(repo):
+    from jeeflow.facade import JeeflowFacade
+    from jeeflow.memory import MemoryExtRepository
+    eng2 = EngineImpl(repo, _UserProv(), _IDGen(), _Expr())
+    return JeeflowFacade(eng2, repo, MemoryExtRepository())
+
+
+@pytest.mark.parametrize("raw", [1, "1", "协办", "SECONDARY", "secondary", " Secondary "])
+async def test06_deploy_leg_bans_secondary_with_zero_write(raw):
+    """deploy 腿：协办档逐字报错，且 define 行一条都不许落（零写入）。"""
+    eng, repo = setup_engine()
+    facade = _facade(repo)
+    flow = chain({"taskType": raw})
+    before = len(repo.defines) if hasattr(repo, "defines") else 0
+    r = await facade.flow("processDefine/deploy",
+                          {"content": json.dumps(flow, ensure_ascii=False), "operator": "userA"})
+    assert r["code"] != 0, f"taskType={raw!r} 竟然 deploy 成功（禁配未生效）"
+    assert r["msg"] == MSG, f"文案不逐字：{r['msg']!r}"
+    assert await repo.find_define_by_name(flow["name"]) is None, "报错却落了 define 行（零写入被破）"
+
+
+@pytest.mark.parametrize("raw", [0, "0", "Major", None, "Aidant"])
+async def test06_deploy_leg_fallback_still_deploys(raw):
+    """回归：主办档/缺省/未知值仍部署成功（issues/245 静默回落口径，不扩成 fail-fast）。"""
+    eng, repo = setup_engine()
+    facade = _facade(repo)
+    props = {} if raw is None else {"taskType": raw}
+    flow = chain(props)
+    r = await facade.flow("processDefine/deploy",
+                          {"content": json.dumps(flow, ensure_ascii=False), "operator": "userA"})
+    assert r["code"] == 0, f"taskType={raw!r} 被误拦：{r.get('msg')!r}"
+    assert await repo.find_define_by_name(flow["name"]) is not None
+
+
+async def test06_deploy_leg_custom_record_not_banned():
+    """回归：custom 记录节点带 taskType:2 属性不经禁配，deploy 成功（RECORD/custom 不受影响）。"""
+    eng, repo = setup_engine()
+    facade = _facade(repo)
+    flow = custom_chain()
+    r = await facade.flow("processDefine/deploy",
+                          {"content": json.dumps(flow, ensure_ascii=False), "operator": "userA"})
+    assert r["code"] == 0, f"custom 记录节点被禁配误伤：{r.get('msg')!r}"
+
+
+async def test06_redeploy_leg_bans_secondary_with_zero_write():
+    """redeploy 腿同判据：协办档报错，且原定义内容不被改写。"""
+    eng, repo = setup_engine()
+    facade = _facade(repo)
+    good = chain({})
+    r0 = await facade.flow("processDefine/deploy",
+                           {"content": json.dumps(good, ensure_ascii=False), "operator": "userA"})
+    assert r0["code"] == 0
+    saved = await repo.find_define_by_name(good["name"])
+    assert saved is not None, "正向 deploy 没落 define 行"
+    did = saved.id
+    bad = chain({"taskType": 1})
+    r = await facade.flow("processDefine/redeploy",
+                          {"processDefineId": str(did),
+                           "content": json.dumps(bad, ensure_ascii=False), "operator": "userA"})
+    assert r["code"] != 0 and r["msg"] == MSG, f"redeploy 禁配未生效：{r!r}"
+    kept = await repo.find_define_by_name(good["name"])
+    assert kept is not None and json.loads(kept.content)["name"] == good["name"], \
+        "报错却改写/删除了原定义内容"

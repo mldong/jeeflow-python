@@ -28,7 +28,8 @@ from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_AC
                      KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
 from .extensions import EventType, ProcessEvent
 from .model import (FlowNode, ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate,
-                    TaskState, InstanceState, ERR_EXIST_UN_FINISH_INSTANCE, parse_flow_model)
+                    TaskState, InstanceState, ERR_EXIST_UN_FINISH_INSTANCE, parse_flow_model,
+                    validate_define_task_type)
 from .reapply import VAR_BRANCH_CTX, VAR_REAPPLY_CTX
 
 # 任务行 ext 的「引擎控制键」集合（issues/121 P1 判据体）：行级首节点标记 ＋ spec 04 的
@@ -1914,9 +1915,15 @@ class JeeflowFacade:
         与第 4 条（``json.JSONDecodeError`` 在族里）会双双把它挡成固定文案。
         """
         try:
-            return json.loads(content)
+            data = json.loads(content)
         except Exception as e:
             raise ValueError(MSG_READ_DEFINE_JSON_FAIL) from e
+        # issues/253 实施轮 T2 缺口②：部署/重新部署/发布三条腿同样过节点级协办禁配
+        # （issues/252 判据，解析期报错、零写入）。原先禁配只挂运行期 parse_flow_model，
+        # 本腿纯 JSON 解析 ⇒ taskType=1/协办/SECONDARY 能 code=0 落 define 行。
+        # ⚠️ 必须排在 try **之外**：禁配文案要逐字透出，不能被 JSON 解析失败的固定文案盖掉。
+        validate_define_task_type(data)
+        return data
 
     @staticmethod
     def _to_int(v) -> Optional[int]:

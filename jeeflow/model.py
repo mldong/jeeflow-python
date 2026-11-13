@@ -488,6 +488,21 @@ def _validate_task_type(nodes: list) -> None:
             raise ValueError(MSG_TASK_TYPE_SECONDARY_FORBID.format(n.id))
 
 
+def validate_define_task_type(raw: dict) -> None:
+    """部署/发布腿的节点级协办禁配（issues/252 ＋ 253 实施轮 T2 缺口②）。
+
+    病灶：禁配判据原先只挂在 ``parse_flow_model``（运行期读定义那一跳），而门面
+    ``_deploy``／``_processDefine_redeploy``／发布腿走的是 ``_parse_define_content``
+    纯 JSON 解析 ⇒ ``taskType=1`` 的定义能 code=0 落进 define 行，禁配形同虚设
+    （java 同判据在 ``ModelParser.parse``，部署腿本来就过它）。
+
+    本函数**不新造判据**：复用 ``_parse_node`` ＋ ``_validate_task_type`` 那一枚单点，
+    只把"解析期报错、零写入"提前到落库之前。custom 记录节点同样不受影响
+    （``_validate_task_type`` 只认 ``snaker:task``，RECORD(2) 历史行不经禁配）。
+    """
+    _validate_task_type([_parse_node(n) for n in (raw or {}).get("nodes", [])])
+
+
 def parse_flow_model(raw: dict) -> FlowModel:
     """从 JSON dict 解析 FlowModel，过滤未知字段。
 

@@ -14,7 +14,7 @@ laravel ``WfPermission.php``／salvo ``wf_permission.rs``／csharp ``WfEndpoints
 三档优先级（java ``permissionCodes`` 的判据次序，不许自创）：
 ① 放行清单（``NO_PERM_ACTIONS``，11 条）→ ``None``（登录即可，boot3 无注解＝登录即可；
    统计三条是 issues/103 的收口成果）；
-② OR 表（``OR_RULES``，7 条）→ 权限码列表，**OR 语义**：任一持有即有权
+② OR 表（``OR_RULES``，8 条）→ 权限码列表，**OR 语义**：任一持有即有权
    （boot3 ``@SaCheckPermission(value={...}, mode=OR)``）；
 ③ 默认派生：``"wf:" + action.replace("/", ":")``。
 
@@ -46,7 +46,7 @@ class ActionPermissionProvider(ABC):
 
 # ─── 内置默认件（java DefaultActionPermissionProvider 的逐条同款）─────────────
 
-# OR 规则表（对齐 java OR_RULES，7 条——条目数是跨栈契约形状锚，加一条要八栈同批改）
+# OR 规则表（对齐 java OR_RULES，8 条——条目数是跨栈契约形状锚，加一条要八栈同批改）
 OR_RULES: dict[str, list[str]] = {
     "processDefine/detail": ["wf:processDefine:detail", "wf:processDesign:listByType"],
     "processDefine/startAndExecute": ["wf:processDefine:startAndExecute", "wf:processDesign:listByType"],

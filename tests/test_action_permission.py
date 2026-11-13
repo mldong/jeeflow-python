@@ -73,7 +73,7 @@ def test_new_actions_ride_execute_code():
     assert permission_codes("processTask/removeTaskActor") == ["wf:processTask:removeTaskActor"]
 
 
-# ─── 表形状锚（与 java OR_RULES 7 条／NO_PERM_ACTIONS 11 条对齐）─────────────
+# ─── 表形状锚（与 java OR_RULES 8 条／NO_PERM_ACTIONS 11 条对齐）─────────────
 
 def test_table_shape_matches_java():
     # 刻意写死数字：不是"会漂的读数"，而是跨栈契约的形状锚——加一条要八栈同批改

@@ -313,6 +313,15 @@ class JdbcRepository(ProcessRepository):
             finally:
                 await self._adapter.release(raw)
 
+    async def lock_instance(self, instance_id: int) -> None:
+        """实例级事务排他（spec 04 · 并发保护）：实例行 SELECT … FOR UPDATE，
+        锁随最外层 with_tx 提交/回滚释放。行不存在不新造失败面（调用方既有判据报错）。"""
+        if not instance_id:
+            return
+        async with self._conn() as conn:
+            await conn.fetchone(self._sql(
+                "SELECT id FROM wf_process_instance WHERE id = ? FOR UPDATE"), (instance_id,))
+
     # ── ProcessDefine ──────────────────────────────────────────────────────
 
     async def find_define_by_name(self, name: str) -> Optional[ProcessDefine]:

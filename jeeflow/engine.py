@@ -19,6 +19,7 @@ from .model import (
     parse_flow_model,
 )
 from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
+from .spi import TimeAction, TimeActionSink
 from .spi import normalize_actors
 from .default_evaluator import DefaultExpressionEvaluator
 from .extensions import EngineExtensions, EventType, ProcessEvent
@@ -34,6 +35,15 @@ from .extensions import EngineExtensions, EventType, ProcessEvent
 # context 拷贝 ⇒ 公开方法入口 ``set`` 一枚**每次调用新建的 list**、建单腿 ``get`` 后追加，
 # 并发办理互不串味（go 用 typed ctx 值、node 用 AsyncLocalStorage，同一件事的三种宿主形状）。
 _NEW_TASKS: "contextvars.ContextVar[Optional[list]]" = contextvars.ContextVar("jeeflow_new_tasks", default=None)
+
+# 引擎时钟（spec 04 · 时间基准）：构造函数注入即覆盖；未注入用系统钟。
+# 模块级是因为到期求值走模块函数 `_apply_expire_time`/`process_time`（与 java FlowUtil
+# 静态时钟同形）；同一进程多引擎仅在测试里出现，按最后注入者生效。
+_CLOCK = None
+
+
+def _engine_now() -> datetime:
+    return _CLOCK() if _CLOCK is not None else datetime.now()
 
 
 def _append_new_task(task: ProcessTask) -> None:
@@ -147,8 +157,15 @@ class Engine:
 
 class EngineImpl(Engine):
     def __init__(self, repo: ProcessRepository, user_prov: UserProvider = None,
-                 id_gen: IDGenerator = None, expr_eval: ExpressionEvaluator = None):
+                 id_gen: IDGenerator = None, expr_eval: ExpressionEvaluator = None,
+                 *, time_action_sink: Optional[TimeActionSink] = None,
+                 clock: Optional[Callable[[], datetime]] = None):
+        global _CLOCK
         self.repo = repo
+        self.time_action_sink = time_action_sink
+        self.clock = clock
+        if clock is not None:
+            _CLOCK = clock
         self.user_prov = user_prov
         self.id_gen = id_gen
         self.expr_eval = expr_eval
@@ -180,6 +197,74 @@ class EngineImpl(Engine):
             self.ext = EngineExtensions()
         self.ext.ext_repository = ext_repo
         return self
+
+    # ─── 任务时限动作（spec 04 · 零 schema）────────────────────────────────
+
+    def _now(self) -> datetime:
+        return self.clock() if self.clock is not None else datetime.now()
+
+    async def _lock_instance(self, instance_id) -> None:
+        """实例级事务排他：仓储实现 lock_instance 时加实例行锁（未实现＝进程内互斥）。"""
+        if instance_id and hasattr(self.repo, "lock_instance"):
+            await self.repo.lock_instance(instance_id)
+
+    async def _cancel_task_actions(self, task_id) -> None:
+        if self.time_action_sink is not None and task_id is not None:
+            await self.time_action_sink.cancel_task_time_actions(task_id)
+
+    async def _cancel_instance_actions(self, instance_id) -> None:
+        if self.time_action_sink is not None and instance_id is not None:
+            await self.time_action_sink.cancel_instance_time_actions(instance_id)
+
+    async def _schedule_time_actions(self, nt: ProcessTask, node: Optional[FlowNode],
+                                     inst: ProcessInstance, allow: bool = True) -> None:
+        """建单侧动作行（与任务落库同事务）：AUTO_COMPLETE（autoExecute=Y 且有到期时间）
+        与首条 REMIND（有效 reminderTime）。协办/征询成员行由调用方传 allow=False。"""
+        if self.time_action_sink is None or not allow or nt is None or node is None:
+            return
+        if nt.taskState != TaskState.DOING:
+            return
+        props = node.properties or {}
+        if str(props.get("autoExecute") or "") == "Y":
+            if nt.expireTime is None:
+                logging.warning("[jeeflow] 时限配置诊断 task=%s node=%s autoExecute=Y 但无有效到期时间",
+                                nt.id, node.id)
+            else:
+                await self.time_action_sink.insert_time_action(TimeAction(
+                    type="AUTO_COMPLETE", dueAt=_epoch_millis(nt.expireTime),
+                    instanceId=nt.processInstanceId, taskId=nt.id, nodeKey=node.id,
+                    occurrenceNo=0, idempotencyKey=f"wf:auto:{nt.id}:0"))
+        raw = props.get("reminderTime")
+        if raw is not None and str(raw).strip():
+            due = _parse_reminder_time(str(raw), inst.variables or {}, nt.createTime)
+            if due is None:
+                logging.warning("[jeeflow] 时限配置诊断 task=%s node=%s reminderTime=%r 解析不出",
+                                nt.id, node.id, raw)
+            else:
+                await self.time_action_sink.insert_time_action(TimeAction(
+                    type="REMIND", dueAt=_epoch_millis(due),
+                    instanceId=nt.processInstanceId, taskId=nt.id, nodeKey=node.id,
+                    occurrenceNo=1, idempotencyKey=f"wf:remind:{nt.id}:1"))
+
+    async def _insert_callback_action(self, task: ProcessTask, node: Optional[FlowNode]) -> None:
+        if self.time_action_sink is None or node is None or task is None or task.id is None:
+            return
+        name = str((node.properties or {}).get("callback") or "").strip()
+        if not name:
+            return
+        await self.time_action_sink.insert_time_action(TimeAction(
+            type="CALLBACK", dueAt=_epoch_millis(self._now()),
+            instanceId=task.processInstanceId, taskId=task.id, nodeKey=node.id,
+            occurrenceNo=0, idempotencyKey=f"wf:callback:{task.id}:0"))
+
+    async def _save_new_task(self, inst: ProcessInstance, nt: ProcessTask, node: Optional[FlowNode],
+                             process_name: Optional[str], allow_actions: bool = True) -> None:
+        """建单统一腿：委托并入 → save_task → 产出列表 → 时限动作建行。"""
+        if process_name is not None:
+            await self._apply_surrogate(nt, process_name)
+        await self.repo.save_task(nt)
+        _append_new_task(nt)
+        await self._schedule_time_actions(nt, node, inst, allow_actions)
 
     def expr_eval_or_default(self) -> ExpressionEvaluator:
         """决策/条件表达式的**单一求值出口**（issues/160）：宿主注册了 SPI 就走宿主，
@@ -405,7 +490,7 @@ class EngineImpl(Engine):
             task_id, operator, args,
             on_task_updated=lambda instance_id: self.handle_cc_actors(
                 instance_id, operator, args.get(KEY_CC_ACTORS)))
-        now = datetime.now()
+        now = self._now()
         cur_node = _find_node(flow, task.taskName)
         if cur_node:
             # 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
@@ -453,9 +538,7 @@ class EngineImpl(Engine):
                         # 变量源＝实例变量（与写点①②③同档，boot2 的 execution.getArgs()；
                         # 只有写点④回退新建用随行那份 hisVariable）。
                         _apply_expire_time(nt, (cur_node.properties or {}).get("expireTime"), inst.variables)
-                        await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
-                        await self.repo.save_task(nt)
-                        _append_new_task(nt)
+                        await self._save_new_task(inst, nt, cur_node, await self._surrogate_process_name(flow, inst))
                         # PROCESS_TASK_START（码 3）：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
                         await self._fire_task_start(inst, nt, cur_node.id, operator)
                         return await self.repo.find_instance_by_id(inst.id)
@@ -579,9 +662,7 @@ class EngineImpl(Engine):
             # 到期时间同尺（issues/126 先例）：走既有建单腿的写点，变量源＝实例变量，
             # 与写点①②③同档；不新增写点、不另造尺子
             _apply_expire_time(nt, expire_expr, inst.variables)
-            await self._apply_surrogate(nt, process_name)
-            await self.repo.save_task(nt)
-            _append_new_task(nt)
+            await self._save_new_task(inst, nt, node, process_name)
             # PROCESS_TASK_START（码 3）：任务行落库**之后** fire（建单拦截器/事件/通知走既有腿）
             await self._fire_task_start(inst, nt, node, operator)
 
@@ -609,7 +690,7 @@ class EngineImpl(Engine):
         node = _find_node(flow, node_name) if flow is not None else None
         if not (_as.node_allows(node) or _cl.node_enabled(node)):
             return 0
-        now = datetime.now()
+        now = self._now()
         abandoned = 0
         for t in await self.repo.find_doing_tasks(inst.id, [node_name]):
             t.abandon(now)
@@ -634,7 +715,7 @@ class EngineImpl(Engine):
         调用方（门面）随后还须：主办行追加账本＋盖轮次戳＋ ``update_task``（主办**不办结**＝
         征询挂起）——与 java 的写序一致（成员行先落库，主办行腿随后）。
         """
-        now = datetime.now()
+        now = self._now()
         form = (node.properties or {}).get("form", "")
         expire_expr = (node.properties or {}).get("expireTime")
         # 征询节点不可能是首任务节点（解析期已拦），沿用现成判据算，不写死 false——与后加签腿同形
@@ -655,9 +736,7 @@ class EngineImpl(Engine):
                 flow, node.id, host.variables, host.id, nt.id)
             # 到期时间同尺（issues/126 先例）：走既有建单腿的写点，变量源＝实例变量
             _apply_expire_time(nt, expire_expr, inst.variables)
-            await self._apply_surrogate(nt, process_name)
-            await self.repo.save_task(nt)
-            _append_new_task(nt)
+            await self._save_new_task(inst, nt, node, process_name)
             # PROCESS_TASK_START（码 3）：任务行落库**之后** fire（建单拦截器/事件/通知走既有腿）
             await self._fire_task_start(inst, nt, node.id, operator)
             created.append(nt)
@@ -679,6 +758,8 @@ class EngineImpl(Engine):
         两仓同源）；flow.auto / flow.admin 特权放行（与转办同口径）。
         """
         _pre = await self.repo.find_task_by_id(task_id)
+        # 实例级事务排他（spec 04 · 并发保护）：先锁再读
+        await self._lock_instance(_pre.processInstanceId if _pre else None)
         # 同实例串行化（与 execute_process_task 同口径）：「判窗口 → 废弃 → 建行」
         # 在同一临界区里（spec 04 并发与事务同款声明）
         async with _rj.instance_lock(self, _pre.processInstanceId if _pre else 0):
@@ -692,7 +773,7 @@ class EngineImpl(Engine):
                 _NEW_TASKS.reset(token)
 
     async def _recall_task_impl(self, task_id: int, operator: str) -> ProcessTask:
-        now = datetime.now()
+        now = self._now()
         # 判据 1：目标行存在且已办结（不存在／进行中／已废弃同档）
         target = await self.repo.find_task_by_id(task_id)
         if target is None or not target.is_finished():
@@ -737,9 +818,7 @@ class EngineImpl(Engine):
         if len(roster) > 1:
             nt.actorIds = roster
         _apply_expire_time(nt, (node.properties or {}).get("expireTime"), inst.variables)
-        await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
-        await self.repo.save_task(nt)
-        _append_new_task(nt)
+        await self._save_new_task(inst, nt, node, await self._surrogate_process_name(flow, inst))
         await self._fire_task_start(inst, nt, node.id, operator)
         # 写 3：原 FINISHED 行不改写，只盖 tf_recallHistory 追加账本（recalledTaskId 指向复活行）
         _rc.append_recall_history(target, operator, nt.id)
@@ -768,6 +847,7 @@ class EngineImpl(Engine):
         update_task。建单形状照征询成员行腿，另落 task_type=1／performType=NORMAL。
         """
         _pre = await self.repo.find_task_by_id(task_id)
+        await self._lock_instance(_pre.processInstanceId if _pre else None)
         # 同实例串行化（与 execute/recall 同口径）：「判协办行 DOING → 建协办行」在同一临界区
         async with _rj.instance_lock(self, _pre.processInstanceId if _pre else 0):
             created: list[ProcessTask] = []
@@ -821,7 +901,7 @@ class EngineImpl(Engine):
                 if t.is_doing() and actor in (t.actorIds or []):
                     raise ValueError(_ad.MSG_DUPLICATE)
         # ── 判据全过，以下才允许写 ──
-        now = datetime.now()
+        now = self._now()
         round_no = _ad.last_round(host) + 1
         first_task_node = self._is_first_task_node(flow, node)
         form = (node.properties or {}).get("form", "")
@@ -840,9 +920,7 @@ class EngineImpl(Engine):
             nt.variables[_rj.VAR_BRANCH_CTX] = _rj.build_scopes(
                 flow, node.id, host.variables, host.id, nt.id)
             # 既有建单腿：委托并入（不摘原人）→ save_task 落库 → 产出列表 → 码 3
-            await self._apply_surrogate(nt, process_name)
-            await self.repo.save_task(nt)
-            _append_new_task(nt)
+            await self._save_new_task(inst, nt, node, process_name, allow_actions=False)
             await self._fire_task_start(inst, nt, node.id, operator)
             created.append(nt)
         # 等待闸开关＋账本落主办行（主办不办结，变量合并序保证账本活到办结后）
@@ -888,7 +966,7 @@ class EngineImpl(Engine):
         for t in (inst.tasks or []):
             if t.taskName == node_name and t.is_doing() and _ad.is_aidant_row(t):
                 by_host.setdefault(t.parentTaskId or 0, []).append(t)
-        now = datetime.now()
+        now = self._now()
         abandoned = 0
         for parent_id, rows in by_host.items():
             actors: list = []
@@ -935,8 +1013,10 @@ class EngineImpl(Engine):
         # issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签/征询的既有废弃腿
         await self._abandon_aidant_on_node(inst, _t.taskName, operator)
         await self._abandon_add_sign_doing(_flow, inst, _t.taskName, operator)
-        inst.reject(datetime.now())
+        inst.reject(self._now())
         await self.repo.update_instance(inst)
+        # 实例终态 ⇒ 取消该实例 pending 提醒/自动行（CALLBACK 表示既成事实，不取消）
+        await self._cancel_instance_actions(inst.id)
         # 实例进入终态＝PROCESS_INSTANCE_END（码 2），拒绝/办结合一号（spec §11.6：
         # 旧的 PROCESS_REJECT/PROCESS_FINISH 拆分以「实例终态＝2」为准，靠载荷 state 分）
         await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
@@ -1098,6 +1178,10 @@ class EngineImpl(Engine):
         本栈唯一挂此钩子的是 ``execute_process_task``（办理抄送腿）；jump/reject 族一律不挂
         （spec §11.7 边界 2）。钩子留在公共序言的调用位＝与任务更新同一次调用栈（同事务作用域），
         满足 §11.7 边界 1。"""
+        # 实例级事务排他（spec 04 · 并发保护）：先锁再读，避免"读后锁前"被另一事务改写
+        _pre = await self.repo.find_task_by_id(task_id)
+        if _pre is not None:
+            await self._lock_instance(_pre.processInstanceId)
         task, inst = await self._load_and_check(task_id, operator)
         # issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
         def_ = await self.repo.find_define_by_id(inst.defineId)
@@ -1123,7 +1207,7 @@ class EngineImpl(Engine):
         base_vars = inst.variables
         vars_ = {**base_vars, **task.variables, **args}
         await self._add_user_info(operator, vars_)
-        now = datetime.now()
+        now = self._now()
         # 聚合根：完成任务（子实体状态转换 + 实例变量合并）
         inst.complete_task(task, operator, vars_, now)
         await self.repo.update_task(task)
@@ -1138,6 +1222,8 @@ class EngineImpl(Engine):
         # 跨栈分叉，本轮按 go/java 收窄）。
         if on_task_updated is not None:
             await on_task_updated(inst.id)
+        # 时限动作联动：任务离开 DOING ⇒ 取消该任务 pending 提醒/自动行
+        await self._cancel_task_actions(task.id)
         # 任务落库后 fire（spec §11.3 码 5/6 互斥：同一动作走退回就不再 fire「办掉」；
         # 拒绝/退上一步/退发起人/会签软拒绝都归 TASK_REJECT，靠载荷 submitType 分档）。
         # submitType 只取**本次 args**——实例变量里可能残留上一步的 submitType（_merge_exec_into_instance
@@ -1146,6 +1232,9 @@ class EngineImpl(Engine):
         if submit_type is None:
             submit_type = reject_as
         is_reject = reject_as is not None or submit_type in _REJECT_SUBMIT_TYPES
+        # 完成回调（spec 04 · CALLBACK）：只对应 TASK_COMPLETE 事实（退回族不触发）
+        if not is_reject:
+            await self._insert_callback_action(task, _find_node(flow, task.taskName))
         evt_type = EventType.TASK_REJECT if is_reject else EventType.TASK_COMPLETE
         await self._fire_event(ProcessEvent(evt_type, inst.id, task.id, task.taskName, operator,
                                             submitType=submit_type))
@@ -1243,7 +1332,7 @@ class EngineImpl(Engine):
             actor = (his.variables or {}).get("u_userId") or inst.operator
         if not actor:
             raise ValueError(ERR_ROLLBACK_NO_LINEAGE)
-        now = datetime.now()
+        now = self._now()
         form = (prev.properties or {}).get("form", "")
         nt = inst.create_task(self._next_id(), prev.id, (prev.text or {}).get("value", ""),
                               actor, his.createUser, form, now,
@@ -1263,9 +1352,7 @@ class EngineImpl(Engine):
         cur_node = _find_node(flow, task.taskName)
         _apply_expire_time(nt, (cur_node.properties or {}).get("expireTime") if cur_node else None,
                            nt.variables)
-        await self._apply_surrogate(nt, await self._surrogate_process_name(flow, inst))
-        await self.repo.save_task(nt)
-        _append_new_task(nt)
+        await self._save_new_task(inst, nt, prev, await self._surrogate_process_name(flow, inst))
         await self._fire_task_start(inst, nt, prev.id, operator)
         return nt
 
@@ -1331,37 +1418,29 @@ class EngineImpl(Engine):
             perform_type = int(_pt)
         except (ValueError, TypeError):
             perform_type = 1 if str(_pt).strip().upper() in ("ALL", "COUNTERSIGN") else 0
-        now = datetime.now()
+        now = self._now()
         form = node.properties.get("form", "")
         if perform_type == 1 and ct:
             if ct in ("PARALLEL", ""):
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
-                    await self._apply_surrogate(nt, process_name)
-                    await self.repo.save_task(nt)
-                    _append_new_task(nt)
+                    await self._save_new_task(inst, nt, node, process_name)
                     await self._fire_task_start(inst, nt, node.id, operator)
             elif ct == "SEQUENTIAL":
                 nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first, 1)
                 nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
-                await self._apply_surrogate(nt, process_name)
-                await self.repo.save_task(nt)
-                _append_new_task(nt)
+                await self._save_new_task(inst, nt, node, process_name)
                 await self._fire_task_start(inst, nt, node.id, operator)
             else:
                 for a in actors:
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
-                    await self._apply_surrogate(nt, process_name)
-                    await self.repo.save_task(nt)
-                    _append_new_task(nt)
+                    await self._save_new_task(inst, nt, node, process_name)
                     await self._fire_task_start(inst, nt, node.id, operator)
         else:
             nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), actors[0], operator, form, now, parent_id, is_first)
             if len(actors) > 1:
                 nt.actorIds = actors
-            await self._apply_surrogate(nt, process_name)
-            await self.repo.save_task(nt)
-            _append_new_task(nt)
+            await self._save_new_task(inst, nt, node, process_name)
             await self._fire_task_start(inst, nt, node.id, operator)
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
@@ -1407,12 +1486,13 @@ class EngineImpl(Engine):
                 # 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish
                 submit_type = inst.variables.get(KEY_SUBMIT_TYPE)
                 if submit_type is not None and int(submit_type) == int(SubmitType.REJECT):
-                    inst.reject(datetime.now())
+                    inst.reject(self._now())
                 else:
-                    inst.finish(datetime.now())
+                    inst.finish(self._now())
                 # issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 _prepare_execute_task 一致）
                 inst.variables = _merge_exec_into_instance(inst.variables, vars_)
                 await self.repo.update_instance(inst)
+                await self._cancel_instance_actions(inst.id)
                 # PROCESS_INSTANCE_END（码 2）：实例 state 落库之后 fire，载荷带落库后的 state
                 # （办结 20 / 拒绝 45 共用一号，spec §11.6 收口旧的 Finish/Reject 拆分）
                 await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
@@ -1503,7 +1583,7 @@ class EngineImpl(Engine):
         except (ValueError, TypeError):
             perform_type = 1 if str(_pt).strip().upper() in ("ALL", "COUNTERSIGN") else 0
         ct = node.properties.get("countersignType", "")
-        now = datetime.now()
+        now = self._now()
         form = node.properties.get("form", "")
         # issues/126 案 A：节点到期表达式（可能没配）；变量源＝实例变量（boot2 execution.getArgs()）
         expire_expr = node.properties.get("expireTime")
@@ -1516,9 +1596,7 @@ class EngineImpl(Engine):
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     # 写点③「并行会签全员」：每位成员各算一次（Java createCountersignTasks 并行循环）
                     _apply_expire_time(nt, expire_expr, inst.variables)
-                    await self._apply_surrogate(nt, process_name)
-                    await self.repo.save_task(nt)
-                    _append_new_task(nt)
+                    await self._save_new_task(inst, nt, node, process_name)
                     # PROCESS_TASK_START（码 3）：任务落库后 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
                     await self._fire_task_start(inst, nt, node.id, operator)
             elif ct == "SEQUENTIAL":
@@ -1532,9 +1610,7 @@ class EngineImpl(Engine):
                 # （ProcessTaskServiceImpl:485/:524）⇒ 首成员与推进出的成员都带到期，不是只有首位。
                 _apply_expire_time(nt, expire_expr, inst.variables)
                 nt.variables |= {f"operatorList_{node.id}": actors, f"loopCounter_{node.id}": 0, f"nrOfInstances_{node.id}": len(actors)}
-                await self._apply_surrogate(nt, process_name)
-                await self.repo.save_task(nt)
-                _append_new_task(nt)
+                await self._save_new_task(inst, nt, node, process_name)
                 await self._fire_task_start(inst, nt, node.id, operator)
             else:
                 # 同 PARALLEL 档：零参与者也要落一行，不吃空列表
@@ -1542,9 +1618,7 @@ class EngineImpl(Engine):
                     nt = inst.create_task(self._next_id(), node.id, node.text.get("value", ""), a, operator, form, now, parent_id, is_first, 1)
                     # 未知/比例会签档（RATIO_* 等）＝ Java 的"非 SEQUENTIAL 一律并行全员"循环
                     _apply_expire_time(nt, expire_expr, inst.variables)
-                    await self._apply_surrogate(nt, process_name)
-                    await self.repo.save_task(nt)
-                    _append_new_task(nt)
+                    await self._save_new_task(inst, nt, node, process_name)
                     await self._fire_task_start(inst, nt, node.id, operator)
         else:
             # 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
@@ -1555,9 +1629,7 @@ class EngineImpl(Engine):
             _apply_expire_time(nt, expire_expr, inst.variables)
             if len(actors) > 1:
                 nt.actorIds = actors
-            await self._apply_surrogate(nt, process_name)
-            await self.repo.save_task(nt)
-            _append_new_task(nt)
+            await self._save_new_task(inst, nt, node, process_name)
             await self._fire_task_start(inst, nt, node.id, operator)
 
     async def _exec_custom_node(self, flow: FlowModel, inst: ProcessInstance, node: FlowNode,
@@ -1623,7 +1695,7 @@ class EngineImpl(Engine):
             # 上一版这里只有 `elif clazz:` 一档 ⇒ 空串 clazz 静默无日志，配置错误照不出来。
             logging.warning("[jeeflow] custom 节点 %s 未配置 clazz（属性缺失或空串），跳过执行、"
                             "照常落历史行并续流；流程定义请补 properties.clazz", node.id)
-        now = datetime.now()
+        now = self._now()
         ht = inst.create_history_task(self._next_id(), node.id, node.text.get("value", ""),
                                       operator, now, parent_id,
                                       self._is_first_task_node(flow, node))
@@ -2020,7 +2092,8 @@ _INT_PREFIX = re.compile(r"[+-]?[0-9]+")
 _UNIT_BY_SUFFIX = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 
 
-def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime]:
+def process_time(expr: Optional[str], args: Optional[dict],
+                 now: Optional[datetime] = None) -> Optional[datetime]:
     """解析节点配的「期待完成时间」表达式 —— **三档顺序不可换**（Java ``FlowUtil.processTime``，
     jeeflow-java ``d9e9397`` 同批的参考实现）。
 
@@ -2107,7 +2180,56 @@ def process_time(expr: Optional[str], args: Optional[dict]) -> Optional[datetime
         if offset >= 0:
             # 本栈写 createTime 用 naive 本地钟 ⇒ naive datetime + timedelta 是**名义（墙上时钟）加量**：
             # "d" 这一档即日历加天，与 Java Calendar.add(DAY_OF_MONTH) 同形，不是乘 86400 秒的瞬时加法
-            return datetime.now() + timedelta(**{_UNIT_BY_SUFFIX[suffix]: offset})
+            return (now or _engine_now()) + timedelta(**{_UNIT_BY_SUFFIX[suffix]: offset})
+    try:
+        return datetime.strptime(expr, _EXPIRE_LAYOUT)
+    except ValueError:
+        return None
+
+
+def _epoch_millis(t: datetime) -> int:
+    """naive 本地钟 → UTC 毫秒（spec 04 行契约 dueAt）。"""
+    return int(t.timestamp() * 1000)
+
+
+_HHMM = re.compile(r"^(\d{2}):(\d{2})$")
+
+
+def _parse_reminder_time(expr: str, args: dict, create_time: datetime) -> Optional[datetime]:
+    """首次提醒时刻（规范 02 §4.5）：变量 → 相对量（锚点＝任务创建时刻）→ 严格 HH:mm → 绝对。
+    任何一档都不得回落"当前时刻"或 expireTime。"""
+    if not expr or not expr.strip():
+        return None
+    if expr in (args or {}):
+        v = args.get(expr)
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, int) and not isinstance(v, bool):
+            try:
+                return datetime.fromtimestamp(v / 1000)
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(v, str):
+            try:
+                return datetime.strptime(v, _EXPIRE_LAYOUT)
+            except ValueError:
+                return None
+    suffix = expr[-1]
+    if suffix in _UNIT_BY_SUFFIX:
+        prefix = expr[:-1].strip()
+        if _INT_PREFIX.fullmatch(prefix):
+            try:
+                n = int(prefix)
+            except ValueError:
+                n = -1
+            if n >= 0:
+                return create_time + timedelta(**{_UNIT_BY_SUFFIX[suffix]: n})
+    m = _HHMM.fullmatch(expr)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h <= 23 and mi <= 59:
+            t = create_time.replace(hour=h, minute=mi, second=0, microsecond=0)
+            return t if t >= create_time else t + timedelta(days=1)
     try:
         return datetime.strptime(expr, _EXPIRE_LAYOUT)
     except ValueError:

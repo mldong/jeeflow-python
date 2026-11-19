@@ -484,3 +484,39 @@ class ProcessExtRepository(ABC):
     # 引擎读侧不再做宽松转换；自定义 SPI 仓储传非整数即按停用。
     @abstractmethod
     async def get_surrogate(self, operator: str, process_name: str, at=None) -> Optional[ProcessSurrogate]: ...
+
+
+
+@dataclass
+class TimeAction:
+    """任务时限动作凭证（spec 04 · 任务时限动作）：dueAt 用 UTC 毫秒，避免时区歧义。"""
+    type: str
+    dueAt: int
+    instanceId: int
+    taskId: int
+    nodeKey: str
+    occurrenceNo: int
+    idempotencyKey: str
+
+
+class TimeActionSink:
+    """时限动作凭证仓储侧实现（集成层按框架执行队列实现，引擎在业务事务内回调）。
+
+    未注册实现时引擎侧全部时限动作静默跳过。取消只清 REMIND/AUTO_COMPLETE，
+    CALLBACK 表达既成事实、不随失效取消。
+    """
+
+    async def insert_time_action(self, action: TimeAction) -> None:
+        raise NotImplementedError
+
+    async def cancel_task_time_actions(self, task_id: int) -> None:
+        raise NotImplementedError
+
+    async def cancel_instance_time_actions(self, instance_id: int) -> None:
+        raise NotImplementedError
+
+
+class InstanceLocker:
+    """仓储可选的实例级事务排他保护（spec 04 · 并发保护）。"""
+    async def lock_instance(self, instance_id: int) -> None:
+        raise NotImplementedError

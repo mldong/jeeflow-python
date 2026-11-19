@@ -45,6 +45,10 @@ class MemoryRepository(ProcessRepository):
         self._cc: dict[int, list[CcRow]] = {}
         self._seq = 1
 
+    async def lock_instance(self, instance_id):
+        """非数据库仓储的等价单进程互斥由引擎实例锁承担（spec 04 · 并发保护），此处 no-op。"""
+        return None
+
     def add_define(self, d: ProcessDefine):
         d.id = d.id or self._seq; self._seq += 1
         self._defines[d.id] = d

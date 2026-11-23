@@ -60,8 +60,8 @@ def test_handler_registry():
                            displayName="日志记录", order=1, group="pre"))
 
     assignments = r.list_handlers("AssignmentHandler")
-    # 内置 7 个通用 handler（v1.6.0 issues/16）+ 2 个自定义
-    assert len(assignments) == 9
+    # 内置通用 handler（9 条）+ 2 个自定义
+    assert len(assignments) == 11
     # order 升序：内置 OperatorAssignmentHandler order=-9999 最前
     assert assignments[0].className == "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler"
     assert assignments[0].displayName == "流程发起人"
@@ -77,5 +77,13 @@ def test_handler_registry():
 
 def test_empty_registry():
     r = HandlerRegistry()
-    # 构造即内置 7 个通用 handler（v1.6.0 issues/16），空注册表不再为空
-    assert len(r.list_handlers("AssignmentHandler")) == 7
+    # 构造即内置通用 handler（v1.6.0 issues/16 起 7 条 ＋ 表单指定用户两条款），空注册表不再为空
+    metas = r.list_handlers("AssignmentHandler")
+    assert len(metas) == 9
+    # order 70/80 两条新项排在 TaskRoleAssignee(60) 之后
+    assert metas[7].className == "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
+    assert metas[7].displayName == "表单指定用户所属部门经理"
+    assert metas[7].order == 70
+    assert metas[8].className == "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
+    assert metas[8].displayName == "表单指定用户所属部门分管领导"
+    assert metas[8].order == 80

@@ -20,6 +20,9 @@ HANDLER_DEPT_MAIN_LEADER = _ORG_HANDLERS_PREFIX + "DeptMainLeaderAssignmentHandl
 HANDLER_APPLICANT_DEPT_LEADER = _ORG_HANDLERS_PREFIX + "ApplicantDeptLeaderAssignmentHandler"
 HANDLER_APPLICANT_DEPT_MAIN_LEADER = _ORG_HANDLERS_PREFIX + "ApplicantDeptMainLeaderAssignmentHandler"
 HANDLER_TASK_ROLE_ASSIGNEE = _ORG_HANDLERS_PREFIX + "TaskRoleAssigneeHandler"
+# 两个「表单指定用户」类是**顶级类**（不带 OrgUserAssignmentHandlers$ 前缀），注册名与其余语言逐字一致
+HANDLER_FORM_USER_DEPT_LEADER = "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
+HANDLER_FORM_USER_DEPT_MAIN_LEADER = "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
 
 # 表单字段编号后缀正则（task_01 → task）
 _NUMBER_SUFFIX_PATTERN = re.compile(r"^(.+?)_(\d+)$")
@@ -99,6 +102,18 @@ class _OrgBase:
         u = await self.user_prov.get_user(user_id)
         return (u.deptId or "") if u else ""
 
+    async def by_form_user(self, node, inst, main: bool) -> list[str]:
+        """表单字段 → 用户 id → 该用户部门 → 领导（main=True 取分管领导）。
+
+        字段缺失／值为空／用户不存在／无部门／部门无领导／SPI 未注册 ⇒ 空列表，不抛异常。
+        """
+        if node is None or inst is None:
+            return []
+        user_id = _first_form_user_id(_find_form_user_field_value(inst.variables, node.id))
+        if user_id == "":
+            return []
+        return await self.by_dept(await self.dept_id_of(user_id), main)
+
 
 class DeptLeaderAssignmentHandler(_OrgBase, IAssignmentHandler):
     """当前用户（任务操作人）部门领导"""
@@ -144,6 +159,79 @@ class TaskRoleAssigneeHandler(IAssignmentHandler):
         return await self.org_prov.find_by_role(node.id) or []
 
 
+# ─── 表单指定用户 → 该用户所属部门领导 ──────────────────────────────────────────
+#
+# 场景（参照 mldong-fastapi-wf 提交 fe9233d）：HR 代员工提交、代理申请——表单里给出被代理人的
+# 用户 id，取**该员工**所属部门的经理／分管领导，与当前操作人无关。
+
+
+class FormUserDeptLeaderAssignmentHandler(_OrgBase, IAssignmentHandler):
+    """表单指定用户所属部门的经理"""
+
+    async def assign(self, node, inst, operator) -> list[str]:
+        return await self.by_form_user(node, inst, False)
+
+
+class FormUserDeptMainLeaderAssignmentHandler(_OrgBase, IAssignmentHandler):
+    """表单指定用户所属部门的分管领导"""
+
+    async def assign(self, node, inst, operator) -> list[str]:
+        return await self.by_form_user(node, inst, True)
+
+
+def _find_form_user_field_value(variables: dict, node_key: str):
+    """两个「表单指定用户」handler 专用的四档并集查找（顺序即优先级）：
+
+    1. ``f_<nodeKey>``（jeeflow 变量带 f_ 前缀，优先）
+    2. ``<nodeKey>``（裸名回落）
+    3. nodeKey 含 ``#`` 时取最后一个 # 之后的 field：先 ``<field>``、再 ``f_<field>``
+    4. nodeKey 匹配 ``^(.+?)_(\\d+)$`` 时取 base：先 ``f_<base>``、再 ``<base>``
+
+    与 ``FormFieldAssigneeHandler._find_field_value`` 的差别只在 3、4 两档各补了 f_ 变体
+    （参照实现没有 f_ 分支，jeeflow 家族变量存 f_ 必须有）。**现存 7 个 handler 仍走原查找。**
+    """
+    if not variables or not node_key:
+        return None
+    if "f_" + node_key in variables:
+        return variables["f_" + node_key]
+    if node_key in variables:
+        return variables[node_key]
+    if "#" in node_key:
+        field = node_key.rsplit("#", 1)[1]
+        if field in variables:
+            return variables[field]
+        if "f_" + field in variables:
+            return variables["f_" + field]
+    m = _NUMBER_SUFFIX_PATTERN.match(node_key)
+    if m:
+        base = m.group(1)
+        if "f_" + base in variables:
+            return variables["f_" + base]
+        if base in variables:
+            return variables[base]
+    return None
+
+
+def _first_form_user_id(value) -> str:
+    """取**第一个**非空用户 id（多值语义不在本轮承诺）。
+
+    判空只比空串 ⇒ ``"0"`` 是合法 id；列表元素不再拆逗号（与 Go/Node 同形）。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            token = str(item).strip()
+            if token != "":
+                return token
+        return ""
+    for token in str(value).split(","):
+        token = token.strip()
+        if token != "":
+            return token
+    return ""
+
+
 # ─── 注册 ───────────────────────────────────────────────────────────────────────
 
 def register_builtin_assignments(registry: HandlerRegistry,
@@ -157,3 +245,7 @@ def register_builtin_assignments(registry: HandlerRegistry,
     registry.register_assignment(HANDLER_APPLICANT_DEPT_LEADER, ApplicantDeptLeaderAssignmentHandler(user_prov, org_prov))
     registry.register_assignment(HANDLER_APPLICANT_DEPT_MAIN_LEADER, ApplicantDeptMainLeaderAssignmentHandler(user_prov, org_prov))
     registry.register_assignment(HANDLER_TASK_ROLE_ASSIGNEE, TaskRoleAssigneeHandler(org_prov))
+    registry.register_assignment(HANDLER_FORM_USER_DEPT_LEADER,
+                                 FormUserDeptLeaderAssignmentHandler(user_prov, org_prov))
+    registry.register_assignment(HANDLER_FORM_USER_DEPT_MAIN_LEADER,
+                                 FormUserDeptMainLeaderAssignmentHandler(user_prov, org_prov))

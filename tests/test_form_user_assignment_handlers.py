@@ -260,6 +260,31 @@ def test_form_field_handler_unchanged_by_union_lookup():
     assert _run(h.assign(FlowNode(id="manager#userId"), inst, "hr")) == []
 
 
+def test_form_field_number_suffix_tier():
+    """issues/255：老类第三档＝`_NN` 去后缀后查**裸名 base**，正／负各钉一枚。
+
+    本轮之前这条在 Java/Python/Node/PHP/C# 是活的，只有 Go 判据写死、Rust／MoonBit 没有——
+    八语言补齐后由这条测试钉住形状：base 只查裸名，`f_<base>` 是新类扩面。
+    """
+    from jeeflow.builtin import FormFieldAssigneeHandler
+    h = FormFieldAssigneeHandler()
+
+    def actors(node_id, variables):
+        inst = ProcessInstance(id=1, defineId=1, operator="hr", variables=variables)
+        return _run(h.assign(FlowNode(id=node_id), inst, "hr"))
+
+    assert actors("task_01", {"task": "userA,userB"}) == ["userA", "userB"]
+    # 惰性量词的最早可切点：a_b_01 的 base 是 a_b，不是 a
+    assert actors("a_b_01", {"a": "u_x", "a_b": "u_c"}) == ["u_c"]
+    # 优先级：f_<id> → 裸名 → base 裸名
+    assert actors("task_01", {"f_task_01": "u_1", "task_01": "u_2", "task": "u_3"}) == ["u_1"]
+    assert actors("task_01", {"task_01": "u_2", "task": "u_3"}) == ["u_2"]
+    # 反向：尾巴非纯数字、base 为空、base 只有 f_ 形 ⇒ 三档全落空
+    assert actors("task_01x", {"task": "u_3"}) == []
+    assert actors("_01", {"": "u_3"}) == []
+    assert actors("task_02", {"f_task": "u_3"}) == []
+
+
 # ─── 注册名／元数据 ──────────────────────────────────────────────────────────────
 
 def test_registration_names_are_top_level_fqns():

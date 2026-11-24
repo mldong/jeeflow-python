@@ -11,11 +11,12 @@ from . import recall as _rc
 from . import collect as _cl
 from . import aidant as _ad
 from .model import (
-    FlowModel, FlowNode, FlowEdge,
+    FlowModel, FlowNode, FlowEdge, SubProcessModel,
     TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK, TYPE_JOIN, TYPE_CUSTOM,
-    KNOWN_NODE_TYPES,
+    SUB_PROCESS_TYPES, KNOWN_NODE_TYPES, TF_KEY_PREFIX,
     ProcessInstance, ProcessTask, ProcessDefine,
-    InstanceState, TaskState, SubmitType, PerformType,
+    InstanceState, TaskState, TaskType, SubmitType, PerformType,
+    ERR_NOT_FOUND_PROCESS_DEFINE,
     parse_flow_model,
 )
 from .spi import ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator
@@ -51,6 +52,52 @@ def _append_new_task(task: ProcessTask) -> None:
     sink = _NEW_TASKS.get()
     if sink is not None:
         sink.append(task)
+
+
+async def apply_initial_tasks(engine, repo, instance_id: int, applicant: str,
+                              args: Optional[dict[str, Any]] = None) -> list[ProcessTask]:
+    """复用顶层 ``startAndExecute`` 的首任务自办腿（issues/257 裁决 D）。
+
+    只对启动时已经存在的 DOING 快照逐任务办理：先加入真实发起人，再以
+    ``flow.auto + submitType=0`` 执行。无 apply 节点时，首任务同样按此规则自办。
+    门面顶层发起与子流程启动共用本函数，避免两套自办语义漂移。
+    """
+    created: list[ProcessTask] = []
+    for task in await repo.find_doing_tasks(instance_id):
+        await repo.add_task_actor(task.id, [applicant])
+        apply_args = dict(args or {})
+        apply_args[KEY_SUBMIT_TYPE] = int(SubmitType.APPLY)
+        next_operator = apply_args.get(KEY_PROCESS_START_NEXT_NODE_OPERATOR)
+        if next_operator is not None and str(next_operator) != "":
+            apply_args[KEY_NEXT_NODE_OPERATOR] = next_operator
+        created.extend(await engine.execute_process_task(task.id, KEY_AUTO_ID, apply_args))
+    return created
+
+
+def _real_operator(operator: str, parent: Optional[ProcessInstance]) -> str:
+    """系统代执行/超级管理员回退父实例 operator，其余保留真实触发人。"""
+    if parent is not None and operator and (
+            operator.lower() == KEY_AUTO_ID or operator.lower() == KEY_ADMIN_ID):
+        return parent.operator
+    return operator
+
+
+def _child_args(parent_args: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """复制父业务参数并剥除本次提交/直返上下文（issues/257 裁决 D）。"""
+    args = dict(parent_args or {})
+    for key in (KEY_SUBMIT_TYPE, KEY_PROCESS_START_NEXT_NODE_OPERATOR,
+                KEY_NEXT_NODE_OPERATOR, _rj.VAR_BRANCH_CTX, _rj.VAR_REAPPLY_CTX):
+        args.pop(key, None)
+    for key in list(args):
+        if key and key.startswith(TF_KEY_PREFIX):
+            args.pop(key, None)
+    return args
+
+
+def _raise_missing_sub_process_define(process_name: str) -> None:
+    error = ValueError(f"子流程{process_name}定义不存在")
+    error.code = ERR_NOT_FOUND_PROCESS_DEFINE
+    raise error
 
 
 # 无状态 ⇒ 模块级单件（rust 侧同形：静态 ``DefaultExpressionEvaluator``）
@@ -142,7 +189,10 @@ def parse_cc_actors(value: Any) -> list[str]:
 class Engine:
     """引擎接口"""
 
-    async def start_process_instance_by_id(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance: ...
+    async def start_process_instance_by_id(self, define_id: int, operator: str,
+                                           args: dict[str, Any] = None,
+                                           parent_id: Optional[int] = None,
+                                           parent_node_name: str = "") -> ProcessInstance: ...
     async def execute_process_task(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]: ...
     async def execute_and_jump_to_end(self, task_id: int, operator: str, args: dict[str, Any] = None) -> list[ProcessTask]: ...
     async def execute_and_jump_task(self, task_id: int, operator: str, args: dict[str, Any] = None, target_task_name: str = None) -> list[ProcessTask]: ...
@@ -414,11 +464,18 @@ class EngineImpl(Engine):
             return await fn()
         return await with_tx(fn)
 
-    async def start_process_instance_by_id(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+    async def start_process_instance_by_id(self, define_id: int, operator: str,
+                                           args: dict[str, Any] = None,
+                                           parent_id: Optional[int] = None,
+                                           parent_node_name: str = "") -> ProcessInstance:
         # audit8 R9 145-3：入口事务包裹（错误处理/事件在包裹内外语义见 spec/12 §12.2）
-        return await self._in_tx(lambda: self._start_process_instance_by_id_impl(define_id, operator, args))
+        return await self._in_tx(lambda: self._start_process_instance_by_id_impl(
+            define_id, operator, args, parent_id, parent_node_name))
 
-    async def _start_process_instance_by_id_impl(self, define_id: int, operator: str, args: dict[str, Any] = None) -> ProcessInstance:
+    async def _start_process_instance_by_id_impl(self, define_id: int, operator: str,
+                                                 args: dict[str, Any] = None,
+                                                 parent_id: Optional[int] = None,
+                                                 parent_node_name: str = "") -> ProcessInstance:
         def_ = await self.repo.find_define_by_id(define_id)
         if not def_: raise ValueError(f"define not found: {define_id}")
         flow = parse_flow_model(json.loads(def_.content))
@@ -429,6 +486,7 @@ class EngineImpl(Engine):
         await self._add_user_info(operator, vars_)
         self._add_auto_gen_title(def_.displayName, vars_)
         inst = ProcessInstance(id=self._next_id(), defineId=define_id, operator=operator,
+                               parentId=parent_id, parentNodeName=parent_node_name,
                                variables=vars_, createTime=datetime.now(), updateTime=datetime.now(),
                                createUser=operator, updateUser=operator,
                                businessNo=str(vars_.get(KEY_BUSINESS_NO, "")))
@@ -1013,15 +1071,10 @@ class EngineImpl(Engine):
         # issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签/征询的既有废弃腿
         await self._abandon_aidant_on_node(inst, _t.taskName, operator)
         await self._abandon_add_sign_doing(_flow, inst, _t.taskName, operator)
-        inst.reject(self._now())
-        await self.repo.update_instance(inst)
-        # 实例终态 ⇒ 取消该实例 pending 提醒/自动行（CALLBACK 表示既成事实，不取消）
-        await self._cancel_instance_actions(inst.id)
-        # 实例进入终态＝PROCESS_INSTANCE_END（码 2），拒绝/办结合一号（spec §11.6：
-        # 旧的 PROCESS_REJECT/PROCESS_FINISH 拆分以「实例终态＝2」为准，靠载荷 state 分）
-        await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
-                                            operator=operator, state=int(inst.state)))
-        return await self.repo.find_instance_by_id(inst.id)
+        # issues/257：拒绝终态与正常结束共用 EndProcessHandler 形状——主办未齐则拒绝结束，
+        # 协办自动办结；实例终态落库后播一次，再按父子关系回父推进。
+        await self._finish_instance(inst, operator, _vars, reject=True)
+        return inst
 
     # ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）──
 
@@ -1188,6 +1241,9 @@ class EngineImpl(Engine):
         flow = parse_flow_model(json.loads(def_.content))
         # 定义行 name 记入回落缓存（同 start 路径，条款 1.1 解析收敛在 _surrogate_process_name 单点）
         self._cache_define_name(inst.defineId, def_.name)
+        # issues/257：当前任务的直接出边若命中子流程，定义必须在办结当前任务前校验；
+        # 内存仓没有事务回滚，后置校验会留下「当前任务已办掉但子流程没起来」的假成功。
+        await self._validate_sub_process_targets(flow, _find_node(flow, task.taskName))
         args = _filter_field_by_perm(args or {}, _find_node(flow, task.taskName))
         # 后加签写入口校验（规范 04 · 后加签）：四判据**必须排在 complete_task 之前**——
         # 内存仓储无回滚，先办结再判错就留下一条已完成却无人能改回的任务行（"报错且零写入"
@@ -1454,6 +1510,118 @@ class EngineImpl(Engine):
         if not inst: raise ValueError("instance not found")
         return task, inst
 
+    async def _find_sub_process_define(self, node: "SubProcessModel") -> Optional[ProcessDefine]:
+        return await self.repo.find_define_by_name_and_version(node.processName, node.version)
+
+    async def _validate_sub_process_targets(self, flow: FlowModel,
+                                            current: Optional[FlowNode]) -> None:
+        """当前任务直接出边的子流程定义写前预检（issues/257）。"""
+        if current is None:
+            return
+        for target in _follow_edges(flow, current.id):
+            if target.type not in SUB_PROCESS_TYPES:
+                continue
+            if await self._find_sub_process_define(target) is None:
+                _raise_missing_sub_process_define(target.processName)
+
+    async def _start_sub_process(self, node: "SubProcessModel", inst: ProcessInstance,
+                                 operator: str, vars_: dict) -> ProcessInstance:
+        """定位定义 → 起真子实例 → 复用 startAndExecute 自办（issues/257）。"""
+        define = await self._find_sub_process_define(node)
+        if define is None:
+            _raise_missing_sub_process_define(node.processName)
+        real_operator = _real_operator(operator, inst)
+        child_args = _child_args(vars_)
+        parent_tasks_before = {task.id for task in await self.repo.find_doing_tasks(inst.id)}
+
+        # 子 start/自办会自行 save_task + fire 码 3。这里隔离父 execution 的产出 sink，
+        # 事后只把「父实例本次新增的待办」登记回父动作，绝不把子任务并入父重复持久化/重复发事件。
+        token = _NEW_TASKS.set(None)
+        try:
+            child = await self.start_process_instance_by_id(
+                define.id, real_operator, child_args,
+                parent_id=inst.id, parent_node_name=node.id)
+            await apply_initial_tasks(self, self.repo, child.id, real_operator, child_args)
+        finally:
+            _NEW_TASKS.reset(token)
+        for task in await self.repo.find_doing_tasks(inst.id):
+            if task.id not in parent_tasks_before:
+                _append_new_task(task)
+        return child
+
+    async def _finish_instance(self, inst: ProcessInstance, operator: str,
+                               vars_: dict, *, reject: Optional[bool] = None) -> ProcessInstance:
+        """结束实例并回父推进（issues/257，对齐 Java EndProcessHandler）。"""
+        # 当前聚合根优先，避免把本次刚废弃/办结但尚未落库的兄弟任务误判成进行中。
+        active = [task for task in (inst.tasks or []) if task.taskState == int(TaskState.DOING)]
+        known_ids = {task.id for task in (inst.tasks or [])}
+        for task in await self.repo.find_doing_tasks(inst.id):
+            if task.id not in known_ids:
+                active.append(task)
+        if any(task.taskType != int(TaskType.SECONDARY) for task in active):
+            raise ValueError("存在未完成的主办任务,请确认.")
+        # 协办不阻塞结束；逐条以 flow.auto 同意办结，走既有任务持久化/事件腿。
+        # 已在当前实例锁/事务内，直接调内部协办办结腿，避免重复获取非可重入 asyncio 锁。
+        active_ids = {task.id for task in active}
+        for task in active:
+            finish_args = dict(vars_ or {})
+            finish_args[KEY_SUBMIT_TYPE] = int(SubmitType.AGREE)
+            await self._complete_aidant_without_drive(task.id, KEY_AUTO_ID, finish_args)
+
+        if active:
+            refreshed = await self.repo.find_instance_by_id(inst.id)
+            if refreshed is not None:
+                tasks = list(inst.tasks or [])
+                for task in refreshed.tasks or []:
+                    index = next((i for i, current in enumerate(tasks) if current.id == task.id), -1)
+                    if task.id in active_ids or index < 0:
+                        if index < 0:
+                            tasks.append(task)
+                        else:
+                            tasks[index] = task
+                inst.tasks = tasks
+                inst.variables.update(refreshed.variables or {})
+        if reject is None:
+            reject = _to_submit_type(inst.variables.get(KEY_SUBMIT_TYPE)) == int(SubmitType.REJECT)
+        if reject:
+            inst.reject(self._now())
+        else:
+            inst.finish(self._now())
+        inst.variables = _merge_exec_into_instance(inst.variables, vars_)
+        await self.repo.update_instance(inst)
+        await self._cancel_instance_actions(inst.id)
+        # 终态事件必须落库后播一次，再触发父流程续流。
+        await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
+                                            operator=operator, state=int(inst.state)))
+        await self._resume_parent(inst, operator)
+        return inst
+
+    async def _resume_parent(self, child: ProcessInstance, operator: str) -> None:
+        """按 parentId/parentNodeName 回父执行 SubProcessModel 的出边一次。"""
+        if child.parentId is None:
+            return
+        parent = await self.repo.find_instance_by_id(child.parentId)
+        if parent is None:
+            return
+        define = await self.repo.find_define_by_id(parent.defineId)
+        if define is None:
+            return
+        parent_flow = parse_flow_model(json.loads(define.content))
+        parent_node = _find_node(parent_flow, child.parentNodeName)
+        if parent_node is None or parent_node.type not in SUB_PROCESS_TYPES:
+            return
+        parent_operator = _real_operator(operator, child)
+        parent_vars = dict(parent.variables or {})
+        parent_vars.update(child.variables or {})
+        if not await self._fire_pre(parent_node, parent):
+            return
+        try:
+            for target in _follow_edges(parent_flow, parent_node.id):
+                await self._execute_node(parent_flow, parent, target, parent_operator,
+                                         parent_vars, 0)
+        finally:
+            await self._fire_post(parent_node, parent)
+
     async def _execute_node(self, flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: str, vars_: dict,
                             parent_id: int = 0):
         # 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
@@ -1482,21 +1650,12 @@ class EngineImpl(Engine):
             elif node.type == TYPE_JOIN:
                 if await _rj.merge_ready(self, flow, inst, node.id, parent_id):
                     for n in _follow_edges(flow, node.id): await self._execute_node(flow, inst, n, operator, vars_, parent_id)
+            elif node.type in SUB_PROCESS_TYPES:
+                # SubProcessModel.exec 本身只负责启动子实例；父出边要等子实例终态后由
+                # _resume_parent 按 parentId/parentNodeName 回来执行，绝不在此处提前续流。
+                await self._start_sub_process(node, inst, operator, vars_)
             elif node.type == TYPE_END:
-                # 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish
-                submit_type = inst.variables.get(KEY_SUBMIT_TYPE)
-                if submit_type is not None and int(submit_type) == int(SubmitType.REJECT):
-                    inst.reject(self._now())
-                else:
-                    inst.finish(self._now())
-                # issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 _prepare_execute_task 一致）
-                inst.variables = _merge_exec_into_instance(inst.variables, vars_)
-                await self.repo.update_instance(inst)
-                await self._cancel_instance_actions(inst.id)
-                # PROCESS_INSTANCE_END（码 2）：实例 state 落库之后 fire，载荷带落库后的 state
-                # （办结 20 / 拒绝 45 共用一号，spec §11.6 收口旧的 Finish/Reject 拆分）
-                await self._fire_event(ProcessEvent(EventType.PROCESS_INSTANCE_END, inst.id,
-                                                    operator=operator, state=int(inst.state)))
+                await self._finish_instance(inst, operator, vars_)
             else:
                 # issues/141 G4 义务 2（spec/02「类型键的三条义务」第 2 条）：**未知档不得静默丢节点**
                 # ——类型不在表里时先记一条可诊断日志，再决定跳过。
@@ -1508,11 +1667,10 @@ class EngineImpl(Engine):
                 # 打一条；令牌停在原地不再有后续推进，所以不存在按请求刷屏
                 # （反例：挂到 parse_flow_model 上，会跟着每一次发起与每一次办理各打一遍）
                 #
-                # **为什么必须带实得类型串原文**：spec/02 义务 3 段 owner 二拍「子流程暂不进契约
-                # 面」，六栈不补 `snaker:subProcess` 档 ⇒ 设计器画出的子流程节点在本栈唯一的
-                # 痕迹就是这条日志。少了 type= 那一半，"snaker:subProcess 被吞了"和"某个手写
-                # 的 snaker:Task 拼错大小写被吞了"长得一模一样，那条裁定就没有可诊断面，
-                # 等于没立法依据。nodeId 同理：没有它连是哪个节点都找不到。
+                # **为什么必须带实得类型串原文**：子流程三档已在 KNOWN_NODE_TYPES 注册
+                # （issues/257），未知档日志只服务真正拼错/未建档的类型。少了 type= 那一半，
+                # "某个节点类型被吞了"和"某个手写 snaker:Task 拼错大小写被吞了"长得一模一样。
+                # nodeId 同理：没有它连是哪个节点都找不到。
                 #
                 # ⚠️ 只记日志，不改行为：跳过形状（不建行、不沿出边推进、令牌停住）已由 issues/143
                 # 在 java/php/c# 收口，本栈本来就是"按 id 现查目标、查不到就停"那一派，行为已对。
@@ -1932,9 +2090,14 @@ class EngineImpl(Engine):
 # ─── Pure Functions ─────────────────────────────────────────────────────────────
 
 def _can_rejected(flow: FlowModel, current_id: str, parent_id: str) -> bool:
-    """照 mldong-boot2 NodeModel.canRejected：自 current 的入边回溯，命中 parent 放行；
-    入边来源是 fork/join/start 时**跳过该条入边、不再深入**（boot2 是 continue，不是穿越），
-    其余来源递归。subprocess 在 boot2 里被注释掉，等同普通节点。"""
+    """照 Java NodeModel.canRejected：自 current 的入边回溯，命中 parent 放行。
+
+    fork/join/start/subprocess 来源不穿越；目标 parent 自身为会签节点时同样不可退
+    （issues/257 裁决 B）。
+    """
+    parent = _find_node(flow, parent_id)
+    if parent is not None and parent.type == TYPE_TASK and _as.is_countersign_node(parent):
+        return False
     for edge in flow.edges:
         if edge.targetNodeId != current_id:
             continue
@@ -1943,7 +2106,7 @@ def _can_rejected(flow: FlowModel, current_id: str, parent_id: str) -> bool:
         src = _find_node(flow, edge.sourceNodeId)
         if src is None:
             continue
-        if src.type in (TYPE_FORK, TYPE_JOIN, TYPE_START):
+        if src.type in (TYPE_FORK, TYPE_JOIN, TYPE_START, *SUB_PROCESS_TYPES):
             continue
         if _can_rejected(flow, src.id, parent_id):
             return True

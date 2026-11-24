@@ -339,6 +339,30 @@ class JdbcRepository(ProcessRepository):
             version=row[6], createTime=row[7], createUser=_user_str(row[8]), updateTime=row[9], updateUser=_user_str(row[10]),
         )
 
+    async def find_define_by_name_and_version(self, name: str,
+                                              version: Optional[int] = None) -> Optional[ProcessDefine]:
+        """issues/257：子流程按 name/version 查定义，缺省版本取 version DESC,id DESC。"""
+        if name is None or str(name).strip() == "":
+            return None
+        where = " WHERE name = ?"
+        params: list[Any] = [str(name)]
+        if version is not None:
+            where += " AND version = ?"
+            params.append(version)
+        async with self._conn() as conn:
+            row = await conn.fetchone(self._sql(
+                "SELECT id, name, display_name, type, state, content, version,"
+                " create_time, create_user, update_time, update_user"
+                " FROM wf_process_define" + where + " ORDER BY version DESC, id DESC LIMIT 1"),
+                tuple(params))
+        if not row:
+            return None
+        return ProcessDefine(
+            id=row[0], name=row[1], displayName=row[2], type=row[3], state=row[4],
+            content=row[5].decode() if isinstance(row[5], (bytes, bytearray)) else (row[5] or ""),
+            version=row[6], createTime=row[7], createUser=_user_str(row[8]), updateTime=row[9], updateUser=_user_str(row[10]),
+        )
+
     async def find_define_by_id(self, id: int) -> Optional[ProcessDefine]:
         async with self._conn() as conn:
             row = await conn.fetchone(self._sql(

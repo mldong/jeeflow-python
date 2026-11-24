@@ -72,4 +72,4 @@ from jeeflow.model import parse_flow_model
 flow = parse_flow_model(json.loads(content))   # 过滤未知字段，生成引擎模型
 ```
 
-> 演示站从本仓 `flows/` 副本加载（15 个；唯一编辑源在 `jeeflow-java` 仓 `test/resources/flows/`，`flows_resolver` 在维护者机器上执行时精确镜像进本仓，单语言用户下载即用）。完整示例与字段说明见[通用指南 02 · 流程定义](../../guides/02-flow-definition)。
+> 演示站从本仓 `flows/` 副本加载（全部共享流程；唯一编辑源在 `jeeflow-java` 仓 `test/resources/flows/`，`flows_resolver` 在维护者机器上执行时精确镜像进本仓，单语言用户下载即用）。完整示例与字段说明见[通用指南 02 · 流程定义](../../guides/02-flow-definition)。

@@ -63,6 +63,20 @@ class MemoryRepository(ProcessRepository):
                 best = d
         return deepcopy(best) if best else None
 
+    async def find_define_by_name_and_version(self, name, version=None):
+        """issues/257：version 缺省按 version DESC,id DESC；显式版本精确匹配。"""
+        if name is None or str(name).strip() == "":
+            return None
+        candidates = [d for d in self._defines.values()
+                      if d.name == name and (version is None or d.version == version)]
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda d: (
+            d.version if d.version is not None else -1,
+            d.id if d.id is not None else 0,
+        ))
+        return deepcopy(best)
+
     # ── 定义写操作（v1.0.1，对齐 SPI）──
 
     async def save_define(self, d: ProcessDefine):

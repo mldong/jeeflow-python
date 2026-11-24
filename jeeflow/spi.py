@@ -154,6 +154,30 @@ class ProcessRepository(ABC):
     async def find_define_by_name(self, name: str) -> Optional[ProcessDefine]:
         """按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）"""
         ...
+
+    async def find_define_by_name_and_version(self, name: str,
+                                              version: Optional[int] = None) -> Optional[ProcessDefine]:
+        """子流程定义查询（issues/257）：name 精确匹配，version 缺省选最新版。
+
+        内置内存/JDBC 仓有直接实现；第三方仓可沿用此默认实现。排序口径固定为
+        ``version DESC, id DESC``，**不附加 state 过滤**（与顶层启动腿一致）。
+        """
+        if name is None or str(name).strip() == "":
+            return None
+        conditions = [QueryCondition("t.name", "EQ", str(name))]
+        if version is not None:
+            conditions.append(QueryCondition("t.version", "EQ", version))
+        rows, total = await self.page_defines(1, 1, conditions)
+        if not rows:
+            return None
+        if total > 1:
+            rows, _ = await self.page_defines(1, int(total), conditions)
+        best = max(rows, key=lambda row: (
+            row.version if row.version is not None else -1,
+            row.id if row.id is not None else 0,
+        ))
+        return await self.find_define_by_id(best.id)
+
     # 定义写操作（v1.0.1，集成反馈①）：保存/更新/启停/删除流程定义
     @abstractmethod
     async def save_define(self, define: ProcessDefine) -> None: ...

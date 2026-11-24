@@ -30,6 +30,20 @@ class FlowNode:
     properties: dict[str, Any] = field(default_factory=dict)
     text: dict[str, str] = field(default_factory=dict)
 
+
+@dataclass
+class SubProcessModel(FlowNode):
+    """子流程节点模型（issues/257）。
+
+    ``processName`` 是目标定义名，``version`` 缺省时选最新版；``form`` 只保留设计器配置，
+    不参与定义查找。节点 ``id`` 仍是图内标识及回父执行时的定位键。
+    """
+
+    processName: str = ""
+    version: Optional[int] = None
+    form: Optional[str] = ""
+
+
 @dataclass
 class FlowEdge:
     id: str = ""
@@ -47,6 +61,10 @@ TYPE_DECISION = "snaker:decision"
 TYPE_FORK     = "snaker:fork"
 TYPE_JOIN     = "snaker:join"
 TYPE_CUSTOM   = "snaker:custom"
+TYPE_SUB_PROCESS = "snaker:subProcess"
+TYPE_SUBPROCESS = "snaker:subprocess"
+TYPE_WF_SUB_PROCESS = "snaker:wfSubProcess"
+SUB_PROCESS_TYPES = frozenset({TYPE_SUB_PROCESS, TYPE_SUBPROCESS, TYPE_WF_SUB_PROCESS})
 
 # 类型表全集（spec/02「类型键的三条义务」第 2 条 · issues/141 G4 立的判据本体）。
 #
@@ -55,11 +73,9 @@ TYPE_CUSTOM   = "snaker:custom"
 # 正常不会被 `_execute_node` 走到）。用"没人认领"当未知判据，会把"令牌真走到 start 上"这种
 # 拓扑病误报成"类型不在表里"——两个病得分别可诊断。义务 2 要的是**串 ∉ 表** 那一判。
 #
-# ⚠️ 表里**没有** `snaker:subProcess`／`snaker:subprocess`：owner 2026-10-01 二拍「子流程暂不进
-# 契约面」（spec/02 义务 3 段），六栈不补这一档。设计器画出子流程节点时，本栈就靠下面那条
-# 未知档日志把它**显式暴露**出来——那条裁定唯一的可诊断面就是这条日志（见 engine._execute_node）。
+# 子流程三档是设计器/历史定义的同值别名（issues/257），大小写敏感、不做归一化。
 KNOWN_NODE_TYPES = frozenset({TYPE_START, TYPE_END, TYPE_TASK, TYPE_DECISION, TYPE_FORK,
-                              TYPE_JOIN, TYPE_CUSTOM})
+                              TYPE_JOIN, TYPE_CUSTOM, *SUB_PROCESS_TYPES})
 
 # ─── 控制类参数前缀（规范 04「流程变量约定」末注的判据本体用得到它）──────────────
 #
@@ -93,6 +109,11 @@ class TaskState(IntEnum):
 # 门面 flow() 捕获后出 {"code": 99999999, "msg": 这句原文}，不拼码、不加前缀。
 # 参照 20010007 / 20010008（engine._rollback_to_parent 的 NO_LINEAGE / GUARD 两句）。
 #
+# issues/257：子流程定义缺失携带 Java WfErrEnum.NOT_FOUND_PROCESS_DEFINE 的内部码；
+# 门面信封仍沿用本栈 99999999，内部码不拼进 msg。
+ERR_NOT_FOUND_PROCESS_DEFINE = 20010002
+
+
 # 20010009 WITHDRAW_INSTANCE_NOT_DOING —— 撤回的实例状态守卫（issues/134 案 A），
 # 落点见下方 ProcessInstance.withdraw。
 ERR_WITHDRAW_INSTANCE_NOT_DOING = "流程实例非进行中，无法撤回"
@@ -542,13 +563,39 @@ def parse_flow_model(raw: dict) -> FlowModel:
 
 
 def _parse_node(raw: dict) -> FlowNode:
-    return FlowNode(
+    node_type = raw.get("type", "")
+    common = dict(
         id=raw.get("id", ""),
-        type=raw.get("type", ""),
+        type=node_type,
         x=float(raw.get("x", 0)),
         y=float(raw.get("y", 0)),
-        properties=raw.get("properties", {}),
-        text=raw.get("text", {}),
+        properties=raw.get("properties") or {},
+        text=raw.get("text") or {},
+    )
+    if node_type not in SUB_PROCESS_TYPES:
+        return FlowNode(**common)
+
+    props = common["properties"]
+    # issues/257 裁决 A：processName → properties.name → 节点 id。
+    # 只把「缺失/null/纯空白」当空；非空值原样参与定义名精确查询，不擅自 trim 业务名。
+    process_name = props.get("processName")
+    if process_name is None or str(process_name).strip() == "":
+        process_name = props.get("name")
+    if process_name is None or str(process_name).strip() == "":
+        process_name = common["id"]
+    raw_version = props.get("version")
+    if raw_version is None or str(raw_version).strip() == "":
+        version = None
+    else:
+        try:
+            version = int(raw_version)
+        except (TypeError, ValueError):
+            version = None
+    return SubProcessModel(
+        **common,
+        processName=str(process_name),
+        version=version,
+        form=props.get("form", ""),
     )
 
 

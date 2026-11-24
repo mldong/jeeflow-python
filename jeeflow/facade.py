@@ -25,7 +25,8 @@ from . import recall as _rc
 from . import add_sign as _add_sign
 from .engine import (Engine, KEY_ADMIN_ID, KEY_AUTO_ID, KEY_CC_ACTORS, KEY_CC_ACTORS_START,
                      KEY_NEXT_NODE_OPERATOR,
-                     KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE)
+                     KEY_PROCESS_START_NEXT_NODE_OPERATOR, KEY_SUBMIT_TYPE,
+                     apply_initial_tasks)
 from .extensions import EventType, ProcessEvent
 from .model import (FlowNode, ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate,
                     TaskState, InstanceState, ERR_EXIST_UN_FINISH_INSTANCE, parse_flow_model,
@@ -401,18 +402,9 @@ class JeeflowFacade:
         # issues/56 E28 → issues/127：发起时抄送（f_ccActors）**不在这里**——键随 flow_args 进引擎，
         # 由 engine.handle_cc_actors 在实例行 insert 的同一次调用栈里落 cc 行并逐人 fire CC_CREATE
         # （spec §11.7；本轮把腿从门面搬进引擎，直连引擎 API 的调用方同样生效）。
-        # startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
-        doing = await self._repo.find_doing_tasks(inst.id)
-        for task in doing:
-            await self._repo.add_task_actor(task.id, [operator])
-            flow_args["submitType"] = SUBMIT_APPLY
-            # 对齐 boot3：f_nextNodeOperator（发起时预指派人）→ tf_nextNodeOperator（引擎执行参数）
-            start_next_op = flow_args.get(KEY_PROCESS_START_NEXT_NODE_OPERATOR)
-            if start_next_op:
-                flow_args[KEY_NEXT_NODE_OPERATOR] = start_next_op
-            # issues/176：spec 04:60-62——apply 节点由 flow.auto 代执行（operator 列=flow.auto，
-            # 不进发起人已办）；u_* 注入由引擎跳过（对齐 boot2 ProcessInstanceServiceImpl:317 AUTO_ID）
-            await self._engine.execute_process_task(task.id, KEY_AUTO_ID, flow_args)
+        # startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）。
+        # issues/257：与子流程启动共用同一自办函数；无 apply 时同样自办首任务。
+        await apply_initial_tasks(self._engine, self._repo, inst.id, operator, flow_args)
         return {"processInstanceId": inst.id}
 
     async def _processDefine_deploy(self, args: dict) -> dict:

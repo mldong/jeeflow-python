@@ -7772,8 +7772,6 @@ async def test_i141_g4_unknown_node_type_logs_one_diagnosable_warning(caplog):
 
     vectors = [
         # (实得类型串, 为什么这一档必须被暴露)
-        ("snaker:subProcess", "设计器实际输出的驼峰子流程串——owner 二拍暂不进契约面，全靠这条日志显影"),
-        ("snaker:subprocess", "契约里那条小写档同样不在表里（查表大小写敏感，不许偷偷认）"),
         ("snaker:Task", "拼错大小写：不许再塌成 Custom/Task 任一档"),
         ("task", "裸名（没带 snaker: 前缀）不在本栈表里"),
         ("snaker:not-a-node", "纯杜撰"),
@@ -7806,7 +7804,7 @@ async def test_i141_g4_unknown_node_type_logs_one_diagnosable_warning(caplog):
 
 @pytest.mark.asyncio
 async def test_i141_g4_known_node_types_emit_no_unknown_warning(caplog):
-    """反向哨兵：表里那 7 档**一律不许**被报成"不在类型表里"。
+    """反向哨兵：非子流程的已知档**一律不许**被报成"不在类型表里"。
     这一格咬的是两种混过判据的写法——① 把日志无条件打出去（只在未知分支里才该响）；
     ② 用"if/elif 走完没人认领"当未知判据（`snaker:start` 也在表里，却恰好没有执行分支，
     令牌真走到它头上时会被误报成未知档——两个病得分开诊断，判据是 model.KNOWN_NODE_TYPES）。"""

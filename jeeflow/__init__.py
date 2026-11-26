@@ -18,4 +18,6 @@ from .builtin import (register_builtin_assignments, OperatorAssignmentHandler, F
                       HANDLER_DEPT_LEADER, HANDLER_DEPT_MAIN_LEADER, HANDLER_APPLICANT_DEPT_LEADER,
                       HANDLER_APPLICANT_DEPT_MAIN_LEADER, HANDLER_TASK_ROLE_ASSIGNEE,
                       FormUserDeptLeaderAssignmentHandler, FormUserDeptMainLeaderAssignmentHandler,
-                      HANDLER_FORM_USER_DEPT_LEADER, HANDLER_FORM_USER_DEPT_MAIN_LEADER)
+                      FormDeptLeaderAssignmentHandler, FormDeptMainLeaderAssignmentHandler,
+                      HANDLER_FORM_USER_DEPT_LEADER, HANDLER_FORM_USER_DEPT_MAIN_LEADER,
+                      HANDLER_FORM_DEPT_LEADER, HANDLER_FORM_DEPT_MAIN_LEADER)

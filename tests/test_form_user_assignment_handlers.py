@@ -298,7 +298,7 @@ def test_registration_names_are_top_level_fqns():
 
 def test_metadata_exposes_two_new_display_names():
     metas = MetaRegistry().list_handlers("AssignmentHandler")
-    assert len(metas) == 9
-    tail = {m.className: (m.displayName, m.order) for m in metas[-2:]}
-    assert tail[FQ_LEADER] == ("表单指定用户所属部门经理", 70)
-    assert tail[FQ_MAIN] == ("表单指定用户所属部门分管领导", 80)
+    assert len(metas) == 11
+    form_user = {m.className: (m.displayName, m.order) for m in metas[7:9]}
+    assert form_user[FQ_LEADER] == ("表单指定用户所属部门经理", 70)
+    assert form_user[FQ_MAIN] == ("表单指定用户所属部门分管领导", 80)

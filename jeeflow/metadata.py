@@ -104,6 +104,12 @@ BUILTIN_ASSIGNMENT_METAS: list[HandlerMeta] = [
     HandlerMeta(type="AssignmentHandler",
                 className="com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler",
                 displayName="表单指定用户所属部门分管领导", order=80),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler",
+                displayName="表单指定部门负责人", order=90),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler",
+                displayName="表单指定部门分管领导", order=100),
 ]
 
 
@@ -120,9 +126,8 @@ BUILTIN_ACTION_PERMISSION_METAS: list[HandlerMeta] = [
 class HandlerRegistry:
     """处理器注册中心（可选能力：不注册不影响引擎加载行为）
 
-    构造即内置 7 个通用 AssignmentHandler 元数据（v1.6.0 issues/16，
-    注册名与 Java 类全限定名一致，四语言通用）＋ 1 条 ActionPermissionProvider
-    内置默认件元数据（issues/29）。
+    构造即内置通用 AssignmentHandler 元数据（注册名与 Java 类全限定名一致，跨语言通用）
+    ＋ 1 条 ActionPermissionProvider 内置默认件元数据（issues/29）。
     """
 
     def __init__(self):

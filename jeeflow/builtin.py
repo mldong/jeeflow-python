@@ -4,6 +4,7 @@
 - 组织维度 handler：通过 OrgUserProvider SPI 取数据，业务方只实现数据接口
 """
 import re
+from collections.abc import Collection, Mapping
 from typing import Optional, Union
 
 from .extensions import HandlerRegistry, IAssignmentHandler
@@ -23,6 +24,9 @@ HANDLER_TASK_ROLE_ASSIGNEE = _ORG_HANDLERS_PREFIX + "TaskRoleAssigneeHandler"
 # 两个「表单指定用户」类是**顶级类**（不带 OrgUserAssignmentHandlers$ 前缀），注册名与其余语言逐字一致
 HANDLER_FORM_USER_DEPT_LEADER = "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
 HANDLER_FORM_USER_DEPT_MAIN_LEADER = "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
+# issues/258：表单指定部门的（分管）领导同样是顶级类，注册名不带 $
+HANDLER_FORM_DEPT_LEADER = "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler"
+HANDLER_FORM_DEPT_MAIN_LEADER = "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler"
 
 # 表单字段编号后缀正则（task_01 → task）
 _NUMBER_SUFFIX_PATTERN = re.compile(r"^(.+?)_(\d+)$")
@@ -232,6 +236,81 @@ def _first_form_user_id(value) -> str:
     return ""
 
 
+# ─── 表单指定 1–N 个部门 → 部门（分管）领导（issues/258）────────────────────────
+
+def _form_dept_ids(value) -> list[str]:
+    """部门 ID 归一：字符串拆英文逗号；集合逐元素不二次拆；trim、丢空、保序去重。
+
+    ``0``／``"0"`` 是合法 ID；映射不是部门列表，按空值处理。
+    """
+    if value is None or isinstance(value, Mapping):
+        return []
+    if isinstance(value, Collection) and not isinstance(value, (str, bytes, bytearray)):
+        tokens = value
+    else:
+        tokens = str(value).split(",")
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token is None:
+            continue
+        dept_id = str(token).strip()
+        if dept_id != "" and dept_id not in seen:
+            seen.add(dept_id)
+            result.append(dept_id)
+    return result
+
+
+async def _assign_form_dept(org_prov: Optional[OrgUserProvider], node, inst, main: bool) -> list[str]:
+    """表单部门 → 各部门领导；按部门输入顺序、SPI 顺序合并并最终去重。
+
+    字段缺失／空值／无节点／缺 SPI ⇒ 空列表。单个部门查询失败或无领导时跳过，
+    不影响其余部门；所有失败均不向引擎抛异常。
+    """
+    if node is None or inst is None or org_prov is None:
+        return []
+    dept_ids = _form_dept_ids(_find_form_user_field_value(inst.variables, node.id))
+    if not dept_ids:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for dept_id in dept_ids:
+        try:
+            if main:
+                leaders = await org_prov.find_dept_main_leaders(dept_id)
+            else:
+                leaders = await org_prov.find_dept_leaders(dept_id)
+            if leaders is None:
+                continue
+            # SPI 契约返回列表；容错把裸字符串当一个完整 userId，不逐字符拆。
+            if isinstance(leaders, str):
+                leaders = [leaders]
+            for leader in leaders:
+                if leader is None:
+                    continue
+                user_id = str(leader).strip()
+                if user_id != "" and user_id not in seen:
+                    seen.add(user_id)
+                    result.append(user_id)
+        except Exception:  # noqa: BLE001 —— 单部门失败降级为空，不打断其他部门
+            continue
+    return result
+
+
+class FormDeptLeaderAssignmentHandler(_OrgBase, IAssignmentHandler):
+    """表单指定 1–N 个部门的负责人。"""
+
+    async def assign(self, node, inst, operator) -> list[str]:
+        return await _assign_form_dept(self.org_prov, node, inst, False)
+
+
+class FormDeptMainLeaderAssignmentHandler(_OrgBase, IAssignmentHandler):
+    """表单指定 1–N 个部门的分管领导。"""
+
+    async def assign(self, node, inst, operator) -> list[str]:
+        return await _assign_form_dept(self.org_prov, node, inst, True)
+
+
 # ─── 注册 ───────────────────────────────────────────────────────────────────────
 
 def register_builtin_assignments(registry: HandlerRegistry,
@@ -249,3 +328,7 @@ def register_builtin_assignments(registry: HandlerRegistry,
                                  FormUserDeptLeaderAssignmentHandler(user_prov, org_prov))
     registry.register_assignment(HANDLER_FORM_USER_DEPT_MAIN_LEADER,
                                  FormUserDeptMainLeaderAssignmentHandler(user_prov, org_prov))
+    registry.register_assignment(HANDLER_FORM_DEPT_LEADER,
+                                 FormDeptLeaderAssignmentHandler(user_prov, org_prov))
+    registry.register_assignment(HANDLER_FORM_DEPT_MAIN_LEADER,
+                                 FormDeptMainLeaderAssignmentHandler(user_prov, org_prov))

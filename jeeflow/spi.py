@@ -451,6 +451,18 @@ class OrgUserProvider(ABC):
         """按角色取人（roleCode → userId 列表）"""
         ...
 
+class PostUserProvider(ABC):
+    """岗位成员查询 SPI（可选，issues/259）。
+
+    岗位是独立组织维度；未注册时岗位相关 handler 返回空参与者，不抛异常。
+    """
+
+    @abstractmethod
+    async def find_by_post(self, post_code: str) -> list[str]:
+        """按岗位编码取用户 ID 列表；岗位不存在或无成员时返回空列表。"""
+        ...
+
+
 class IDGenerator(ABC):
     @abstractmethod
     def next_id(self) -> int: ...

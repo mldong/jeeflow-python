@@ -60,8 +60,8 @@ def test_handler_registry():
                            displayName="日志记录", order=1, group="pre"))
 
     assignments = r.list_handlers("AssignmentHandler")
-    # 内置通用 handler（11 条）+ 2 个自定义
-    assert len(assignments) == 13
+    # 内置通用 handler（13 条）+ 2 个自定义
+    assert len(assignments) == 15
     # order 升序：内置 OperatorAssignmentHandler order=-9999 最前
     assert assignments[0].className == "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler"
     assert assignments[0].displayName == "流程发起人"
@@ -77,19 +77,26 @@ def test_handler_registry():
 
 def test_empty_registry():
     r = HandlerRegistry()
-    # 构造即内置通用 handler（7 条基础 ＋ 表单指定用户两条款 ＋ 表单指定部门两条款）
+    # 构造即内置通用 handler（7 条基础 ＋ 表单指定用户两条款 ＋ 表单指定部门两条款 ＋ 岗位两条款）
     metas = r.list_handlers("AssignmentHandler")
-    assert len(metas) == 11
-    # order 70/80 两条表单单用户项、90/100 两条表单部门项依次排在 TaskRoleAssignee(60) 之后
-    assert metas[7].className == "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
-    assert metas[7].displayName == "表单指定用户所属部门经理"
-    assert metas[7].order == 70
-    assert metas[8].className == "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
-    assert metas[8].displayName == "表单指定用户所属部门分管领导"
-    assert metas[8].order == 80
-    assert metas[9].className == "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler"
-    assert metas[9].displayName == "表单指定部门负责人"
-    assert metas[9].order == 90
-    assert metas[10].className == "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler"
-    assert metas[10].displayName == "表单指定部门分管领导"
-    assert metas[10].order == 100
+    assert len(metas) == 13
+    assert metas[6].className == "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler"
+    assert metas[6].order == 60
+    assert metas[7].className == "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler"
+    assert metas[7].displayName == "根据任务节点唯一编码关联岗位分配参与者"
+    assert metas[7].order == 65
+    assert metas[8].className == "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
+    assert metas[8].displayName == "表单指定用户所属部门经理"
+    assert metas[8].order == 70
+    assert metas[9].className == "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
+    assert metas[9].displayName == "表单指定用户所属部门分管领导"
+    assert metas[9].order == 80
+    assert metas[10].className == "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler"
+    assert metas[10].displayName == "表单指定部门负责人"
+    assert metas[10].order == 90
+    assert metas[11].className == "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler"
+    assert metas[11].displayName == "表单指定部门分管领导"
+    assert metas[11].order == 100
+    assert metas[12].className == "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler"
+    assert metas[12].displayName == "表单指定岗位分配参与者"
+    assert metas[12].order == 110

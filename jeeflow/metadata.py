@@ -99,6 +99,9 @@ BUILTIN_ASSIGNMENT_METAS: list[HandlerMeta] = [
                 className="com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler",
                 displayName="根据任务节点唯一编码关联角色分配参与者", order=60),
     HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler",
+                displayName="根据任务节点唯一编码关联岗位分配参与者", order=65),
+    HandlerMeta(type="AssignmentHandler",
                 className="com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler",
                 displayName="表单指定用户所属部门经理", order=70),
     HandlerMeta(type="AssignmentHandler",
@@ -110,6 +113,9 @@ BUILTIN_ASSIGNMENT_METAS: list[HandlerMeta] = [
     HandlerMeta(type="AssignmentHandler",
                 className="com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler",
                 displayName="表单指定部门分管领导", order=100),
+    HandlerMeta(type="AssignmentHandler",
+                className="com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler",
+                displayName="表单指定岗位分配参与者", order=110),
 ]
 
 

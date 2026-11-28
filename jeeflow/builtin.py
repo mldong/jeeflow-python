@@ -9,7 +9,7 @@ from typing import Optional, Union
 
 from .extensions import HandlerRegistry, IAssignmentHandler
 from .model import FlowNode, ProcessInstance
-from .spi import OrgUserProvider, UserProvider
+from .spi import OrgUserProvider, PostUserProvider, UserProvider
 
 # ─── 注册名（与 Java 类全限定名一致）────────────────────────────────────────────
 
@@ -21,12 +21,15 @@ HANDLER_DEPT_MAIN_LEADER = _ORG_HANDLERS_PREFIX + "DeptMainLeaderAssignmentHandl
 HANDLER_APPLICANT_DEPT_LEADER = _ORG_HANDLERS_PREFIX + "ApplicantDeptLeaderAssignmentHandler"
 HANDLER_APPLICANT_DEPT_MAIN_LEADER = _ORG_HANDLERS_PREFIX + "ApplicantDeptMainLeaderAssignmentHandler"
 HANDLER_TASK_ROLE_ASSIGNEE = _ORG_HANDLERS_PREFIX + "TaskRoleAssigneeHandler"
+HANDLER_TASK_POST_ASSIGNEE = _ORG_HANDLERS_PREFIX + "TaskPostAssigneeHandler"
 # 两个「表单指定用户」类是**顶级类**（不带 OrgUserAssignmentHandlers$ 前缀），注册名与其余语言逐字一致
 HANDLER_FORM_USER_DEPT_LEADER = "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
 HANDLER_FORM_USER_DEPT_MAIN_LEADER = "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
 # issues/258：表单指定部门的（分管）领导同样是顶级类，注册名不带 $
 HANDLER_FORM_DEPT_LEADER = "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler"
 HANDLER_FORM_DEPT_MAIN_LEADER = "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler"
+# issues/259：表单指定岗位同为顶级类，注册名不带 $
+HANDLER_FORM_POST_ASSIGNMENT = "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler"
 
 # 表单字段编号后缀正则（task_01 → task）
 _NUMBER_SUFFIX_PATTERN = re.compile(r"^(.+?)_(\d+)$")
@@ -161,6 +164,21 @@ class TaskRoleAssigneeHandler(IAssignmentHandler):
         if node is None or self.org_prov is None:
             return []
         return await self.org_prov.find_by_role(node.id) or []
+
+
+class TaskPostAssigneeHandler(IAssignmentHandler):
+    """任务节点唯一编码关联岗位（postCode = 节点 id，issues/259）。"""
+
+    def __init__(self, post_prov: Optional[PostUserProvider] = None):
+        self.post_prov = post_prov
+
+    async def assign(self, node, inst, operator) -> list[str]:
+        if node is None or node.id is None or node.id == "" or self.post_prov is None:
+            return []
+        try:
+            return await self.post_prov.find_by_post(node.id) or []
+        except Exception:  # noqa: BLE001 —— 岗位查询失败降级为空，不打断建任务
+            return []
 
 
 # ─── 表单指定用户 → 该用户所属部门领导 ──────────────────────────────────────────
@@ -311,12 +329,81 @@ class FormDeptMainLeaderAssignmentHandler(_OrgBase, IAssignmentHandler):
         return await _assign_form_dept(self.org_prov, node, inst, True)
 
 
+# ─── 表单指定 1–N 个岗位 → 岗位成员（issues/259）───────────────────────────────
+
+def _form_post_codes(value) -> list[str]:
+    """岗位编码归一：字符串拆英文逗号；集合逐元素不二次拆；trim、丢空、保序去重。
+
+    ``0``／``"0"`` 是合法编码；映射不是岗位列表，按空值处理。
+    """
+    if value is None or isinstance(value, Mapping):
+        return []
+    if isinstance(value, Collection) and not isinstance(value, (str, bytes, bytearray)):
+        tokens = value
+    else:
+        tokens = str(value).split(",")
+    result: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token is None:
+            continue
+        post_code = str(token).strip()
+        if post_code != "" and post_code not in seen:
+            seen.add(post_code)
+            result.append(post_code)
+    return result
+
+
+async def _assign_form_post(post_prov: Optional[PostUserProvider], node, inst) -> list[str]:
+    """表单岗位 → 各岗位成员；按岗位输入顺序、SPI 顺序合并并最终去重。
+
+    字段缺失／空值／无节点／缺 SPI ⇒ 空列表。单个岗位查询失败或无成员时跳过，
+    不影响其余岗位；所有失败均不向引擎抛异常。
+    """
+    if node is None or node.id is None or node.id == "" or inst is None or post_prov is None:
+        return []
+    post_codes = _form_post_codes(_find_form_user_field_value(inst.variables, node.id))
+    if not post_codes:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for post_code in post_codes:
+        try:
+            user_ids = await post_prov.find_by_post(post_code)
+            if user_ids is None:
+                continue
+            # SPI 契约返回列表；容错把裸字符串当一个完整 userId，不逐字符拆。
+            if isinstance(user_ids, str):
+                user_ids = [user_ids]
+            for user_id in user_ids:
+                if user_id is None:
+                    continue
+                normalized = str(user_id).strip()
+                if normalized != "" and normalized not in seen:
+                    seen.add(normalized)
+                    result.append(normalized)
+        except Exception:  # noqa: BLE001 —— 单岗位失败降级为空，不打断其他岗位
+            continue
+    return result
+
+
+class FormPostAssignmentHandler(IAssignmentHandler):
+    """表单指定 1–N 个岗位，按岗位成员分配参与者。"""
+
+    def __init__(self, post_prov: Optional[PostUserProvider] = None):
+        self.post_prov = post_prov
+
+    async def assign(self, node, inst, operator) -> list[str]:
+        return await _assign_form_post(self.post_prov, node, inst)
+
+
 # ─── 注册 ───────────────────────────────────────────────────────────────────────
 
 def register_builtin_assignments(registry: HandlerRegistry,
                                  user_prov: Optional[UserProvider] = None,
-                                 org_prov: Optional[OrgUserProvider] = None):
-    """注册内置通用参与者处理器到注册表（组织维度 handler 依赖 user_prov/org_prov）"""
+                                 org_prov: Optional[OrgUserProvider] = None,
+                                 post_prov: Optional[PostUserProvider] = None):
+    """注册内置通用参与者处理器到注册表（各组织维度 SPI 均可选）"""
     registry.register_assignment(HANDLER_OPERATOR_ASSIGNMENT, OperatorAssignmentHandler())
     registry.register_assignment(HANDLER_FORM_FIELD_ASSIGNEE, FormFieldAssigneeHandler())
     registry.register_assignment(HANDLER_DEPT_LEADER, DeptLeaderAssignmentHandler(user_prov, org_prov))
@@ -324,6 +411,7 @@ def register_builtin_assignments(registry: HandlerRegistry,
     registry.register_assignment(HANDLER_APPLICANT_DEPT_LEADER, ApplicantDeptLeaderAssignmentHandler(user_prov, org_prov))
     registry.register_assignment(HANDLER_APPLICANT_DEPT_MAIN_LEADER, ApplicantDeptMainLeaderAssignmentHandler(user_prov, org_prov))
     registry.register_assignment(HANDLER_TASK_ROLE_ASSIGNEE, TaskRoleAssigneeHandler(org_prov))
+    registry.register_assignment(HANDLER_TASK_POST_ASSIGNEE, TaskPostAssigneeHandler(post_prov))
     registry.register_assignment(HANDLER_FORM_USER_DEPT_LEADER,
                                  FormUserDeptLeaderAssignmentHandler(user_prov, org_prov))
     registry.register_assignment(HANDLER_FORM_USER_DEPT_MAIN_LEADER,
@@ -332,3 +420,5 @@ def register_builtin_assignments(registry: HandlerRegistry,
                                  FormDeptLeaderAssignmentHandler(user_prov, org_prov))
     registry.register_assignment(HANDLER_FORM_DEPT_MAIN_LEADER,
                                  FormDeptMainLeaderAssignmentHandler(user_prov, org_prov))
+    registry.register_assignment(HANDLER_FORM_POST_ASSIGNMENT,
+                                 FormPostAssignmentHandler(post_prov))

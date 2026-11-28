@@ -257,8 +257,8 @@ def test_registration_names_and_runtime_registry():
 
 def test_metadata_count_names_display_names_and_orders():
     metas = MetaRegistry().list_handlers("AssignmentHandler")
-    assert len(metas) == 11
-    assert [(m.className, m.displayName, m.order) for m in metas[-2:]] == [
+    assert len(metas) == 13
+    assert [(m.className, m.displayName, m.order) for m in metas[10:12]] == [
         (FQ_LEADER, "表单指定部门负责人", 90),
         (FQ_MAIN, "表单指定部门分管领导", 100),
     ]

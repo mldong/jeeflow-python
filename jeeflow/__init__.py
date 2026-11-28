@@ -4,7 +4,8 @@ from .facade import JeeflowFacade
 from .extensions import EngineExtensions, FlowInterceptor, HandlerRegistry, EventType, ProcessEvent
 from .memory import MemoryRepository
 from .repository import JdbcRepository, TsIDGenerator, MySqlAdapter, PostgresAdapter
-from .spi import (ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator,
+from .spi import (ProcessRepository, UserProvider, PostUserProvider,
+                  IDGenerator, ExpressionEvaluator,
                   normalize_actors, normalize_cc_actors, normalize_actor_value, require_present_id,
                   actor_delete_forms)
 from .default_evaluator import DefaultExpressionEvaluator, evaluate_builtin
@@ -14,10 +15,13 @@ from .action_permission import (ActionPermissionProvider, DefaultActionPermissio
 from .builtin import (register_builtin_assignments, OperatorAssignmentHandler, FormFieldAssigneeHandler,
                       DeptLeaderAssignmentHandler, DeptMainLeaderAssignmentHandler,
                       ApplicantDeptLeaderAssignmentHandler, ApplicantDeptMainLeaderAssignmentHandler,
-                      TaskRoleAssigneeHandler, HANDLER_OPERATOR_ASSIGNMENT, HANDLER_FORM_FIELD_ASSIGNEE,
+                      TaskRoleAssigneeHandler, TaskPostAssigneeHandler, FormPostAssignmentHandler,
+                      HANDLER_OPERATOR_ASSIGNMENT, HANDLER_FORM_FIELD_ASSIGNEE,
                       HANDLER_DEPT_LEADER, HANDLER_DEPT_MAIN_LEADER, HANDLER_APPLICANT_DEPT_LEADER,
                       HANDLER_APPLICANT_DEPT_MAIN_LEADER, HANDLER_TASK_ROLE_ASSIGNEE,
+                      HANDLER_TASK_POST_ASSIGNEE,
                       FormUserDeptLeaderAssignmentHandler, FormUserDeptMainLeaderAssignmentHandler,
                       FormDeptLeaderAssignmentHandler, FormDeptMainLeaderAssignmentHandler,
                       HANDLER_FORM_USER_DEPT_LEADER, HANDLER_FORM_USER_DEPT_MAIN_LEADER,
-                      HANDLER_FORM_DEPT_LEADER, HANDLER_FORM_DEPT_MAIN_LEADER)
+                      HANDLER_FORM_DEPT_LEADER, HANDLER_FORM_DEPT_MAIN_LEADER,
+                      HANDLER_FORM_POST_ASSIGNMENT)
